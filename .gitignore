@@ -1,0 +1,41 @@
+# Binaries
+/bin/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artefacts
+*.test
+*.out
+coverage.txt
+coverage.html
+
+# Vendor / build cache
+/vendor/
+
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+*.pem
+*.key
+!docs/**/*.pem
+!docs/**/*.key
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated artefacts
+/dist/
+/tmp/
+
+# Container builds
+*.tar
