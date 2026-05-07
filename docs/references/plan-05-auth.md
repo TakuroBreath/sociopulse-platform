@@ -12,12 +12,15 @@ Status: **ready, plan not yet started**.
 
 ### Password hashing
 - [**RFC 9106 — Argon2 Password Hashing**](https://datatracker.ietf.org/doc/rfc9106/) — каноническое описание Argon2id, включая RECOMMENDED parameters.
+- [**OWASP Password Storage Cheat Sheet**](https://cheatsheetseries.owasp.org/cheatsheets/Password_Storage_Cheat_Sheet.html) — runtime guidance с актуальными minimum-параметрами.
   Note:
   - **Используем Argon2id**, не Argon2i и не Argon2d (баланс устойчивости к GPU и side-channel).
-  - RFC рекомендует: t=1, p=4, m=2 GiB для max-security; t=3, p=4, m=64 MiB для server-side default.
-  - **Для нашей нагрузки** (login peak ~10 RPS): t=3, m=64 MiB, p=2 — реалистичный баланс. Уточнить под реальный CPU.
+  - **Default params (locked in commit 66e35c3)**: m=19 MiB, t=2, p=1 — это OWASP "Argon2id minimum" (Aug 2024 revision).
+  - **Почему не 64 MiB / t=3 / p=4** (что советует RFC): главный риск для нас — DoS в виде memory pressure от concurrent логинов, а не offline-атака против утёкшей БД. 64 MiB × N concurrent = OOM-kill на 256 MiB pod'е до того, как rate-limit сработает. С m=19 MiB и `BoundedHasher` (semaphore cap = NumCPU) worst-case ≈ 76 MiB — предсказуемо и безопасно.
+  - **Defense layers**: (1) Argon2id с bounded memory; (2) `BoundedHasher` через `golang.org/x/sync/semaphore`; (3) per-IP rate limit (Plan 05 Task 5, 30/h); (4) lockout after 5 failures (Plan 05 Task 5).
   - Salt: 16 random bytes from `crypto/rand` (NOT math/rand).
   - Output: 32 bytes hex.
+  - **Если threat model изменится** (high-value tenant, real attack target) — bump `auth.password.{memory,iterations}` через config, существующие хеши работают (cost params в каждом PHC).
 
 ### JWT
 - [**RFC 7519 — JSON Web Token**](https://datatracker.ietf.org/doc/rfc7519/) — спецификация JWT.
@@ -96,7 +99,7 @@ Status: **ready, plan not yet started**.
 
 ## Gotchas (do-not-do list)
 
-1. **НЕ использовать `bcrypt`** — устарел (нет protect-against-side-channel, нет memory-hardness). Argon2id — современный стандарт.
+1. **НЕ использовать `bcrypt`** — устарел (нет protect-against-side-channel, нет memory-hardness). Argon2id — современный стандарт. (Note Aug 2024: bcrypt всё ещё OK для совсем low-stakes deployments; мы выбрали Argon2id с OWASP-минимум params + BoundedHasher.)
 2. **НЕ генерировать JWT secret detrministically** — всегда из `crypto/rand`. И НЕ из ENV var с дефолтом — обязательно из Lockbox в production.
 3. **НЕ хранить пароли в plaintext** для recovery — используем "user types new password + old password" flow. Forgot-password — email/sms link, не passive recovery.
 4. **НЕ путать `access` и `refresh` token TTL**: access = 15 мин (короткий), refresh = 30 дней (длинный, но revocable). Не наоборот.
