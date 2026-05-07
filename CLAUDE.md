@@ -69,3 +69,35 @@ Headlines:
   mandatory (ADR-0015). Methodology: `docs/architecture/08-tdd-discipline.md`.
 - **Linters**: `.golangci.yml` enforces all of the above mechanically.
   See `docs/architecture/07-go-coding-standards.md` § Linter Mapping.
+
+## Workflow rule for this project
+
+When working on Plans (00a/00b/02/03/...) on this repo:
+
+1. **Compact context** at the start — read tags, last commits, current state of `internal/`, `pkg/`, `migrations/`, `cmd/`. Cross-reference with `PROJECT_STATUS.md` (the living state document; update it after every milestone).
+2. **Read the plan** — `docs/superpowers/plans/2026-05-06-NN-<topic>.md`. Extract every task. Create a TodoWrite list.
+3. **Per task**, dispatch a fresh implementer subagent (`Agent` tool, `general-purpose`, `model: opus`) with:
+   - Explicit reference to relevant `samber/cc-skills-golang` skills (e.g., `golang-concurrency` BP1-BP9 for goroutine work, `golang-security` for crypto, `golang-error-handling` for error policy).
+   - **TDD discipline mandatory** per `superpowers:test-driven-development`: Red-Green-Refactor, watch the test fail before writing impl.
+   - Path-correction note: many older plan texts use `internal/<X>` where the real path is `pkg/<X>` (Plan 00a moved several abstractions to `pkg/`). Always check existing scaffolding before instructing the agent.
+   - Quality bar: `go build ./...` + `go vet ./...` + `go test -race -count=1 ./...` + `golangci-lint run ./...` + `gofmt -l ...` + `make grep-time-after`. ALL must be green before reporting DONE.
+   - Subagent MUST commit at the end (don't leave uncommitted work to be found later).
+4. **Two-stage review** per task (per `superpowers:subagent-driven-development`):
+   - Spec compliance review (verify code matches plan).
+   - Code quality review (strengths/issues/severity).
+   - Fix-up loop until both pass.
+5. **gopls cache is often stale** after subagent dispatches — diagnostic noise. Always re-verify directly with `go build ./... && go vet ./... && go test -race -count=1 ./...`. If those pass, the IDE diagnostics are noise.
+6. **At the end of each plan**, push to origin/main, watch CI to green (6 jobs: lint/test/build/docker/vuln/secret-scan), then tag `v0.0.N-<plan-slug>`.
+7. **Update `PROJECT_STATUS.md`** after each plan completes. Future agents read this first to know what exists. This is mandatory — `superpowers:grill-with-docs` is the canonical way to do it.
+
+## Tooling notes
+
+- `/Users/user/go/bin/golangci-lint` is the lint binary (v1.64.8 built against Go 1.26).
+- `make grep-time-after` is the CI gate against `time.After` in for loops (samber/cc-skills-golang@golang-concurrency § BP6).
+- `make dev-up` boots Postgres + Redis + NATS in containers; cmd/api etc. run natively via `go run`.
+- testcontainers-go is wired in `pkg/postgres`, `pkg/outbox`, `cmd/migrator` — local Docker required for `-tags=integration` tests.
+- depguard rules in `.golangci.yml`:
+  - `module-boundaries`: `internal/<X>/{service,store,events}` not importable across modules.
+  - `pgxpool-isolation`: `pgxpool` only in `pkg/postgres` + `internal/tenancy/store/admin_*` + `cmd/migrator`.
+  - `yandex-sdk-isolation`: forward-looking guard for Plan 04 KMS work.
+  - `banned-stdlib`: `math/rand`, CBC/ECB, MD5, SHA1, DES.
