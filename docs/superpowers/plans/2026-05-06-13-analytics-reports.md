@@ -11,7 +11,7 @@ The two modules share queue/cache plumbing and a strict tenant-scoping disciplin
 
 **Architecture:** Standard module shape `internal/<module>/{api,service,store,events}` with one extra: `internal/reports/templates/<kind>/{xlsx.go,csv.go,pdf.go}` for renderers. Public surface in `api/`: typed DTOs and interfaces — no third-party types leak. `service/` owns batching, queries, rendering. `store/` — direct ClickHouse driver (analytics) and `pgx` against `reports_jobs` (reports). `events/` — analytics consumes `dialer.call.finalized`/`recording.uploaded`/`operator.state.changed` durably; reports publishes `reports.report.ready`. HTTP endpoints registered through the gateway router from Plan 02 — admin-only RBAC.
 
-**Tech Stack:** Go 1.22+, `github.com/ClickHouse/clickhouse-go/v2` v2.25+, `github.com/xuri/excelize/v2` v2.8+, `github.com/signintech/gopdf` v0.20+, `github.com/hibiken/asynq` v0.24+, `github.com/nats-io/nats.go`, `github.com/redis/go-redis/v9`, `github.com/stretchr/testify`, `github.com/google/uuid`, `github.com/jackc/pgx/v5` (already wired in Plan 03). HTTP via the gateway's chi router from Plan 02. NATS subscription via the shared `events.Bus` interface (Plan 02). CH driver and asynq client are wired from `cmd/api/main.go` once and injected.
+**Tech Stack:** Go 1.22+, `github.com/ClickHouse/clickhouse-go/v2` v2.25+, `github.com/xuri/excelize/v2` v2.8+, `github.com/signintech/gopdf` v0.20+, `github.com/hibiken/asynq` v0.24+, `github.com/nats-io/nats.go`, `github.com/redis/go-redis/v9`, `github.com/stretchr/testify`, `github.com/google/uuid`, `github.com/jackc/pgx/v5` (already wired in Plan 03). HTTP via the gateway's gin router from Plan 02. NATS subscription via the shared `events.Bus` interface (Plan 02). CH driver and asynq client are wired from `cmd/api/main.go` once and injected.
 
 **Spec sections covered:** §FR-I (full), §6.4 (ClickHouse tables, materialised views), §6.3 `reports_jobs` table, §15.3 (`sociopulse_*` metrics), §17 (test strategy), §22 prototype `admin-pages-2.jsx::AdminReports`.
 
@@ -107,9 +107,9 @@ internal/reports/
 │   ├── upload_test.go
 │   ├── audit.go                      # writes audit_log entries
 │   ├── http_list.go                  # GET /api/reports
-│   ├── http_predefined.go            # POST /api/reports/{kind}/export
+│   ├── http_predefined.go            # POST /api/reports/:kind/export
 │   ├── http_custom.go                # POST /api/reports/custom
-│   ├── http_jobs.go                  # GET /api/reports/jobs/{jobID}, /download
+│   ├── http_jobs.go                  # GET /api/reports/jobs/:jobID, /download
 │   └── http_test.go
 │
 ├── store/
@@ -207,7 +207,7 @@ Read this once. Repeat in every PR description.
 - **Cache only what is read often.** Redis cache key is `analytics:{tenant_id}:{q_hash}` with TTL 30s for live overview, 5 min for region progress and operator comparisons. The hash is `sha256(canonical-json(query))[0:16]`. Cache is bypassed when `from > now-5min` (live tail).
 - **Idempotency.** Every CH INSERT carries an `event_id` (UUID from the source NATS message). The MergeTree table doesn't enforce uniqueness — we de-dup with a `ReplacingMergeTree(_inserted_at)` collapsing pattern in the materialised views, plus an in-memory LRU on the consumer for the latest 100k IDs to short-circuit obvious replays.
 - **Async threshold.** `service.IsAsyncRequired(period, est)` returns `true` if `period.End.Sub(period.Start) > 30*24h` OR `est > 100_000`. The service refuses to render synchronously above the threshold and forces enqueue.
-- **Audit.** Every `POST /api/reports/*/export`, `POST /api/reports/custom`, and `GET /api/reports/jobs/{id}/download` writes an `audit_log` row via `internal/audit/api.Writer.Write` (see Plan 11). Subject `reports.export`, payload contains `kind, params, format, job_id?, bytes?`.
+- **Audit.** Every `POST /api/reports/*/export`, `POST /api/reports/custom`, and `GET /api/reports/jobs/:id/download` writes an `audit_log` row via `internal/audit/api.Writer.Write` (see Plan 11). Subject `reports.export`, payload contains `kind, params, format, job_id?, bytes?`.
 - **PDF for big result sets.** PDFs cap at 5,000 rows of detail data; the runner falls back to "summary only" PDF beyond that, and the user gets a 2nd attached XLSX in the same job — surfaced as `result_files` JSON array on the job row.
 - **OpenTelemetry.** Each metric query and each render emits a span: `analytics.metrics.calls`, `reports.render.efficiency.xlsx`. Attributes always include `tenant_id`, `format`, `rows_returned`. No PII (phone numbers) in attributes — only IDs.
 - **Ports.** `cmd/api` exposes the HTTP API. `cmd/worker` runs the asynq consumer and the analytics ingest pipeline. Both bind to the same config and are deployed as separate `Deployment`s.
@@ -1402,7 +1402,7 @@ package api
 import (
     "net/http"
 
-    "github.com/go-chi/chi/v5"
+    "github.com/gin-gonic/gin"
 )
 
 type ServiceRO interface {
@@ -1423,21 +1423,37 @@ type OverviewResult struct {
     Hourly         []HourlyBucket         `json:"hourly"`
 }
 
-func Endpoints(svc ServiceRO, requireAdmin func(http.Handler) http.Handler) chi.Router {
-    r := chi.NewRouter()
-    r.Use(requireAdmin)
-    r.Get("/overview",   handleOverview(svc))
-    r.Get("/calls",      handleCalls(svc))
-    r.Get("/operators",  handleOperators(svc))
-    r.Get("/regions",    handleRegions(svc))
-    r.Get("/hourly",     handleHourly(svc))
-    return r
+func Endpoints(svc ServiceRO, requireAdmin gin.HandlerFunc) func(*gin.RouterGroup) {
+    return func(r *gin.RouterGroup) {
+        r.Use(requireAdmin)
+        r.GET("/overview",   handleOverview(svc))
+        r.GET("/calls",      handleCalls(svc))
+        r.GET("/operators",  handleOperators(svc))
+        r.GET("/regions",    handleRegions(svc))
+        r.GET("/hourly",     handleHourly(svc))
+    }
+}
+
+func handleOverview(svc ServiceRO) gin.HandlerFunc {
+    return func(c *gin.Context) {
+        q, err := decodeOverviewQuery(c)
+        if err != nil {
+            c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+            return
+        }
+        result, err := svc.Overview(c.Request.Context(), q)
+        if err != nil {
+            c.JSON(http.StatusInternalServerError, gin.H{"error": "internal"})
+            return
+        }
+        c.JSON(http.StatusOK, result)
+    }
 }
 ```
 
-- [ ] Each `handle*` decodes the query from URL parameters (`from`, `to`, `project_id`), reads `tenant_id` from the request context (set by tenancy middleware in Plan 04), calls the service, and JSON-encodes the response. 400 on bad input; 500 on internal; 200 on success.
+- [ ] Each `handle*` decodes the query from URL parameters (`from`, `to`, `project_id`), reads `tenant_id` from the request context (set by tenancy middleware in Plan 04), calls the service, and JSON-encodes the response via `c.JSON`. 400 on bad input; 500 on internal; 200 on success.
 
-- [ ] `cmd/api/main.go` registers it under `/api/analytics`.
+- [ ] `cmd/api/main.go` registers it under `/api/analytics` via `analyticsHTTP.Endpoints(svc, requireAdminMW)(router.Group("/api/analytics"))`.
 
 #### 4.5 — Verification
 
@@ -1460,7 +1476,7 @@ func Endpoints(svc ServiceRO, requireAdmin func(http.Handler) http.Handler) chi.
 - §FR-I1 6 преднастроенных отчётов в `internal/reports/templates/<kind>/{xlsx.go,csv.go,pdf.go}`: efficiency_operators, project_summary, calls_by_status, financial, quality_control, hourly_activity. ✓
 - §FR-I2 произвольный отчёт `POST /api/reports/custom` → 202 + jobID для async. ✓
 - §FR-I3 async через asynq для period > 30 дней OR rows > 100 000; persist в S3 (`reports` bucket), 24h presigned URL. ✓
-- HTTP endpoints: GET `/api/reports`, GET `/api/reports/{kind}`, POST `/api/reports/{kind}/export`, POST `/api/reports/custom`, GET `/api/reports/jobs/{jobID}`, GET `/api/reports/jobs/{jobID}/download`. ✓
+- HTTP endpoints: GET `/api/reports`, GET `/api/reports/:kind`, POST `/api/reports/:kind/export`, POST `/api/reports/custom`, GET `/api/reports/jobs/:jobID`, GET `/api/reports/jobs/:jobID/download`. Handlers return `gin.HandlerFunc`; path params read via `c.Param("kind")` / `c.Param("jobID")`. ✓
 - §15.3 метрики: `sociopulse_reports_jobs_total{kind,status}`, `sociopulse_reports_render_duration_seconds`, `sociopulse_analytics_query_duration_seconds`. ✓
 - §17 тестовая стратегия: unit (renderer на минимальных данных + структура XLSX через excelize-read, CSV через csv.Reader, PDF через page-count), integration end-to-end async-job, load-test (100 RPS for 1 min, p95 < 300ms с прогретым кешем). Coverage ≥ 80%. ✓
 - §22 прототип `admin-pages-2.jsx::AdminReports` — UI потребляет эти endpoints, реализуется в Plan 19. ✓
