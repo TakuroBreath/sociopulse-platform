@@ -54,16 +54,26 @@ func registerModule(ctx context.Context, deps api.Deps) (*api.Module, error) {
 	}
 	kmsResolver := newKMSResolverWithContext(ctx, deps.Logger.Named("kms-resolver"), tenantStore, deps.KMS, resolverCfg)
 
+	hasherCfg := PhoneHasherConfig{
+		PepperCacheTTL:  resolverCfg.DEKCacheTTL,
+		PepperCacheSize: resolverCfg.DEKCacheSize,
+	}
+	phoneHasher := NewPhoneHasher(deps.Logger, tenantStore, hasherCfg)
+
 	mod := api.NewModule(deps, nil /* full Tenancy aggregate lands in a later task */, tenantSvc, &resolverCloser{r: kmsResolver})
 	mod.SetKMSResolver(kmsResolver)
+	mod.SetPhoneHasher(phoneHasher)
 
 	deps.Logger.Info("tenancy module registered",
 		zap.Strings("services", []string{
 			"tenancy.TenantService",
 			"tenancy.KMSResolver",
+			"tenancy.PhoneHasher",
 		}),
 		zap.Duration("dek_cache_ttl", resolverCfg.DEKCacheTTL),
 		zap.Int("dek_cache_size", resolverCfg.DEKCacheSize),
+		zap.Duration("pepper_cache_ttl", hasherCfg.PepperCacheTTL),
+		zap.Int("pepper_cache_size", hasherCfg.PepperCacheSize),
 	)
 
 	return mod, nil

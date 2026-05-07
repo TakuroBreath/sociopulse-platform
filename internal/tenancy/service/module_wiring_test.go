@@ -74,6 +74,11 @@ func TestModule_Register_RegistersKMSResolver_WithLocalProvider(t *testing.T) {
 	require.True(t, ok, "tenancy.KMSResolver must be registered in the locator")
 	_, isResolver := resolver.(api.KMSResolver)
 	require.True(t, isResolver, "registered service must satisfy api.KMSResolver")
+
+	hasher, ok := loc.Lookup("tenancy.PhoneHasher")
+	require.True(t, ok, "tenancy.PhoneHasher must be registered in the locator")
+	_, isHasher := hasher.(api.PhoneHasher)
+	require.True(t, isHasher, "registered service must satisfy api.PhoneHasher")
 }
 
 func TestModule_Register_PropagatesUnknownKMSProvider(t *testing.T) {

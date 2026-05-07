@@ -60,14 +60,17 @@ func (m *Module) Register(d modules.Deps) error {
 	}
 	m.apiModule = mod
 	if d.Locator != nil {
-		// Plan 04 Task 2 wires TenantService; Task 3 wires KMSResolver.
-		// SettingsCache and PhoneHasher follow in later tasks; the
-		// aggregate Tenancy is registered once all four have landed.
+		// Plan 04 Task 2 wires TenantService; Task 3 wires KMSResolver;
+		// Task 5 wires PhoneHasher. SettingsCache follows in later tasks;
+		// the aggregate Tenancy is registered once all four have landed.
 		if ts := mod.TenantService(); ts != nil {
 			d.Locator.Register("tenancy.TenantService", ts)
 		}
 		if r := mod.KMSResolver(); r != nil {
 			d.Locator.Register("tenancy.KMSResolver", r)
+		}
+		if h := mod.PhoneHasher(); h != nil {
+			d.Locator.Register("tenancy.PhoneHasher", h)
 		}
 		if t := mod.Tenancy(); t != nil {
 			d.Locator.Register("tenancy.Tenancy", t)

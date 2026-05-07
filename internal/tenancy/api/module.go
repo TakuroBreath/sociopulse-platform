@@ -112,6 +112,7 @@ type Module struct {
 	tenancy       Tenancy
 	tenantService TenantService
 	kmsResolver   KMSResolver
+	phoneHasher   PhoneHasher
 	closer        io.Closer
 }
 
@@ -144,6 +145,16 @@ func (m *Module) KMSResolver() KMSResolver { return m.kmsResolver }
 // Used by service.registerModule to keep NewModule's signature stable as
 // new sub-interfaces land. Idempotent; the last call wins.
 func (m *Module) SetKMSResolver(r KMSResolver) { m.kmsResolver = r }
+
+// PhoneHasher returns the per-tenant HMAC-SHA256 phone hasher. Available
+// once Plan 04 Task 5 wires the service-layer implementation. Returns nil
+// before the service-layer Register populates it; callers must gate.
+func (m *Module) PhoneHasher() PhoneHasher { return m.phoneHasher }
+
+// SetPhoneHasher injects the hasher into the Module after construction.
+// Used by service.registerModule to keep NewModule's signature stable as
+// new sub-interfaces land. Idempotent; the last call wins.
+func (m *Module) SetPhoneHasher(h PhoneHasher) { m.phoneHasher = h }
 
 // Deps returns the dependency bundle the module was constructed with.
 // Useful in tests and at shutdown.
