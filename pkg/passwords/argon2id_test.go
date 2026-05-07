@@ -2,7 +2,6 @@ package passwords_test
 
 import (
 	"slices"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -206,7 +205,7 @@ func TestVerify_TimingDeltaSmall(t *testing.T) {
 	rights := make([]time.Duration, 0, N)
 	wrongs := make([]time.Duration, 0, N)
 	// Interleave to spread scheduler/JIT noise evenly across the two arms.
-	for i := 0; i < N; i++ {
+	for range N {
 		t0 := time.Now()
 		_, _ = passwords.Verify(encoded, "hunter2")
 		rights = append(rights, time.Since(t0))
@@ -233,7 +232,7 @@ func TestVerify_TimingDeltaSmall(t *testing.T) {
 // slice ordering is preserved.
 func median(d []time.Duration) time.Duration {
 	cp := slices.Clone(d)
-	sort.Slice(cp, func(i, j int) bool { return cp[i] < cp[j] })
+	slices.Sort(cp)
 	return cp[len(cp)/2]
 }
 
