@@ -1,0 +1,11 @@
+<?xml version="1.0"?>
+<!--
+  dev/clickhouse/config.xml — local dev ClickHouse server config.
+  DEV ONLY. Production is Yandex Managed ClickHouse.
+-->
+<clickhouse>
+    <listen_host>0.0.0.0</listen_host>
+    <logger>
+        <level>information</level>
+    </logger>
+</clickhouse>

@@ -1,0 +1,151 @@
+# docker-compose.dev.yml — local development stack for sociopulse-platform.
+#
+# DEV ONLY. Production runs on Yandex Managed Kubernetes (MKS) with Yandex
+# Managed PostgreSQL / Redis / ClickHouse / Object Storage. This file is NOT a
+# production deployment artefact and MUST NOT be deployed anywhere reachable
+# from the public internet — every port binds to 127.0.0.1 to enforce that.
+#
+# Usage:
+#   make dev-up                       # core: Postgres + Redis + NATS
+#   make dev-up PROFILE=analytics     # add ClickHouse
+#   make dev-up PROFILE=storage       # add MinIO (S3 emulator)
+#   make dev-up PROFILE=full          # everything
+#
+# Application code (cmd/api, cmd/worker, etc.) runs natively on the host with
+# `go run` and connects to these containers via 127.0.0.1:<port>.
+
+name: sociopulse-dev
+
+services:
+  postgres:
+    image: postgres:16.4-alpine
+    container_name: sp-postgres
+    ports:
+      - "127.0.0.1:5432:5432"
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: devpass
+      POSTGRES_DB: sociopulse
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./dev/postgres/init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+      - ./dev/postgres/postgresql.conf:/etc/postgresql/postgresql.conf:ro
+    command: postgres -c config_file=/etc/postgresql/postgresql.conf
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d sociopulse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7.2-alpine
+    container_name: sp-redis
+    ports:
+      - "127.0.0.1:6379:6379"
+    volumes:
+      - redis-data:/data
+      - ./dev/redis/redis.conf:/usr/local/etc/redis/redis.conf:ro
+    command: redis-server /usr/local/etc/redis/redis.conf
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  nats:
+    image: nats:2.10-alpine
+    container_name: sp-nats
+    ports:
+      - "127.0.0.1:4222:4222"   # client
+      - "127.0.0.1:8222:8222"   # monitoring HTTP
+    volumes:
+      - nats-data:/data
+      - ./dev/nats/nats-server.conf:/etc/nats/nats-server.conf:ro
+    command: ["-c", "/etc/nats/nats-server.conf"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # --- analytics profile -------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    container_name: sp-clickhouse
+    profiles: [analytics, full]
+    ports:
+      - "127.0.0.1:8123:8123"   # HTTP
+      - "127.0.0.1:9000:9000"   # native
+    volumes:
+      - clickhouse-data:/var/lib/clickhouse
+      - ./dev/clickhouse/users.xml:/etc/clickhouse-server/users.d/dev-users.xml:ro
+      - ./dev/clickhouse/config.xml:/etc/clickhouse-server/config.d/dev-config.xml:ro
+    environment:
+      CLICKHOUSE_DB: sociopulse
+      CLICKHOUSE_USER: app
+      CLICKHOUSE_PASSWORD: devpass
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8123/ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  # --- storage profile ---------------------------------------------------
+  minio:
+    image: minio/minio:RELEASE.2024-09-13T20-26-02Z
+    container_name: sp-minio
+    profiles: [storage, full]
+    ports:
+      - "127.0.0.1:9090:9000"   # S3 API (host port 9090 to avoid clash with CH 9000)
+      - "127.0.0.1:9091:9001"   # Console UI
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+    command: server /data --console-address ":9001"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
+
+  # MinIO bootstrap: create dev buckets on first run.
+  minio-init:
+    image: minio/mc:RELEASE.2024-09-09T07-53-10Z
+    container_name: sp-minio-init
+    profiles: [storage, full]
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 minioadmin minioadmin;
+      mc mb -p local/sociopulse-dev-recordings || true;
+      mc mb -p local/sociopulse-dev-backups || true;
+      mc mb -p local/sociopulse-dev-reports || true;
+      mc mb -p local/sociopulse-dev-consent-prompts || true;
+      echo 'MinIO buckets ready';
+      "
+
+volumes:
+  postgres-data:
+  redis-data:
+  nats-data:
+  clickhouse-data:
+  minio-data:
+
+networks:
+  default:
+    name: sociopulse-dev-net

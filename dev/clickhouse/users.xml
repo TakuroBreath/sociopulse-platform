@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<!--
+  dev/clickhouse/users.xml — local dev ClickHouse user config.
+  DEV ONLY. Production is Yandex Managed ClickHouse.
+-->
+<clickhouse>
+    <users>
+        <app>
+            <password>devpass</password>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <access_management>1</access_management>
+        </app>
+    </users>
+</clickhouse>

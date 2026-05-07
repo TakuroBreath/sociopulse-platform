@@ -88,3 +88,59 @@ grep-time-after: ## Fail if time.After appears within a for-loop scope (golang-c
 
 .PHONY: ci
 ci: lint vet grep-time-after test ## What CI runs
+
+# ----------------------------------------------------------------------
+# Local development stack (Docker Compose)
+# ----------------------------------------------------------------------
+# `make dev-up` boots Postgres + Redis + NATS in containers; cmd/api etc.
+# run natively on the host via `go run ./cmd/api`. Production runs on Yandex
+# MKS with managed services — see Plan 01.
+
+PROFILE ?=
+
+.PHONY: dev-up
+dev-up: ## Start local dev stack (PROFILE=analytics|storage|full)
+	@if [ -z "$(PROFILE)" ]; then \
+		docker compose -f docker-compose.dev.yml up -d postgres redis nats; \
+	else \
+		docker compose -f docker-compose.dev.yml --profile $(PROFILE) up -d; \
+	fi
+	@echo ""
+	@echo "Stack is up. Endpoints (all bound to 127.0.0.1):"
+	@echo "  Postgres   : postgres://app:devpass@localhost:5432/sociopulse"
+	@echo "  Redis      : redis://localhost:6379"
+	@echo "  NATS       : nats://localhost:4222 (monitoring at http://localhost:8222)"
+	@if [ "$(PROFILE)" = "analytics" ] || [ "$(PROFILE)" = "full" ]; then \
+		echo "  ClickHouse : http://localhost:8123 (user=app)"; \
+	fi
+	@if [ "$(PROFILE)" = "storage" ] || [ "$(PROFILE)" = "full" ]; then \
+		echo "  MinIO      : http://localhost:9090 (console http://localhost:9091, minioadmin/minioadmin)"; \
+	fi
+
+.PHONY: dev-down
+dev-down: ## Stop local dev stack (preserves volumes)
+	docker compose -f docker-compose.dev.yml --profile full down
+
+.PHONY: dev-logs
+dev-logs: ## Tail logs from dev stack
+	docker compose -f docker-compose.dev.yml logs -f --tail=100
+
+.PHONY: dev-psql
+dev-psql: ## Open psql shell against dev Postgres
+	docker exec -it sp-postgres psql -U app -d sociopulse
+
+.PHONY: dev-redis-cli
+dev-redis-cli: ## Open redis-cli against dev Redis
+	docker exec -it sp-redis redis-cli
+
+.PHONY: dev-nats
+dev-nats: ## Show NATS monitoring info
+	@echo "NATS monitoring: http://localhost:8222"
+	@echo "JetStream info:"
+	@curl -s http://localhost:8222/jsz | (jq . 2>/dev/null || cat)
+
+.PHONY: dev-reset
+dev-reset: ## Stop and DELETE all dev data volumes (destructive)
+	@echo "WARNING: deleting all dev data (Postgres, Redis, NATS, CH, MinIO volumes)..."
+	docker compose -f docker-compose.dev.yml --profile full down -v
+	@echo "Done. Run 'make dev-up' to recreate."

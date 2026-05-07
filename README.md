@@ -30,6 +30,58 @@ make run
 
 Visit http://localhost:8080/healthz to verify.
 
+## Local development
+
+Backend services (`cmd/api`, `cmd/worker`, `cmd/telephony-bridge`, etc.) run
+natively on your machine via `go run`. External dependencies (Postgres, Redis,
+NATS, optionally ClickHouse and MinIO) run as Docker containers managed by
+`docker-compose.dev.yml`.
+
+All ports bind to `127.0.0.1` only — nothing in the dev stack is reachable
+from your network.
+
+### Quick start
+
+```bash
+# Boot core dependencies (Postgres + Redis + NATS):
+make dev-up
+
+# Run cmd/api locally against the containers:
+go run ./cmd/api --config configs/development/config.yaml
+
+# In another terminal — run a worker:
+go run ./cmd/worker --config configs/development/config.yaml
+```
+
+### Profiles
+
+- `make dev-up` — core only (PG + Redis + NATS).
+- `make dev-up PROFILE=analytics` — adds ClickHouse for analytics module work.
+- `make dev-up PROFILE=storage` — adds MinIO (S3 emulator) for recording-module work.
+- `make dev-up PROFILE=full` — everything above.
+
+### Useful commands
+
+- `make dev-logs` — tail all container logs.
+- `make dev-psql` — open a `psql` shell against the dev Postgres.
+- `make dev-redis-cli` — open `redis-cli`.
+- `make dev-nats` — show NATS monitoring info.
+- `make dev-down` — stop all containers (data preserved in volumes).
+- `make dev-reset` — stop and **delete all data** (destructive). Use when
+  migrations get tangled.
+
+### Tests
+
+Integration tests use `testcontainers-go` and start their own ephemeral
+containers per test, separate from the dev stack. You don't need
+`make dev-up` to run `go test`.
+
+### Production != Dev
+
+This Compose stack is for **local development only**. Production runs on
+Yandex Managed Kubernetes (MKS) with Yandex Managed PostgreSQL / Redis /
+ClickHouse / Object Storage — see `sociopulse-infra` and Plan 01.
+
 ## Docker images
 
 CI publishes multi-tagged images to Docker Hub on every push to `main` and on
