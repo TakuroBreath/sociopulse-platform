@@ -87,9 +87,9 @@ linters-settings:
     errorf-multi: true
     asserts: true               # require errors.As over type assertion
     comparison: true            # require errors.Is over ==
-  forcetypeassert:
-    # Empty allow-list — every type assertion MUST use comma-ok form.
-    # See samber/cc-skills-golang@golang-safety §Type-Assertions.
+  # forcetypeassert: no settings to configure — linter is enabled in `linters:`
+  # block above. Every type assertion in our code MUST use comma-ok form.
+  # See samber/cc-skills-golang@golang-safety §Type-Assertions.
   paralleltest:
     ignore-missing: false        # all tests SHOULD call t.Parallel() unless explicitly excluded
     ignore-missing-subtests: false
