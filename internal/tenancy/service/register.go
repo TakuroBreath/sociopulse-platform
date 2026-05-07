@@ -25,11 +25,14 @@ func init() {
 // an *api.Module that the caller (internal/tenancy/module.go) registers in
 // the modules.Locator.
 //
-// Plan 04 Task 3 adds KMSResolver to the wired surface. SettingsCache and
-// PhoneHasher follow in later tasks; until they land, the aggregate
-// Tenancy interface stays nil and callers gate via Module.Tenancy().
+// The KMSResolver's DEK cache spawns a background eviction goroutine bound
+// to ctx — cancelling ctx (cmd/api shutdown) terminates the goroutine.
+// Callers should also call mod.Stop() at shutdown for the explicit close
+// path; either route stops the goroutine cleanly.
+//
+// Plan 04 Task 3 added KMSResolver to the wired surface; Task 4 hardens
+// the cache to LRU+TTL with a KEK-version-aware key.
 func registerModule(ctx context.Context, deps api.Deps) (*api.Module, error) {
-	_ = ctx
 	if deps.Logger == nil {
 		return nil, errors.New("tenancy/service: logger is required")
 	}
@@ -49,9 +52,9 @@ func registerModule(ctx context.Context, deps api.Deps) (*api.Module, error) {
 		DEKCacheTTL:  parseTTL(deps.Config.DEKCacheTTL, 5*time.Minute),
 		DEKCacheSize: orDefaultInt(deps.Config.DEKCacheSize, 1024),
 	}
-	kmsResolver := NewKMSResolver(deps.Logger.Named("kms-resolver"), tenantStore, deps.KMS, resolverCfg)
+	kmsResolver := newKMSResolverWithContext(ctx, deps.Logger.Named("kms-resolver"), tenantStore, deps.KMS, resolverCfg)
 
-	mod := api.NewModule(deps, nil /* full Tenancy aggregate lands in a later task */, tenantSvc, noopCloser{})
+	mod := api.NewModule(deps, nil /* full Tenancy aggregate lands in a later task */, tenantSvc, &resolverCloser{r: kmsResolver})
 	mod.SetKMSResolver(kmsResolver)
 
 	deps.Logger.Info("tenancy module registered",
@@ -89,10 +92,20 @@ func orDefaultInt(v, fallback int) int {
 	return v
 }
 
-// noopCloser satisfies io.Closer for module shutdown when there are no
-// resources to release. Plan 04 later tasks may swap in a real closer that
-// stops cache invalidation subscribers.
-type noopCloser struct{}
+// resolverCloser is the io.Closer the module exposes to the modules.Locator.
+// It terminates the KMSResolver's background DEK-cache eviction goroutine
+// when the host process shuts down. cmd/api invokes this through the
+// modules.Locator's CloseAll.
+type resolverCloser struct {
+	r *KMSResolverImpl
+}
 
-// Close is a no-op for the Plan 04 Task 2/3 wiring.
-func (noopCloser) Close() error { return nil }
+// Close terminates the resolver's eviction goroutine. Always returns nil:
+// the resolver's Close is idempotent and panic-free, so there is no error
+// surface to propagate.
+func (c *resolverCloser) Close() error {
+	if c.r != nil {
+		c.r.Close()
+	}
+	return nil
+}

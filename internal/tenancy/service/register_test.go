@@ -49,6 +49,12 @@ func TestRegisterSeam_WiresKMSResolver_WhenAllDepsPresent(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, mod, "register must return a Module")
+	t.Cleanup(func() {
+		// Stop releases the KMSResolver's eviction goroutine so goleak
+		// stays clean. Plan 04 Task 4 wired the resolver's lifecycle into
+		// the module's Closer.
+		_ = mod.Stop()
+	})
 	require.NotNil(t, mod.KMSResolver(),
 		"Plan 04 Task 3 requires Register to wire the KMSResolver onto the Module")
 	require.NotNil(t, mod.TenantService(),

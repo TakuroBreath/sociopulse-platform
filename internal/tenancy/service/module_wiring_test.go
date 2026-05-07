@@ -64,6 +64,11 @@ func TestModule_Register_RegistersKMSResolver_WithLocalProvider(t *testing.T) {
 		Locator: loc,
 	})
 	require.NoError(t, err)
+	t.Cleanup(func() {
+		// Stop tears down the KMSResolver's eviction goroutine — required
+		// by goleak.VerifyTestMain in main_test.go.
+		_ = mod.Stop()
+	})
 
 	resolver, ok := loc.Lookup("tenancy.KMSResolver")
 	require.True(t, ok, "tenancy.KMSResolver must be registered in the locator")

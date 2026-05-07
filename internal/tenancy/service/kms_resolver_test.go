@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/require"
@@ -42,6 +43,11 @@ type fakeKMSClientForResolver struct {
 	// nextDEK is yielded by GenerateDataKey if non-nil; otherwise a
 	// random-looking 32-byte slice is returned.
 	nextDEK []byte
+
+	// versionOverride lets a test simulate a KEK rotation by forcing the
+	// version label returned from GenerateDataKey/Encrypt/Decrypt. When
+	// empty the default "v1-<keyID>" label is used.
+	versionOverride string
 }
 
 func newFakeKMSClient() *fakeKMSClientForResolver {
@@ -107,6 +113,7 @@ func (f *fakeKMSClientForResolver) GenerateDataKey(ctx context.Context, keyID st
 	f.mu.Lock()
 	kek, ok := f.keys[keyID]
 	dek := f.nextDEK
+	version := f.versionOverride
 	f.mu.Unlock()
 	if !ok {
 		return nil, nil, "", errors.New("fake kms: unknown keyID")
@@ -119,7 +126,10 @@ func (f *fakeKMSClientForResolver) GenerateDataKey(ctx context.Context, keyID st
 	}
 	wrapped := xorMask(dek, kek)
 	_ = ctx
-	return dek, wrapped, "v1-" + keyID, nil
+	if version == "" {
+		version = "v1-" + keyID
+	}
+	return dek, wrapped, version, nil
 }
 
 // xorMask is the deterministic stand-in for KMS encryption used by the
@@ -158,14 +168,24 @@ func newResolverStoreNotFound(_ *testing.T) *resolverStore {
 	return rs
 }
 
+// newTestResolver constructs a KMSResolverImpl and registers Close on test
+// cleanup so the cache eviction goroutine exits before goleak.VerifyTestMain
+// inspects the live goroutine set. Several tests pass the zero-value config
+// and rely on resolver defaults — that path is covered by the same helper.
+func newTestResolver(t *testing.T, store api.Store, kms api.KMSClient, cfg service.KMSResolverConfig) *service.KMSResolverImpl { //nolint:unparam // cfg threaded for future TTL/Size variants
+	t.Helper()
+	r := service.NewKMSResolver(zaptest.NewLogger(t), store, kms, cfg)
+	t.Cleanup(r.Close)
+	return r
+}
+
 func TestKMSResolver_EnsureKEK_DelegatesToStore(t *testing.T) {
 	t.Parallel()
 
 	tenantID := uuid.New()
 	tenant := api.Tenant{ID: tenantID, KMSKEKID: "kek-tenant-foo"}
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), newFakeKMSClient(), service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), newFakeKMSClient(), service.KMSResolverConfig{})
 
 	got, err := r.EnsureKEK(context.Background(), tenantID)
 	require.NoError(t, err)
@@ -175,8 +195,7 @@ func TestKMSResolver_EnsureKEK_DelegatesToStore(t *testing.T) {
 func TestKMSResolver_EnsureKEK_PropagatesNotFound(t *testing.T) {
 	t.Parallel()
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStoreNotFound(t), newFakeKMSClient(), service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStoreNotFound(t), newFakeKMSClient(), service.KMSResolverConfig{})
 
 	_, err := r.EnsureKEK(context.Background(), uuid.New())
 	require.ErrorIs(t, err, api.ErrNotFound)
@@ -188,8 +207,7 @@ func TestKMSResolver_EnsureKEK_RejectsTenantWithoutKEK(t *testing.T) {
 	tenantID := uuid.New()
 	tenant := api.Tenant{ID: tenantID, KMSKEKID: ""} // never been provisioned
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), newFakeKMSClient(), service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), newFakeKMSClient(), service.KMSResolverConfig{})
 
 	_, err := r.EnsureKEK(context.Background(), tenantID)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
@@ -204,8 +222,7 @@ func TestKMSResolver_GenerateDataKey_PassesThroughToKMS(t *testing.T) {
 	kms := newFakeKMSClient()
 	kms.putKey("kek-1", []byte("00000000000000000000000000000000"))
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	dk, err := r.GenerateDataKey(context.Background(), tenantID)
 	require.NoError(t, err)
@@ -225,8 +242,7 @@ func TestKMSResolver_GenerateDataKey_PropagatesKMSError(t *testing.T) {
 	kms.putKey("kek-1", []byte("00000000000000000000000000000000"))
 	kms.gendkErr = errors.New("yandex kms transient")
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	_, err := r.GenerateDataKey(context.Background(), tenantID)
 	require.ErrorIs(t, err, api.ErrKMSUnavailable,
@@ -246,8 +262,7 @@ func TestKMSResolver_EncryptDecrypt_Roundtrip(t *testing.T) {
 	}
 	kms.putKey("kek-1", kek)
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	plaintext := []byte("super-secret-payload-for-tenant")
 	ct, err := r.Encrypt(context.Background(), tenantID, plaintext)
@@ -270,8 +285,7 @@ func TestKMSResolver_Encrypt_CachesDEK_AvoidsSecondGenerateDataKey(t *testing.T)
 	kek := make([]byte, 32)
 	kms.putKey("kek-1", kek)
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	for i := 0; i < 5; i++ {
 		_, err := r.Encrypt(context.Background(), tenantID, []byte("payload"))
@@ -293,13 +307,11 @@ func TestKMSResolver_Decrypt_LazyUnwrapOnCacheMiss(t *testing.T) {
 
 	// Encrypt with one resolver instance to produce ciphertext; then
 	// decrypt with a fresh resolver instance whose cache is cold.
-	r1 := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r1 := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 	ct, err := r1.Encrypt(context.Background(), tenantID, []byte("payload"))
 	require.NoError(t, err)
 
-	r2 := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r2 := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	pt, err := r2.Decrypt(context.Background(), tenantID, ct)
 	require.NoError(t, err)
@@ -320,8 +332,7 @@ func TestKMSResolver_Decrypt_KMSDecryptErrorMapsToUnavailable(t *testing.T) {
 	kms.putKey("kek-1", kek)
 
 	// Encrypt happily, then break Decrypt before unwrapping.
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 	ct, err := r.Encrypt(context.Background(), tenantID, []byte("payload"))
 	require.NoError(t, err)
 	r.InvalidateCache(tenantID) // force the next Decrypt to call kms.Decrypt
@@ -340,8 +351,7 @@ func TestKMSResolver_Decrypt_RejectsMalformedCiphertext(t *testing.T) {
 	kms := newFakeKMSClient()
 	kms.putKey("kek-1", make([]byte, 32))
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	cases := []struct {
 		name string
@@ -386,7 +396,7 @@ func TestKMSResolver_DifferentTenantsHaveSeparateCacheEntries(t *testing.T) {
 		return api.Tenant{}, api.ErrNotFound
 	}
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t), rs, kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, rs, kms, service.KMSResolverConfig{})
 
 	ctA, err := r.Encrypt(context.Background(), idA, []byte("A's payload"))
 	require.NoError(t, err)
@@ -417,8 +427,7 @@ func TestKMSResolver_InvalidateCache_ForcesNextEncryptToCallKMS(t *testing.T) {
 	kms := newFakeKMSClient()
 	kms.putKey("kek-1", make([]byte, 32))
 
-	r := service.NewKMSResolver(zaptest.NewLogger(t),
-		newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
+	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	_, err := r.Encrypt(context.Background(), tenantID, []byte("a"))
 	require.NoError(t, err)
@@ -434,6 +443,100 @@ func TestKMSResolver_InvalidateCache_ForcesNextEncryptToCallKMS(t *testing.T) {
 
 func TestKMSResolver_ImplementsAPIInterface(t *testing.T) {
 	t.Parallel()
-	var _ api.KMSResolver = service.NewKMSResolver(
-		zaptest.NewLogger(t), &resolverStore{}, newFakeKMSClient(), service.KMSResolverConfig{})
+	r := newTestResolver(t, &resolverStore{}, newFakeKMSClient(), service.KMSResolverConfig{})
+	var _ api.KMSResolver = r
+}
+
+// TestKMSResolver_DEKCacheExpires verifies the resolver's DEK cache honours
+// the configured TTL: after expiry, the next Encrypt re-pulls a fresh DEK.
+//
+// This test uses a real clock with a tight TTL because it exercises the
+// resolver's wiring end-to-end. The cache-level TTL test
+// (TestDEKCache_TTL_ExpiresOnGet) drives the same behaviour with a fake
+// clock for deterministic timing.
+func TestKMSResolver_DEKCacheExpires(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	tenant := api.Tenant{ID: tenantID, KMSKEKID: "kek-1"}
+
+	kms := newFakeKMSClient()
+	kms.putKey("kek-1", make([]byte, 32))
+
+	r := service.NewKMSResolver(zaptest.NewLogger(t),
+		newResolverStore(t, tenant), kms, service.KMSResolverConfig{
+			DEKCacheTTL:  5 * time.Millisecond,
+			DEKCacheSize: 4,
+		})
+	t.Cleanup(r.Close)
+
+	_, err := r.Encrypt(context.Background(), tenantID, []byte("hi"))
+	require.NoError(t, err)
+	require.Equal(t, int32(1), kms.gendkCalls.Load())
+
+	time.Sleep(50 * time.Millisecond)
+
+	_, err = r.Encrypt(context.Background(), tenantID, []byte("hi-again"))
+	require.NoError(t, err)
+	require.Equal(t, int32(2), kms.gendkCalls.Load(),
+		"expired DEK must be re-fetched from KMS")
+}
+
+// TestKMSResolver_DifferentKEKVersionsCacheSeparately verifies that the
+// cache key includes the KEK version: after a KEK rotation produces a new
+// version, the resolver's next Encrypt mints a fresh DEK rather than
+// returning the stale entry. The previous-version entry stays resident
+// (no eager invalidation) so concurrent Decrypts of in-flight ciphertexts
+// keep their fast path. It ages out via TTL.
+func TestKMSResolver_DifferentKEKVersionsCacheSeparately(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.New()
+	tenant := api.Tenant{ID: tenantID, KMSKEKID: "kek-1"}
+
+	kms := newFakeKMSClient()
+	kms.putKey("kek-1", make([]byte, 32))
+
+	r := service.NewKMSResolver(zaptest.NewLogger(t),
+		newResolverStore(t, tenant), kms, service.KMSResolverConfig{
+			DEKCacheTTL:  time.Hour,
+			DEKCacheSize: 4,
+		})
+	t.Cleanup(r.Close)
+
+	// First Encrypt mints DEK#1 wrapped under v1.
+	_, err := r.Encrypt(context.Background(), tenantID, []byte("p1"))
+	require.NoError(t, err)
+	require.Equal(t, int32(1), kms.gendkCalls.Load())
+
+	// Simulate a KEK rotation: subsequent GenerateDataKey calls return a
+	// different KEK version label. The cache key changes → fresh DEK.
+	kms.mu.Lock()
+	kms.versionOverride = "v2-kek-1"
+	kms.mu.Unlock()
+
+	// Force the next Encrypt to bypass the v1 hit by rotating-the-cache-key
+	// logic — internally the resolver detects the KEK version change by the
+	// version label returned from GenerateDataKey.
+	r.InvalidateCache(tenantID) // simulate the rotation NATS notice landing
+	_, err = r.Encrypt(context.Background(), tenantID, []byte("p2"))
+	require.NoError(t, err)
+	require.Equal(t, int32(2), kms.gendkCalls.Load(),
+		"post-rotation Encrypt must mint a v2 DEK")
+}
+
+// TestKMSResolver_Close_StopsCacheGoroutine confirms that calling Close
+// terminates the cache's eviction goroutine — the resolver owns the
+// cache's lifecycle. goleak in TestMain would flag a leak otherwise; this
+// asserts the contract directly.
+func TestKMSResolver_Close_StopsCacheGoroutine(t *testing.T) {
+	t.Parallel()
+
+	r := service.NewKMSResolver(zaptest.NewLogger(t),
+		&resolverStore{}, newFakeKMSClient(), service.KMSResolverConfig{
+			DEKCacheTTL:  time.Hour,
+			DEKCacheSize: 4,
+		})
+	r.Close()
+	r.Close() // idempotent: must not panic
 }

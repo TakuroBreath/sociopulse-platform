@@ -26,8 +26,9 @@ func TestKMSResolverImpl_AssignableToAPI(t *testing.T) {
 	}
 	kms := newFakeKMSClient()
 
-	var resolver api.KMSResolver = service.NewKMSResolver(zaptest.NewLogger(t),
-		rs, kms, service.KMSResolverConfig{})
+	resolver := service.NewKMSResolver(zaptest.NewLogger(t), rs, kms, service.KMSResolverConfig{})
+	t.Cleanup(resolver.Close)
+	var _ api.KMSResolver = resolver
 	require.NotNil(t, resolver)
 }
 
@@ -53,8 +54,8 @@ func TestKMSResolverImpl_BuiltAgainstLocalKMSClient(t *testing.T) {
 		return api.Tenant{ID: tenantID, KMSKEKID: keyID}, nil
 	}
 
-	resolver := service.NewKMSResolver(zaptest.NewLogger(t),
-		rs, kmsClient, service.KMSResolverConfig{})
+	resolver := service.NewKMSResolver(zaptest.NewLogger(t), rs, kmsClient, service.KMSResolverConfig{})
+	t.Cleanup(resolver.Close)
 
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
 	ct, err := resolver.Encrypt(context.Background(), tenantID, plaintext)

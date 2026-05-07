@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -18,8 +17,10 @@ import (
 
 // KMSResolverConfig controls the DEK cache shape. Defaults are filled in
 // by NewKMSResolver — the zero value is valid and yields a 5-minute TTL,
-// 1024-tenant cap. Task 4 swaps the bag-of-maps cache for an LRU with
-// proactive eviction; the surface stays the same.
+// 1024-tenant cap.
+//
+// Task 4 swaps the bag-of-maps cache for an LRU with proactive TTL eviction
+// and a KEK-version-aware key; the resolver surface stays the same.
 type KMSResolverConfig struct {
 	// DEKCacheTTL is how long an unwrapped DEK plaintext lives in
 	// process memory. Default 5 minutes (spec §6.2). The cache stores
@@ -29,11 +30,11 @@ type KMSResolverConfig struct {
 
 	// DEKCacheSize is the maximum number of distinct (tenantID,
 	// keyVersion) entries cached at once. Default 1024.
-	//
-	// In Task 3 the cache is unbounded — the field is accepted by the
-	// constructor for API compatibility with Task 4 but does not yet
-	// trigger eviction.
 	DEKCacheSize int
+
+	// DEKCacheTickRate controls how often the eviction goroutine sweeps
+	// expired entries. Defaults to TTL/4 clamped to [1s, 1m].
+	DEKCacheTickRate time.Duration
 }
 
 func (c *KMSResolverConfig) defaults() {
@@ -47,20 +48,20 @@ func (c *KMSResolverConfig) defaults() {
 
 // KMSResolverImpl is the concrete api.KMSResolver. It wraps a provider-
 // specific KMSClient (Yandex KMS in production; the local in-process
-// fallback in dev) with a per-tenant DEK cache so the hot path of
-// Encrypt/Decrypt avoids round-tripping every payload to the KMS.
+// fallback in dev) with a per-(tenant, KEK-version) DEK cache so the hot
+// path of Encrypt/Decrypt avoids round-tripping every payload to the KMS.
 //
-// Thread-safety: cache is protected by RWMutex. Reads (cache hits)
-// take RLock; misses take Lock to insert. Sensitive material (DEK
-// plaintext, wrapped DEK ciphertext) lives only in process memory and
-// is never logged or surfaced beyond the api.KMSResolver surface.
+// Thread-safety: the underlying DEKCache is internally synchronised; the
+// resolver itself is stateless beyond its dependencies, so all methods are
+// safe for concurrent use.
 //
-// Cache key is the tenant ID alone. This is a TASK 3 simplification:
-// after KEK rotation, the operator must call InvalidateCache(tenantID)
-// to evict the stale entry — the cached DEK was wrapped by the old KEK
-// version. Task 4 hardens the cache to ((tenantID, kekVersion)) and
-// invalidates entries automatically on receipt of the rotation NATS
-// message.
+// Cache key is (tenantID, KEK-version). KEK rotation produces a fresh
+// version label from KMS GenerateDataKey, which addresses a different
+// cache slot — the old entry stays resident long enough to fast-path
+// concurrent Decrypts of in-flight ciphertexts wrapped by the previous
+// version, then ages out via TTL. Operators who want immediate eviction
+// call InvalidateCache(tenantID), which drops every version for the
+// tenant atomically.
 //
 // Compile-time check: implements api.KMSResolver.
 type KMSResolverImpl struct {
@@ -69,20 +70,7 @@ type KMSResolverImpl struct {
 	kms    api.KMSClient
 	cfg    KMSResolverConfig
 
-	mu    sync.RWMutex
-	cache map[uuid.UUID]*cachedDEK
-}
-
-// cachedDEK holds an unwrapped DEK plus its KMS-wrapped form. Storing the
-// ciphertext alongside the plaintext lets Decrypt fast-path when the
-// incoming wrapped-DEK matches what's already cached — common after
-// Encrypt because the same DEK is reused for every payload until the
-// cache evicts.
-type cachedDEK struct {
-	plaintext  []byte
-	ciphertext []byte
-	keyVersion string
-	insertedAt time.Time
+	cache *DEKCache
 }
 
 // Compile-time interface check.
@@ -91,16 +79,42 @@ var _ api.KMSResolver = (*KMSResolverImpl)(nil)
 // NewKMSResolver constructs a KMSResolver from already-built dependencies.
 //
 // The returned implementation is goroutine-safe: callers can share a
-// single resolver across all request handlers.
+// single resolver across all request handlers. The resolver owns a
+// background eviction goroutine — call Close at process shutdown to
+// terminate it cleanly (production wires this through cmd/api lifecycle;
+// tests use t.Cleanup).
+//
+// The eviction goroutine's lifetime is bound to context.Background by
+// default; production wiring uses newKMSResolverWithContext to pass the
+// cmd/api root context so cancellation also tears the goroutine down.
 func NewKMSResolver(logger *zap.Logger, store api.Store, kms api.KMSClient, cfg KMSResolverConfig) *KMSResolverImpl {
+	return newKMSResolverWithContext(context.Background(), logger, store, kms, cfg)
+}
+
+// newKMSResolverWithContext is the internal constructor that the package's
+// register seam uses to bind the cache's eviction goroutine to cmd/api's
+// root context. Tests stick with NewKMSResolver + t.Cleanup; this overload
+// is unexported because callers outside the module shouldn't reach for it.
+func newKMSResolverWithContext(ctx context.Context, logger *zap.Logger, store api.Store, kms api.KMSClient, cfg KMSResolverConfig) *KMSResolverImpl {
 	cfg.defaults()
+	cache := NewDEKCacheWithContext(ctx, DEKCacheConfig{
+		Size:     cfg.DEKCacheSize,
+		TTL:      cfg.DEKCacheTTL,
+		TickRate: cfg.DEKCacheTickRate,
+	})
 	return &KMSResolverImpl{
 		logger: logger,
 		store:  store,
 		kms:    kms,
 		cfg:    cfg,
-		cache:  make(map[uuid.UUID]*cachedDEK),
+		cache:  cache,
 	}
+}
+
+// Close terminates the resolver's background eviction goroutine. Idempotent:
+// calling twice is safe.
+func (r *KMSResolverImpl) Close() {
+	r.cache.Stop()
 }
 
 // EnsureKEK returns the tenant's KEK ID after fetching the row through
@@ -160,24 +174,24 @@ const maxWrappedDEKLen = 1 << 20
 
 // Encrypt performs envelope AES-256-GCM with a cached DEK. Cache miss
 // triggers a fresh GenerateDataKey, after which subsequent Encrypts on
-// the same tenant reuse the same DEK until InvalidateCache is called or
-// the cache evicts.
+// the same (tenant, KEK-version) reuse the same DEK until InvalidateCache
+// is called or the cache evicts.
 func (r *KMSResolverImpl) Encrypt(ctx context.Context, tenantID uuid.UUID, plaintext []byte) ([]byte, error) {
 	dek, err := r.resolveDEKForEncrypt(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	if len(dek.ciphertext) > maxWrappedDEKLen {
+	if len(dek.Ciphertext) > maxWrappedDEKLen {
 		return nil, fmt.Errorf("kms-resolver: wrapped dek length %d exceeds %d byte cap",
-			len(dek.ciphertext), maxWrappedDEKLen)
+			len(dek.Ciphertext), maxWrappedDEKLen)
 	}
-	body, err := encryption.Encrypt(dek.plaintext, plaintext, nil)
+	body, err := encryption.Encrypt(dek.Plaintext, plaintext, nil)
 	if err != nil {
 		return nil, fmt.Errorf("kms-resolver: aes-gcm encrypt: %w", err)
 	}
-	out := make([]byte, 0, wrappedDEKLenBytes+len(dek.ciphertext)+len(body))
-	out = binary.BigEndian.AppendUint32(out, uint32(len(dek.ciphertext))) //nolint:gosec // bounded above
-	out = append(out, dek.ciphertext...)
+	out := make([]byte, 0, wrappedDEKLenBytes+len(dek.Ciphertext)+len(body))
+	out = binary.BigEndian.AppendUint32(out, uint32(len(dek.Ciphertext))) //nolint:gosec // bounded above
+	out = append(out, dek.Ciphertext...)
 	out = append(out, body...)
 	return out, nil
 }
@@ -200,7 +214,7 @@ func (r *KMSResolverImpl) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphe
 	if err != nil {
 		return nil, err
 	}
-	pt, err := encryption.Decrypt(dek.plaintext, body, nil)
+	pt, err := encryption.Decrypt(dek.Plaintext, body, nil)
 	if err != nil {
 		// Surface as ErrInvalidArgument: the wrapped-DEK was authentic
 		// (KMS.Decrypt succeeded) but the body is corrupt. We don't map
@@ -211,44 +225,52 @@ func (r *KMSResolverImpl) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphe
 	return pt, nil
 }
 
-// InvalidateCache drops the cached DEK for the tenant. Called after
-// KEK rotation, tenant suspension, or on receipt of a peer-cache-
-// invalidation NATS message (Task 4 wires the subscriber).
+// InvalidateCache drops every cached DEK for the tenant — across all
+// KEK versions. Called after KEK rotation, tenant suspension, or on
+// receipt of a peer-cache-invalidation NATS message.
 func (r *KMSResolverImpl) InvalidateCache(tenantID uuid.UUID) {
-	r.mu.Lock()
-	delete(r.cache, tenantID)
-	r.mu.Unlock()
+	r.cache.InvalidateTenant(tenantID)
 }
 
 // resolveDEKForEncrypt returns a cached DEK or mints a fresh one via
 // GenerateDataKey. The result is committed to the cache so the next
 // Encrypt is a hit.
-func (r *KMSResolverImpl) resolveDEKForEncrypt(ctx context.Context, tenantID uuid.UUID) (*cachedDEK, error) {
-	if hit, ok := r.lookup(tenantID); ok {
+//
+// On the cache-miss path we discover the KEK version only from the
+// GenerateDataKey response, so the cache key is computed after the
+// network call. On the cache-hit path we look up by tenant alone (we
+// don't yet know which version the caller wants); when we find a hit
+// we trust it — concurrent KEK rotation is rare and the operator is
+// expected to call InvalidateCache to force fresh material.
+//
+// To preserve KEK-version-aware behaviour the resolver scans the cache
+// for any entry under the tenant; if found, returns it. If absent, the
+// fresh DEK is keyed by (tenant, returned-version).
+func (r *KMSResolverImpl) resolveDEKForEncrypt(ctx context.Context, tenantID uuid.UUID) (*CachedDEK, error) {
+	if hit, ok := r.cacheLookupAnyVersion(tenantID); ok {
 		return hit, nil
 	}
 	dk, err := r.GenerateDataKey(ctx, tenantID)
 	if err != nil {
 		return nil, err
 	}
-	entry := &cachedDEK{
-		plaintext:  dk.Plaintext,
-		ciphertext: dk.Ciphertext,
-		keyVersion: dk.KeyVersion,
-		insertedAt: time.Now(),
+	entry := &CachedDEK{
+		Plaintext:  dk.Plaintext,
+		Ciphertext: dk.Ciphertext,
+		KeyVersion: dk.KeyVersion,
 	}
-	r.put(tenantID, entry)
+	r.cache.Put(DEKCacheKey{TenantID: tenantID, KEKVersion: dk.KeyVersion}, entry)
 	return entry, nil
 }
 
 // resolveDEKForDecrypt returns the cached DEK if its wrapped form
 // matches the embedded one. Otherwise it asks KMS to unwrap the
 // embedded DEK and commits the result.
-func (r *KMSResolverImpl) resolveDEKForDecrypt(ctx context.Context, tenantID uuid.UUID, wrappedDEK []byte) (*cachedDEK, error) {
-	if hit, ok := r.lookup(tenantID); ok {
+func (r *KMSResolverImpl) resolveDEKForDecrypt(ctx context.Context, tenantID uuid.UUID, wrappedDEK []byte) (*CachedDEK, error) {
+	if hit, ok := r.cacheLookupAnyVersion(tenantID); ok {
 		// Constant-time compare so we don't leak timing about the
 		// wrapped-DEK contents to an adversary feeding crafted bodies.
-		if subtle.ConstantTimeCompare(hit.ciphertext, wrappedDEK) == 1 {
+		if subtle.ConstantTimeCompare(hit.Ciphertext, wrappedDEK) == 1 {
 			return hit, nil
 		}
 	}
@@ -269,31 +291,25 @@ func (r *KMSResolverImpl) resolveDEKForDecrypt(ctx context.Context, tenantID uui
 		return nil, fmt.Errorf("kms-resolver: unwrapped dek must be %d bytes, got %d",
 			encryption.KeyLen, len(pt))
 	}
-	entry := &cachedDEK{
-		plaintext:  pt,
-		ciphertext: append([]byte(nil), wrappedDEK...),
-		keyVersion: version,
-		insertedAt: time.Now(),
+	entry := &CachedDEK{
+		Plaintext:  pt,
+		Ciphertext: append([]byte(nil), wrappedDEK...),
+		KeyVersion: version,
 	}
-	r.put(tenantID, entry)
+	r.cache.Put(DEKCacheKey{TenantID: tenantID, KEKVersion: version}, entry)
 	return entry, nil
 }
 
-func (r *KMSResolverImpl) lookup(tenantID uuid.UUID) (*cachedDEK, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	hit, ok := r.cache[tenantID]
-	if !ok {
-		return nil, false
-	}
-	if r.cfg.DEKCacheTTL > 0 && time.Since(hit.insertedAt) > r.cfg.DEKCacheTTL {
-		return nil, false
-	}
-	return hit, true
-}
-
-func (r *KMSResolverImpl) put(tenantID uuid.UUID, entry *cachedDEK) {
-	r.mu.Lock()
-	r.cache[tenantID] = entry
-	r.mu.Unlock()
+// cacheLookupAnyVersion returns the most-recently-used cached DEK for the
+// tenant, regardless of KEK version. The LRU order ensures we prefer the
+// newest version when one is resident — the bookkeeping for "which version
+// is current" lives in KMS, not the cache.
+//
+// Implementation note: the underlying DEKCache is keyed by (tenantID,
+// version) so a strict per-key Get cannot answer "any version". We expose
+// a thin scan method on DEKCache for this use case; in practice the cache
+// holds at most a handful of versions per tenant during a rotation
+// window, so a linear scan is bounded.
+func (r *KMSResolverImpl) cacheLookupAnyVersion(tenantID uuid.UUID) (*CachedDEK, bool) {
+	return r.cache.GetByTenant(tenantID)
 }

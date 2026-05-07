@@ -318,6 +318,64 @@ func (s *TenantService) Archive(ctx context.Context, id uuid.UUID) error {
 	)
 }
 
+// tenantServiceWithKMS extends *TenantService with a KMSResolver hook so
+// Suspend/Archive transitions invalidate the DEK cache atomically with the
+// status change. The base service handles the DB write + outbox + audit; the
+// wrapper layers the cache invalidation on top after a successful tx.
+//
+// Cache invalidation is best-effort and post-tx: a failure to drop the
+// cache entry does not unwind the tenant status change. The cache will
+// age out via TTL even if the call is missed.
+type tenantServiceWithKMS struct {
+	*TenantService
+	kmsResolver api.KMSResolver
+}
+
+// NewTenantServiceWithKMS returns a TenantService that additionally calls
+// KMSResolver.InvalidateCache after Suspend/Archive succeed. cmd/api should
+// prefer this constructor when a resolver is available so a suspended
+// tenant's DEKs leave the resolver's hot path immediately.
+//
+// Resume is intentionally NOT instrumented — the cache contents are still
+// useful when a tenant returns to active. Create handles its own KEK
+// provisioning via the embedded KMSClient and does not need cache hooks.
+func NewTenantServiceWithKMS(
+	logger *zap.Logger,
+	tx TxRunner,
+	store api.Store,
+	kms api.KMSClient,
+	pub api.SettingsPublisher,
+	outboxWriter outbox.Writer,
+	resolver api.KMSResolver,
+) api.TenantService {
+	base := NewTenantService(logger, tx, store, kms, pub, outboxWriter)
+	if resolver == nil {
+		return base
+	}
+	return &tenantServiceWithKMS{TenantService: base, kmsResolver: resolver}
+}
+
+// Suspend wraps the base Suspend and invalidates the DEK cache on success.
+func (s *tenantServiceWithKMS) Suspend(ctx context.Context, id uuid.UUID, reason string) error {
+	if err := s.TenantService.Suspend(ctx, id, reason); err != nil {
+		return err
+	}
+	s.kmsResolver.InvalidateCache(id)
+	return nil
+}
+
+// Archive wraps the base Archive and invalidates the DEK cache on success.
+func (s *tenantServiceWithKMS) Archive(ctx context.Context, id uuid.UUID) error {
+	if err := s.TenantService.Archive(ctx, id); err != nil {
+		return err
+	}
+	s.kmsResolver.InvalidateCache(id)
+	return nil
+}
+
+// Compile-time assertion: tenantServiceWithKMS must satisfy api.TenantService.
+var _ api.TenantService = (*tenantServiceWithKMS)(nil)
+
 // transitionStatus is the shared write path for Suspend/Resume/Archive.
 // It opens one tenancy_admin tx that updates tenants.status, appends the
 // canonical lifecycle event to the outbox, and writes an audit row. After

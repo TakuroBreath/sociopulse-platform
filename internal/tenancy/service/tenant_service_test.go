@@ -635,6 +635,128 @@ func TestTenantService_ImplementsAPIInterface(t *testing.T) {
 		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
 }
 
+// fakeKMSResolverForCache is a minimal api.KMSResolver double that records
+// InvalidateCache calls — the only method exercised by the
+// TenantServiceWithKMS tests. Other methods return errors so any unexpected
+// touch surfaces immediately.
+type fakeKMSResolverForCache struct {
+	mu          sync.Mutex
+	invalidated []uuid.UUID
+}
+
+func (f *fakeKMSResolverForCache) EnsureKEK(_ context.Context, _ uuid.UUID) (string, error) {
+	return "", errors.New("fakeKMSResolverForCache.EnsureKEK not configured")
+}
+
+func (f *fakeKMSResolverForCache) GenerateDataKey(_ context.Context, _ uuid.UUID) (api.DataKey, error) {
+	return api.DataKey{}, errors.New("fakeKMSResolverForCache.GenerateDataKey not configured")
+}
+
+func (f *fakeKMSResolverForCache) Encrypt(_ context.Context, _ uuid.UUID, _ []byte) ([]byte, error) {
+	return nil, errors.New("fakeKMSResolverForCache.Encrypt not configured")
+}
+
+func (f *fakeKMSResolverForCache) Decrypt(_ context.Context, _ uuid.UUID, _ []byte) ([]byte, error) {
+	return nil, errors.New("fakeKMSResolverForCache.Decrypt not configured")
+}
+
+func (f *fakeKMSResolverForCache) InvalidateCache(tenantID uuid.UUID) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.invalidated = append(f.invalidated, tenantID)
+}
+
+func (f *fakeKMSResolverForCache) snapshot() []uuid.UUID {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]uuid.UUID(nil), f.invalidated...)
+}
+
+func TestTenantServiceWithKMS_Suspend_InvalidatesCache(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.New()
+	store := &fakeStore{
+		updateStatusFn: func(_ context.Context, _ postgres.Tx, _ uuid.UUID, _ api.TenantStatus) error {
+			return nil
+		},
+	}
+	resolver := &fakeKMSResolverForCache{}
+	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+
+	require.NoError(t, svc.Suspend(context.Background(), id, "test"))
+	require.Equal(t, []uuid.UUID{id}, resolver.snapshot(),
+		"Suspend on the KMS-aware variant must call InvalidateCache for the tenant")
+}
+
+func TestTenantServiceWithKMS_Archive_InvalidatesCache(t *testing.T) {
+	t.Parallel()
+
+	id := uuid.New()
+	store := &fakeStore{
+		updateStatusFn: func(_ context.Context, _ postgres.Tx, _ uuid.UUID, _ api.TenantStatus) error {
+			return nil
+		},
+	}
+	resolver := &fakeKMSResolverForCache{}
+	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+
+	require.NoError(t, svc.Archive(context.Background(), id))
+	require.Equal(t, []uuid.UUID{id}, resolver.snapshot(),
+		"Archive on the KMS-aware variant must call InvalidateCache for the tenant")
+}
+
+func TestTenantServiceWithKMS_Suspend_DoesNotInvalidateOnFailure(t *testing.T) {
+	// When the underlying Suspend fails, the cache must NOT be invalidated:
+	// the tenant is still in its previous state, and dropping the DEK would
+	// force unnecessary KMS round-trips on the next Encrypt.
+	t.Parallel()
+
+	id := uuid.New()
+	store := &fakeStore{
+		updateStatusFn: func(_ context.Context, _ postgres.Tx, _ uuid.UUID, _ api.TenantStatus) error {
+			return api.ErrNotFound
+		},
+	}
+	resolver := &fakeKMSResolverForCache{}
+	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+
+	err := svc.Suspend(context.Background(), id, "")
+	require.ErrorIs(t, err, api.ErrNotFound)
+	require.Empty(t, resolver.snapshot(),
+		"a failed Suspend must not invalidate the DEK cache")
+}
+
+func TestTenantServiceWithKMS_Resume_DoesNotInvalidate(t *testing.T) {
+	// Resume restores a tenant to active; the DEK cache, if anything, is
+	// still useful. We expect no InvalidateCache call.
+	t.Parallel()
+
+	id := uuid.New()
+	store := &fakeStore{
+		updateStatusFn: func(_ context.Context, _ postgres.Tx, _ uuid.UUID, _ api.TenantStatus) error {
+			return nil
+		},
+	}
+	resolver := &fakeKMSResolverForCache{}
+	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+
+	require.NoError(t, svc.Resume(context.Background(), id))
+	require.Empty(t, resolver.snapshot(),
+		"Resume must not invalidate the DEK cache (tenant remains usable)")
+}
+
+func TestTenantServiceWithKMS_ImplementsAPIInterface(t *testing.T) {
+	t.Parallel()
+	var _ api.TenantService = service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
+		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{},
+		&fakeKMSResolverForCache{})
+}
+
 // outbox.Writer is an interface; tests pass a fake. Keep a compile-time
 // assertion to make schema drift surface immediately if Writer changes.
 var _ outbox.Writer = (*fakeOutbox)(nil)
