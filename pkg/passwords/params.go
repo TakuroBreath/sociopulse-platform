@@ -31,18 +31,35 @@ type Params struct {
 	KeyLength   uint32 // bytes
 }
 
-// DefaultParams returns the production defaults from spec §14.2:
+// DefaultParams returns the production defaults.
 //
-//	Memory      = 64 * 1024 KiB  (64 MiB)
-//	Iterations  = 3
-//	Parallelism = 4
+//	Memory      = 19 * 1024 KiB  (19 MiB)
+//	Iterations  = 2
+//	Parallelism = 1
 //	SaltLength  = 16 bytes
 //	KeyLength   = 32 bytes
+//
+// These are the OWASP "Argon2id minimum" recommendation (Password Storage
+// Cheat Sheet, Aug 2024 revision) — sized for a deployment where each login
+// request triggers one hash and the host may receive bursty traffic. The
+// 19 MiB working set fits comfortably in a 256 MiB pod and is small enough
+// that BoundedHasher (see bounded.go) can cap concurrency without wedging.
+//
+// We deliberately diverged from the "max security" 64 MiB / t=3 / p=4 profile
+// to lower the OOM/DoS surface: an unbounded burst of N concurrent hashes at
+// 64 MiB each pegs memory linearly with no operational benefit for our threat
+// model (no high-value password targets, no expectation of an offline attack
+// against a future DB dump where seconds-per-guess matters more than
+// MB-per-guess). With m=19 MiB and BoundedHasher capping concurrency at the
+// CPU count, the worst-case resident set is bounded and predictable.
+//
+// Spec note: these values can be overridden via auth.password.{memory,t,p}
+// in the runtime config — production may tune up if hardware permits.
 func DefaultParams() Params {
 	return Params{
-		Memory:      64 * 1024,
-		Iterations:  3,
-		Parallelism: 4,
+		Memory:      19 * 1024,
+		Iterations:  2,
+		Parallelism: 1,
 		SaltLength:  16,
 		KeyLength:   32,
 	}

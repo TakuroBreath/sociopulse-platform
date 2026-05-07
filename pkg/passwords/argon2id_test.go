@@ -175,10 +175,14 @@ func TestDefaultParams_IsValid(t *testing.T) {
 func TestDefaultParams_Values(t *testing.T) {
 	t.Parallel()
 
+	// OWASP Argon2id minimum (Aug 2024): m=19 MiB, t=2, p=1 — sized
+	// for our threat model (no high-value offline-attack surface) so the
+	// per-hash memory footprint stays bounded and BoundedHasher can
+	// safely cap concurrency without OOMing.
 	p := passwords.DefaultParams()
-	assert.Equal(t, uint32(64*1024), p.Memory)
-	assert.Equal(t, uint32(3), p.Iterations)
-	assert.Equal(t, uint8(4), p.Parallelism)
+	assert.Equal(t, uint32(19*1024), p.Memory)
+	assert.Equal(t, uint32(2), p.Iterations)
+	assert.Equal(t, uint8(1), p.Parallelism)
 	assert.Equal(t, uint32(16), p.SaltLength)
 	assert.Equal(t, uint32(32), p.KeyLength)
 }

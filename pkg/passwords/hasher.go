@@ -1,8 +1,16 @@
 package passwords
 
+import "context"
+
 // Hasher is the small interface the rest of the codebase consumes for
 // password operations. Tests in dependent packages can substitute a fake
-// (e.g. SHA-1-of-password) so unit tests don't pay the 64 MiB Argon2 cost.
+// so unit tests don't pay the Argon2 cost.
+//
+// All methods take a context. The plain in-process implementation does
+// not block on it (Argon2 is CPU-bound and uncancellable mid-derivation),
+// but BoundedHasher uses ctx for its semaphore wait — so handlers that
+// time out on a slow login burst do exactly that, instead of piling up
+// goroutines waiting for a hash slot.
 //
 // Per project convention (07-go-coding-standards §5), the interface is
 // defined here at the producer because every consumer wants the same two
@@ -12,11 +20,11 @@ package passwords
 type Hasher interface {
 	// Hash derives a fresh PHC-encoded Argon2id hash of password using
 	// the parameters the implementation was constructed with.
-	Hash(password string) (string, error)
+	Hash(ctx context.Context, password string) (string, error)
 
 	// Verify reports whether password matches the embedded key in
 	// encoded. (false, ErrInvalidHash) on a malformed encoded string.
-	Verify(encoded, password string) (bool, error)
+	Verify(ctx context.Context, encoded, password string) (bool, error)
 }
 
 // defaultHasher is the production-ready Hasher backed by package-level
@@ -35,6 +43,9 @@ var _ Hasher = defaultHasher{}
 // Default returns a Hasher with DefaultParams() baked in. This is the
 // convention call-sites should use unless they explicitly need to tune
 // the parameters (which warrants a code-review conversation per spec §14.2).
+//
+// In production-facing code paths wrap with NewBoundedHasher so a burst
+// of concurrent logins cannot exhaust memory.
 func Default() Hasher {
 	return defaultHasher{p: DefaultParams()}
 }
@@ -48,13 +59,16 @@ func NewHasher(p Params) Hasher {
 }
 
 // Hash satisfies Hasher by delegating to the package-level Hash function.
-func (d defaultHasher) Hash(password string) (string, error) {
+// ctx is accepted for interface symmetry but ignored: Argon2's IDKey is
+// uncancellable and runs to completion regardless of deadline.
+func (d defaultHasher) Hash(_ context.Context, password string) (string, error) {
 	return Hash(password, d.p)
 }
 
 // Verify satisfies Hasher by delegating to the package-level Verify
 // function. The constructor's Params are intentionally NOT consulted —
 // every PHC string carries its own parameters and we honour those.
-func (d defaultHasher) Verify(encoded, password string) (bool, error) {
+// ctx is accepted for interface symmetry; see Hash.
+func (d defaultHasher) Verify(_ context.Context, encoded, password string) (bool, error) {
 	return Verify(encoded, password)
 }

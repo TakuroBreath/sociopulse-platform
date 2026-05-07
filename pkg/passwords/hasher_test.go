@@ -1,6 +1,7 @@
 package passwords_test
 
 import (
+	"context"
 	"strings"
 	"testing"
 
@@ -16,18 +17,19 @@ func TestDefault_HashVerifyRoundTrip(t *testing.T) {
 		t.Skip("Default() uses production Argon2 parameters which are slow under -short")
 	}
 
+	ctx := context.Background()
 	h := passwords.Default()
 
-	encoded, err := h.Hash("hunter2")
+	encoded, err := h.Hash(ctx, "hunter2")
 	require.NoError(t, err)
 	assert.True(t, strings.HasPrefix(encoded, "$argon2id$v=19$"),
 		"Default().Hash must produce a PHC string; got %q", encoded)
 
-	ok, err := h.Verify(encoded, "hunter2")
+	ok, err := h.Verify(ctx, encoded, "hunter2")
 	require.NoError(t, err)
 	assert.True(t, ok, "Default().Verify must accept the matching password")
 
-	bad, err := h.Verify(encoded, "wrong")
+	bad, err := h.Verify(ctx, encoded, "wrong")
 	require.NoError(t, err)
 	assert.False(t, bad, "Default().Verify must reject a wrong password")
 }
@@ -35,6 +37,7 @@ func TestDefault_HashVerifyRoundTrip(t *testing.T) {
 func TestNewHasher_HonoursCustomParams(t *testing.T) {
 	t.Parallel()
 
+	ctx := context.Background()
 	// Cheap parameters keep the test fast; using NewHasher is the documented
 	// way for callers to opt into non-defaults.
 	h := passwords.NewHasher(passwords.Params{
@@ -45,12 +48,12 @@ func TestNewHasher_HonoursCustomParams(t *testing.T) {
 		KeyLength:   32,
 	})
 
-	encoded, err := h.Hash("hunter2")
+	encoded, err := h.Hash(ctx, "hunter2")
 	require.NoError(t, err)
 	require.Contains(t, encoded, "m=8,t=1,p=1",
 		"PHC params segment must reflect the params passed to NewHasher")
 
-	ok, err := h.Verify(encoded, "hunter2")
+	ok, err := h.Verify(ctx, encoded, "hunter2")
 	require.NoError(t, err)
 	assert.True(t, ok)
 }
@@ -67,7 +70,7 @@ func TestNewHasher_PropagatesParamValidation(t *testing.T) {
 		SaltLength:  16,
 		KeyLength:   32,
 	})
-	_, err := h.Hash("x")
+	_, err := h.Hash(context.Background(), "x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, passwords.ErrInvalidParams)
 }
@@ -82,7 +85,7 @@ func TestNewHasher_VerifyForwardsMalformed(t *testing.T) {
 		Memory: 8, Iterations: 1, Parallelism: 1, SaltLength: 16, KeyLength: 32,
 	})
 
-	ok, err := h.Verify("definitely-not-a-phc", "x")
+	ok, err := h.Verify(context.Background(), "definitely-not-a-phc", "x")
 	assert.False(t, ok)
 	assert.ErrorIs(t, err, passwords.ErrInvalidHash)
 }
