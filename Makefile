@@ -144,3 +144,41 @@ dev-reset: ## Stop and DELETE all dev data volumes (destructive)
 	@echo "WARNING: deleting all dev data (Postgres, Redis, NATS, CH, MinIO volumes)..."
 	docker compose -f docker-compose.dev.yml --profile full down -v
 	@echo "Done. Run 'make dev-up' to recreate."
+
+# ----------------------------------------------------------------------
+# Database migrations (cmd/migrator wraps golang-migrate v4)
+# ----------------------------------------------------------------------
+# These targets require a Postgres DSN in DATABASE_URL or fall back to the
+# local docker-compose dev stack from `make dev-up`. MIGRATIONS_PATH defaults
+# to file://$(PWD)/migrations so `make migrate-up` works from a fresh clone.
+
+DATABASE_URL ?= postgres://app:devpass@localhost:5432/sociopulse?sslmode=disable
+MIGRATIONS_PATH ?= file://$(PWD)/migrations
+
+.PHONY: migrate-up
+migrate-up: ## Apply all pending migrations against $$DATABASE_URL
+	DATABASE_URL='$(DATABASE_URL)' MIGRATIONS_PATH='$(MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator up
+
+.PHONY: migrate-down
+migrate-down: ## Revert all migrations against $$DATABASE_URL (DEV ONLY)
+	DATABASE_URL='$(DATABASE_URL)' MIGRATIONS_PATH='$(MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator down
+
+.PHONY: migrate-status
+migrate-status: ## Print the current migration version + dirty flag
+	DATABASE_URL='$(DATABASE_URL)' MIGRATIONS_PATH='$(MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator status
+
+.PHONY: migrate-create
+migrate-create: ## Create a new migration pair: NAME=add_users_table
+	@if [ -z "$(NAME)" ]; then \
+	  echo "ERROR: NAME is required, e.g. make migrate-create NAME=add_users_table"; \
+	  exit 1; \
+	fi
+	@mkdir -p migrations
+	@last=$$(ls migrations/ 2>/dev/null | grep -E '^[0-9]{6}_' | sed -E 's/^([0-9]{6})_.*/\1/' | sort -n | tail -1); \
+	if [ -z "$$last" ]; then next=000001; else next=$$(printf '%06d' $$((10#$$last + 1))); fi; \
+	touch migrations/$${next}_$(NAME).up.sql migrations/$${next}_$(NAME).down.sql; \
+	echo "Created migrations/$${next}_$(NAME).up.sql"; \
+	echo "Created migrations/$${next}_$(NAME).down.sql"
