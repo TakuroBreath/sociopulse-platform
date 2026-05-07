@@ -76,6 +76,7 @@ When working on Plans (00a/00b/02/03/...) on this repo:
 
 1. **Compact context** at the start — read tags, last commits, current state of `internal/`, `pkg/`, `migrations/`, `cmd/`. Cross-reference with `PROJECT_STATUS.md` (the living state document; update it after every milestone).
 2. **Read the plan** — `docs/superpowers/plans/2026-05-06-NN-<topic>.md`. Extract every task. Create a TodoWrite list.
+2a. **Read the references** — `docs/references/plan-NN-<topic>.md` (per-plan curated reading list) + `docs/references/COMMON.md` (cross-cutting). If the per-plan file doesn't exist yet, **create it before dispatching the first subagent** — it captures canonical specs, reference impls, gotchas, open questions. Subagent prompts MUST include the file path so they read it before writing code.
 3. **Per task**, dispatch a fresh implementer subagent (`Agent` tool, `general-purpose`, `model: opus`) with:
    - Explicit reference to relevant `samber/cc-skills-golang` skills (e.g., `golang-concurrency` BP1-BP9 for goroutine work, `golang-security` for crypto, `golang-error-handling` for error policy).
    - **TDD discipline mandatory** per `superpowers:test-driven-development`: Red-Green-Refactor, watch the test fail before writing impl.
@@ -88,7 +89,8 @@ When working on Plans (00a/00b/02/03/...) on this repo:
    - Fix-up loop until both pass.
 5. **gopls cache is often stale** after subagent dispatches — diagnostic noise. Always re-verify directly with `go build ./... && go vet ./... && go test -race -count=1 ./...`. If those pass, the IDE diagnostics are noise.
 6. **At the end of each plan**, push to origin/main, watch CI to green (6 jobs: lint/test/build/docker/vuln/secret-scan), then tag `v0.0.N-<plan-slug>`.
-7. **Update `PROJECT_STATUS.md`** after each plan completes. Future agents read this first to know what exists. This is mandatory — `superpowers:grill-with-docs` is the canonical way to do it.
+7. **Update `PROJECT_STATUS.md`** after each plan completes. Future agents read this first to know what exists. This is mandatory — `superpowers:grill-with-docs` is the canonical way (skill name from user; if not available in the local skill cache, do the equivalent manually: audit git log + actual changes, update PROJECT_STATUS.md to match).
+8. **Update `docs/references/plan-NN-<topic>.md`** after each plan completes — fill the "Production lessons" section with what we actually learned, especially gotchas not in the canonical specs. Future agents (and you) re-reading this file save real time.
 
 ## Tooling notes
 

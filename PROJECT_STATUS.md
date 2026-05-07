@@ -69,6 +69,7 @@
 - `adr/0001-...md` through `0015-...md` (15 ADRs + README index).
 - `superpowers/specs/2026-05-06-sociopulse-system-design.md` (~2700 lines spec).
 - `superpowers/plans/2026-05-06-NN-...md` (22 implementation plans).
+- **`references/`** — per-plan curated reading lists. `README.md` (index + format), `COMMON.md` (cross-cutting: 152-ФЗ, Yandex Cloud, Go best practices, Postgres RLS, Outbox, NATS), `plan-05-auth.md` (ready), Plans 06-14/20 TBD. Subagent prompts include the file path so they read it before writing code. Future agents save time by not re-deriving canonical specs.
 
 ---
 

@@ -1,0 +1,67 @@
+# References — internal curated reading list
+
+> **Goal**: snap each plan to authoritative external sources, so subagents (and humans) don't re-derive what's already known. Per-plan reference files are loaded into implementer subagent prompts at dispatch time.
+
+## Format
+
+Each file follows this structure:
+
+```markdown
+# Plan NN — <topic> references
+
+## Canonical specs (must-read)
+- [Title](URL) — one-line value statement.
+  Note: what to take, what to skip, gotchas.
+
+## Reference implementations
+- [Project name](URL) — what they do well.
+  Files of interest: <path>, <path>.
+
+## Production lessons (blog posts, talks)
+- [Title](URL) — what's the lesson.
+
+## Russian-specific (152-ФЗ, Yandex Cloud, RU integrations)
+- [Title](URL) — RU-only context.
+
+## Gotchas (do-not-do list)
+- Specific anti-patterns we've decided to avoid + why.
+
+## Open questions
+- What we still don't know and need to learn empirically.
+```
+
+## Workflow
+
+1. **Before starting a plan**: read its `plan-NN-<topic>.md`. Skim "Canonical specs" + "Gotchas" sections at minimum.
+2. **When dispatching an implementer subagent**: include the file path in the prompt. Subagents read it before writing code.
+3. **After completing a plan**: update the file with what we actually learned (especially "Production lessons" and "Gotchas" sections). This is the institutional memory.
+4. **Cross-cutting**: things that apply to >1 plan (152-ФЗ, Yandex KMS quirks, Go skill discipline) live in `COMMON.md`.
+
+## Coverage status
+
+| Plan | Status | File |
+|---|---|---|
+| Plan 00, 00a, 00b | retroactive — TBD | — |
+| Plan 02 — cmd/api skeleton | retroactive — TBD | — |
+| Plan 03 — database | retroactive — TBD | — |
+| Plan 04 — tenancy | retroactive — TBD | `plan-04-tenancy.md` |
+| Plan 05 — auth | **ready** | [`plan-05-auth.md`](plan-05-auth.md) |
+| Plan 06 — CRM | TBD | — |
+| Plan 07 — surveys | TBD | — |
+| Plan 08 — FreeSWITCH cluster | TBD | — |
+| Plan 09 — telephony-bridge | TBD | — |
+| Plan 10 — dialer | TBD | — |
+| Plan 11 — realtime | TBD | — |
+| Plan 12 — recording | TBD | — |
+| Plan 13 — analytics+reports | TBD | — |
+| Plan 14 — billing | TBD | — |
+| Plan 20 — observability | TBD | — |
+
+Cross-cutting: [`COMMON.md`](COMMON.md).
+
+## Caveats
+
+- **Links rot**. When you find a 404, replace with the closest current equivalent and note the original was lost.
+- **My (Claude's) curation bias**: I weight authoritative specs (RFC, OWASP) higher than blog posts. For production-realism, prioritize blog posts + ClueCon talks.
+- **Russian-language sources** are weighted heavier here than in my training data — Russian 152-ФЗ context is project-critical and English sources don't cover it.
+- **WebFetch'd at curation time**: when I curate a file, I verify URLs are live + note training-data version vs current. If a library API has changed since my training, I'll flag it.
