@@ -39,4 +39,23 @@ var (
 
 	// ErrPermissionDenied — request lacks Service-Owner mTLS identity.
 	ErrPermissionDenied = errors.New("tenancy: permission denied")
+
+	// ErrBucketProvisionPending — a tenant exists in Postgres and has its KEK
+	// provisioned in KMS, but the per-tenant Object Storage bucket failed to
+	// provision and the tenant is therefore in a degraded state. Operators
+	// retry via /admin/tenants/{id}/repair. The Service-Owner UI shows the
+	// tenant in red while this state is active.
+	ErrBucketProvisionPending = errors.New("tenancy: bucket provision pending")
+
+	// ErrBucketAlreadyExists — a request to provision a bucket collided with
+	// an existing bucket of the same name owned by a different account.
+	// Distinct from the idempotent same-tenant case: this is a permanent
+	// failure indicating a naming collision and requires operator intervention.
+	ErrBucketAlreadyExists = errors.New("tenancy: bucket already exists")
+
+	// ErrBucketProvisionFailed — non-recoverable failure from the storage
+	// provider during Provision (policy rejected, IAM denied, network down
+	// past retries). Wrapped with %w by the bucket provisioner so callers
+	// can errors.Is without depending on provider error types.
+	ErrBucketProvisionFailed = errors.New("tenancy: bucket provision failed")
 )

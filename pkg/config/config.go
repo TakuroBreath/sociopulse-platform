@@ -52,49 +52,50 @@ type ServiceConfig struct {
 // We intentionally do not collect all errors — operators should fix issues one
 // at a time so they understand the failure mode.
 func (c *Config) Validate() error {
-	if err := c.Service.validate(); err != nil {
-		return fmt.Errorf("service: %w", err)
+	type subValidator struct {
+		name string
+		fn   func() error
 	}
-	if err := c.HTTP.validate(); err != nil {
-		return fmt.Errorf("http: %w", err)
+	subs := []subValidator{
+		{"service", c.Service.validate},
+		{"http", c.HTTP.validate},
+		{"ws", c.WS.validate},
+		{"grpc", c.GRPC.validate},
+		{"database", c.Database.validate},
+		{"nats", c.NATS.validate},
+		{"observability", c.Observability.validate},
+		{"shutdown", c.Shutdown.validate},
+		{"outbox", c.Outbox.validate},
+		{"kms", c.KMS.Validate},
+		{"s3", c.S3.Validate},
 	}
-	if err := c.WS.validate(); err != nil {
-		return fmt.Errorf("ws: %w", err)
-	}
-	if err := c.GRPC.validate(); err != nil {
-		return fmt.Errorf("grpc: %w", err)
-	}
-	if err := c.Database.validate(); err != nil {
-		return fmt.Errorf("database: %w", err)
-	}
-	if err := c.NATS.validate(); err != nil {
-		return fmt.Errorf("nats: %w", err)
-	}
-	if err := c.Observability.validate(); err != nil {
-		return fmt.Errorf("observability: %w", err)
-	}
-	if err := c.Shutdown.validate(); err != nil {
-		return fmt.Errorf("shutdown: %w", err)
-	}
-	if err := c.Outbox.validate(); err != nil {
-		return fmt.Errorf("outbox: %w", err)
-	}
-	if err := c.KMS.Validate(); err != nil {
-		return fmt.Errorf("kms: %w", err)
+	for _, s := range subs {
+		if err := s.fn(); err != nil {
+			return fmt.Errorf("%s: %w", s.name, err)
+		}
 	}
 
-	// Production-only invariants: explicit DSN+secrets must come from Lockbox/ENV
-	// and must not contain literal placeholders like "${PG_PASSWORD}".
 	if c.Service.Env == "production" {
-		if strings.Contains(c.Database.Postgres.DSN, "${") {
-			return errors.New("production: database.postgres.dsn contains unresolved ${...} — set ENV var")
-		}
-		if c.Auth.JWT.SecretLockboxKey == "" {
-			return errors.New("production: auth.jwt.secret_lockbox_key required")
-		}
-		if c.KMS.effective() == KMSProviderLocal {
-			return errors.New("production: kms.provider must be \"yandex\"; the local provider is dev-only")
-		}
+		return c.validateProduction()
+	}
+	return nil
+}
+
+// validateProduction enforces the production-only invariants. Kept separate
+// so Validate stays under the gocyclo budget; both functions are O(N) on
+// the number of sub-configs and run only once at boot.
+func (c *Config) validateProduction() error {
+	if strings.Contains(c.Database.Postgres.DSN, "${") {
+		return errors.New("production: database.postgres.dsn contains unresolved ${...} — set ENV var")
+	}
+	if c.Auth.JWT.SecretLockboxKey == "" {
+		return errors.New("production: auth.jwt.secret_lockbox_key required")
+	}
+	if c.KMS.effective() == KMSProviderLocal {
+		return errors.New("production: kms.provider must be \"yandex\"; the local provider is dev-only")
+	}
+	if c.S3.effective() == S3ProviderLocal {
+		return errors.New("production: s3.provider must be \"yandex\"; the local provider is dev-only")
 	}
 	return nil
 }
@@ -212,6 +213,14 @@ func DefaultDev() Config {
 			// in tests via store.NewLocalKMSClient.
 			Provider:    KMSProviderLocal,
 			LocalKeyHex: "4242424242424242424242424242424242424242424242424242424242424242",
+		},
+		S3: S3Config{
+			// Dev uses the in-process bucket provisioner so unit tests
+			// and `make dev-up` do not need a running MinIO. Replace with
+			// `provider: yandex` plus endpoint/region/credentials for
+			// staging and prod (Yandex Object Storage is S3-compatible).
+			Provider:     S3ProviderLocal,
+			BucketPrefix: "sociopulse-recordings-",
 		},
 	}
 }

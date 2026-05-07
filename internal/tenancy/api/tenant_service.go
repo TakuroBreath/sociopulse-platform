@@ -42,7 +42,11 @@ type Tenant struct {
 	Status          TenantStatus `json:"status"`
 	KMSKEKID        string       `json:"kms_kek_id"` // Yandex KMS symmetric key ID
 	PhoneHashPepper []byte       `json:"-"`          // 32 random bytes; never serialised
-	CreatedAt       time.Time    `json:"created_at"`
+	// RecordingBucket is the per-tenant Object Storage bucket used for call
+	// recordings. Populated after BucketProvisioner.Provision succeeds; empty
+	// while ErrBucketProvisionPending is in effect.
+	RecordingBucket string    `json:"recording_bucket,omitempty"`
+	CreatedAt       time.Time `json:"created_at"`
 }
 
 // Validate enforces the invariants that aren't already enforced by the DB

@@ -57,7 +57,22 @@ type Store interface {
 
 	// GetAllSettings returns every setting for the tenant as a snapshot.
 	GetAllSettings(ctx context.Context, tenantID uuid.UUID) (map[string]SettingValue, error)
+
+	// UpdateBucket persists the recording-bucket name for the tenant inside
+	// tx. Idempotent: re-issuing the same name is a no-op. Stored in
+	// tenant_settings under the canonical SettingKeyRecordingBucket key so
+	// it benefits from the same RLS/audit surface as other tenant settings.
+	UpdateBucket(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, bucketName string) error
+
+	// GetBucket returns the recording-bucket name for the tenant, or
+	// ErrNotFound when no bucket has been provisioned yet.
+	GetBucket(ctx context.Context, tenantID uuid.UUID) (string, error)
 }
+
+// SettingKeyRecordingBucket is the tenant_settings key under which the
+// per-tenant recording bucket name is stored. Exposed so service-layer
+// tests and the recording module's reader can use the same constant.
+const SettingKeyRecordingBucket = "recording.bucket"
 
 // SettingsPublisher abstracts the message-bus emission of lifecycle and
 // cache-invalidation events so the service layer is testable without NATS.

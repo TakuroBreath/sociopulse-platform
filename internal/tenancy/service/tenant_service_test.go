@@ -37,6 +37,8 @@ type fakeStore struct {
 	getAllSettingsFn func(ctx context.Context, tenantID uuid.UUID) (map[string]api.SettingValue, error)
 	upsertSettingFn  func(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, key string, value api.SettingValue) error
 	deleteSettingFn  func(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, key string) error
+	updateBucketFn   func(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, bucketName string) error
+	getBucketFn      func(ctx context.Context, tenantID uuid.UUID) (string, error)
 }
 
 func (f *fakeStore) Insert(ctx context.Context, tx postgres.Tx, t api.Tenant) (api.Tenant, error) {
@@ -127,6 +129,67 @@ func (f *fakeStore) DeleteSetting(ctx context.Context, tx postgres.Tx, tenantID 
 		return f.deleteSettingFn(ctx, tx, tenantID, key)
 	}
 	return errors.New("fakeStore.DeleteSetting not configured")
+}
+
+func (f *fakeStore) UpdateBucket(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, bucketName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.updateBucketFn != nil {
+		return f.updateBucketFn(ctx, tx, tenantID, bucketName)
+	}
+	// Default to success so tests that don't care about bucket persistence
+	// don't need to wire the hook explicitly.
+	return nil
+}
+
+func (f *fakeStore) GetBucket(ctx context.Context, tenantID uuid.UUID) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.getBucketFn != nil {
+		return f.getBucketFn(ctx, tenantID)
+	}
+	return "", errors.New("fakeStore.GetBucket not configured")
+}
+
+// fakeBucketProvisioner is a minimal api.BucketProvisioner double for the
+// service tests. The captured tenant IDs and KEK IDs let tests assert the
+// service called the provisioner with the expected arguments.
+type fakeBucketProvisioner struct {
+	mu                sync.Mutex
+	provisionFn       func(ctx context.Context, tenantID uuid.UUID, kmsKeyID string) (string, error)
+	provisionCalls    []bucketProvisionCall
+	decommissionCalls []uuid.UUID
+}
+
+type bucketProvisionCall struct {
+	tenantID uuid.UUID
+	kekID    string
+}
+
+func (f *fakeBucketProvisioner) Provision(ctx context.Context, tenantID uuid.UUID, kmsKeyID string) (string, error) {
+	f.mu.Lock()
+	f.provisionCalls = append(f.provisionCalls, bucketProvisionCall{tenantID: tenantID, kekID: kmsKeyID})
+	fn := f.provisionFn
+	f.mu.Unlock()
+	if fn != nil {
+		return fn(ctx, tenantID, kmsKeyID)
+	}
+	return "sociopulse-recordings-" + tenantID.String(), nil
+}
+
+func (f *fakeBucketProvisioner) Decommission(_ context.Context, tenantID uuid.UUID) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.decommissionCalls = append(f.decommissionCalls, tenantID)
+	return nil
+}
+
+func (f *fakeBucketProvisioner) snapshotProvisionCalls() []bucketProvisionCall {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]bucketProvisionCall, len(f.provisionCalls))
+	copy(out, f.provisionCalls)
+	return out
 }
 
 // fakeKMS is a minimal api.KMSClient double. Only CreateKey is exercised by
@@ -305,7 +368,7 @@ func TestTenantService_Create_HappyPath(t *testing.T) {
 	tx := &fakeTxRunner{}
 	ob := &fakeOutbox{}
 
-	svc := service.NewTenantService(zaptest.NewLogger(t), tx, store, kms, pub, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), tx, store, kms, &fakeBucketProvisioner{}, pub, ob)
 	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: orgCode,
 		Name:    "ВЦИОМ-Москва",
@@ -325,6 +388,199 @@ func TestTenantService_Create_HappyPath(t *testing.T) {
 	require.Equal(t, createdID, *calls[0].tenantID)
 }
 
+func TestTenantService_Create_ProvisionsBucket(t *testing.T) {
+	// After the tenant row is inserted and KMS provisioned, Create must call
+	// BucketProvisioner.Provision exactly once with the new tenant ID and
+	// KEK ID so the bucket inherits the tenant's encryption key.
+	t.Parallel()
+
+	const orgCode = "CC-BKT-01"
+	const kekID = "yk-kek-bkt"
+	createdID := uuid.New()
+
+	store := &fakeStore{
+		getByOrgCodeFn: func(_ context.Context, _ string) (api.Tenant, error) {
+			return api.Tenant{}, api.ErrNotFound
+		},
+		insertFn: func(_ context.Context, _ postgres.Tx, tn api.Tenant) (api.Tenant, error) {
+			tn.ID = createdID
+			return tn, nil
+		},
+	}
+	kms := &fakeKMS{
+		createKeyFn: func(_ context.Context, _, _ string) (string, error) {
+			return kekID, nil
+		},
+	}
+	bp := &fakeBucketProvisioner{
+		provisionFn: func(_ context.Context, tenantID uuid.UUID, kek string) (string, error) {
+			require.Equal(t, createdID, tenantID, "provisioner must receive the new tenant ID")
+			require.Equal(t, kekID, kek, "provisioner must receive the tenant KEK ID")
+			return "sociopulse-recordings-" + tenantID.String(), nil
+		},
+	}
+
+	svc := service.NewTenantService(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, kms, bp, &fakePublisher{}, &fakeOutbox{})
+	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{
+		OrgCode: orgCode,
+		Name:    "Bucket Test",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "sociopulse-recordings-"+createdID.String(), tn.RecordingBucket,
+		"Create must surface the provisioned bucket name in the returned Tenant")
+
+	calls := bp.snapshotProvisionCalls()
+	require.Len(t, calls, 1, "Provision must be called exactly once on the happy path")
+	require.Equal(t, createdID, calls[0].tenantID)
+	require.Equal(t, kekID, calls[0].kekID)
+}
+
+func TestTenantService_Create_PersistsBucketName(t *testing.T) {
+	// Create must persist the bucket name in tenant_settings via
+	// Store.UpdateBucket so subsequent reads can resolve the per-tenant
+	// bucket without re-calling the provisioner.
+	t.Parallel()
+
+	createdID := uuid.New()
+	var (
+		gotTenantID uuid.UUID
+		gotBucket   string
+		updateCalls int
+	)
+	store := &fakeStore{
+		getByOrgCodeFn: func(_ context.Context, _ string) (api.Tenant, error) {
+			return api.Tenant{}, api.ErrNotFound
+		},
+		insertFn: func(_ context.Context, _ postgres.Tx, tn api.Tenant) (api.Tenant, error) {
+			tn.ID = createdID
+			return tn, nil
+		},
+		updateBucketFn: func(_ context.Context, _ postgres.Tx, tenantID uuid.UUID, bucketName string) error {
+			gotTenantID = tenantID
+			gotBucket = bucketName
+			updateCalls++
+			return nil
+		},
+	}
+	kms := &fakeKMS{
+		createKeyFn: func(_ context.Context, _, _ string) (string, error) {
+			return "kek-1", nil
+		},
+	}
+
+	svc := service.NewTenantService(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, kms, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
+	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{OrgCode: "CC-PER", Name: "Persist"})
+	require.NoError(t, err)
+
+	require.Equal(t, 1, updateCalls, "Store.UpdateBucket must be called exactly once after Provision")
+	require.Equal(t, createdID, gotTenantID)
+	require.Equal(t, tn.RecordingBucket, gotBucket,
+		"the persisted bucket name must match the bucket name returned to the caller")
+}
+
+func TestTenantService_Create_BucketProvisionFailureSurfacesPending(t *testing.T) {
+	// When BucketProvisioner.Provision fails, Create must return the saved
+	// Tenant alongside ErrBucketProvisionPending so the admin UI shows the
+	// "Repair" affordance — the tenant row is intentionally NOT rolled back.
+	t.Parallel()
+
+	createdID := uuid.New()
+	store := &fakeStore{
+		getByOrgCodeFn: func(_ context.Context, _ string) (api.Tenant, error) {
+			return api.Tenant{}, api.ErrNotFound
+		},
+		insertFn: func(_ context.Context, _ postgres.Tx, tn api.Tenant) (api.Tenant, error) {
+			tn.ID = createdID
+			return tn, nil
+		},
+	}
+	kms := &fakeKMS{
+		createKeyFn: func(_ context.Context, _, _ string) (string, error) {
+			return "kek-1", nil
+		},
+	}
+	bp := &fakeBucketProvisioner{
+		provisionFn: func(_ context.Context, _ uuid.UUID, _ string) (string, error) {
+			return "", errors.New("yos: 503 service unavailable")
+		},
+	}
+
+	svc := service.NewTenantService(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, kms, bp, &fakePublisher{}, &fakeOutbox{})
+	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{OrgCode: "CC-BKT-FAIL", Name: "Fail"})
+	require.ErrorIs(t, err, api.ErrBucketProvisionPending,
+		"bucket provisioning failure must wrap ErrBucketProvisionPending")
+	require.Equal(t, createdID, tn.ID,
+		"the saved Tenant must still be returned so callers can show the pending state")
+	require.Empty(t, tn.RecordingBucket,
+		"RecordingBucket must remain empty until Repair succeeds")
+}
+
+func TestTenantService_Create_BucketPersistFailureSurfacesPending(t *testing.T) {
+	// When Store.UpdateBucket fails AFTER Provision succeeded, the result is
+	// the same degraded "pending" state — the bucket exists but the platform
+	// cannot find it via the canonical lookup until /admin repair retries.
+	t.Parallel()
+
+	createdID := uuid.New()
+	store := &fakeStore{
+		getByOrgCodeFn: func(_ context.Context, _ string) (api.Tenant, error) {
+			return api.Tenant{}, api.ErrNotFound
+		},
+		insertFn: func(_ context.Context, _ postgres.Tx, tn api.Tenant) (api.Tenant, error) {
+			tn.ID = createdID
+			return tn, nil
+		},
+		updateBucketFn: func(_ context.Context, _ postgres.Tx, _ uuid.UUID, _ string) error {
+			return errors.New("pg: deadlock")
+		},
+	}
+	kms := &fakeKMS{
+		createKeyFn: func(_ context.Context, _, _ string) (string, error) {
+			return "kek-1", nil
+		},
+	}
+
+	svc := service.NewTenantService(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, kms, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
+	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{OrgCode: "CC-BKT-PER", Name: "Per"})
+	require.ErrorIs(t, err, api.ErrBucketProvisionPending,
+		"persist-bucket failure must surface as ErrBucketProvisionPending too")
+	require.Equal(t, createdID, tn.ID)
+}
+
+func TestTenantService_Create_NilBucketProvisionerLogsAndContinues(t *testing.T) {
+	// When the BucketProvisioner is nil (early-stage deployments without
+	// Object Storage wired), Create must log and return the tenant without a
+	// bucket — the operator promotes via /admin/repair once storage lands.
+	t.Parallel()
+
+	createdID := uuid.New()
+	store := &fakeStore{
+		getByOrgCodeFn: func(_ context.Context, _ string) (api.Tenant, error) {
+			return api.Tenant{}, api.ErrNotFound
+		},
+		insertFn: func(_ context.Context, _ postgres.Tx, tn api.Tenant) (api.Tenant, error) {
+			tn.ID = createdID
+			return tn, nil
+		},
+	}
+	kms := &fakeKMS{
+		createKeyFn: func(_ context.Context, _, _ string) (string, error) {
+			return "kek-1", nil
+		},
+	}
+
+	svc := service.NewTenantService(zaptest.NewLogger(t),
+		&fakeTxRunner{}, store, kms, nil /* bucketProv */, &fakePublisher{}, &fakeOutbox{})
+	tn, err := svc.Create(context.Background(), api.CreateTenantRequest{OrgCode: "CC-NIL", Name: "Nil"})
+	require.NoError(t, err)
+	require.Equal(t, createdID, tn.ID)
+	require.Empty(t, tn.RecordingBucket)
+}
+
 func TestTenantService_Create_RejectsDuplicateOrgCode(t *testing.T) {
 	t.Parallel()
 
@@ -339,7 +595,7 @@ func TestTenantService_Create_RejectsDuplicateOrgCode(t *testing.T) {
 	tx := &fakeTxRunner{}
 	ob := &fakeOutbox{}
 
-	svc := service.NewTenantService(zaptest.NewLogger(t), tx, store, kms, pub, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), tx, store, kms, &fakeBucketProvisioner{}, pub, ob)
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: "CC-MOSKVA-01",
 		Name:    "Dup",
@@ -353,7 +609,7 @@ func TestTenantService_Create_RejectsEmptyOrgCode(t *testing.T) {
 	t.Parallel()
 
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: "",
 		Name:    "X",
@@ -365,7 +621,7 @@ func TestTenantService_Create_RejectsEmptyName(t *testing.T) {
 	t.Parallel()
 
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: "CC-X",
 		Name:    "",
@@ -387,7 +643,7 @@ func TestTenantService_Create_KMSFailureSurfacesAsKMSUnavailable(t *testing.T) {
 		},
 	}
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, kms, &fakePublisher{}, &fakeOutbox{})
+		&fakeTxRunner{}, store, kms, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: "CC-NEW",
 		Name:    "X",
@@ -414,7 +670,7 @@ func TestTenantService_Create_PropagatesInsertErrorAfterKEK(t *testing.T) {
 		},
 	}
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, kms, &fakePublisher{}, &fakeOutbox{})
+		&fakeTxRunner{}, store, kms, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{
 		OrgCode: "CC-NEW",
 		Name:    "X",
@@ -443,7 +699,7 @@ func TestTenantService_Create_OutboxFailureRollsBackTransaction(t *testing.T) {
 	}
 	ob := &fakeOutbox{errOn: errors.New("outbox down")}
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, kms, &fakePublisher{}, ob)
+		&fakeTxRunner{}, store, kms, &fakeBucketProvisioner{}, &fakePublisher{}, ob)
 
 	_, err := svc.Create(context.Background(), api.CreateTenantRequest{OrgCode: "CC-X", Name: "X"})
 	require.Error(t, err)
@@ -461,7 +717,7 @@ func TestTenantService_Get_DelegatesToStore(t *testing.T) {
 			return wanted, nil
 		},
 	}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	got, err := svc.Get(context.Background(), id)
 	require.NoError(t, err)
 	require.Equal(t, wanted, got)
@@ -477,7 +733,7 @@ func TestTenantService_GetByOrgCode_DelegatesToStore(t *testing.T) {
 			return wanted, nil
 		},
 	}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	got, err := svc.GetByOrgCode(context.Background(), "CC-X")
 	require.NoError(t, err)
 	require.Equal(t, wanted, got)
@@ -493,7 +749,7 @@ func TestTenantService_List_AppliesDefaultLimit(t *testing.T) {
 			return []api.Tenant{{ID: uuid.New()}}, nil
 		},
 	}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	out, err := svc.List(context.Background(), api.ListTenantsFilter{}) // limit=0 → default
 	require.NoError(t, err)
 	require.Len(t, out, 1)
@@ -510,7 +766,7 @@ func TestTenantService_List_ClampsLimitTo500(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.List(context.Background(), api.ListTenantsFilter{Limit: 9999})
 	require.NoError(t, err)
 	require.Equal(t, 500, observed.Limit, "limit must clamp to 500")
@@ -526,7 +782,7 @@ func TestTenantService_List_ClampsNegativeOffsetToZero(t *testing.T) {
 			return nil, nil
 		},
 	}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 	_, err := svc.List(context.Background(), api.ListTenantsFilter{Offset: -10})
 	require.NoError(t, err)
 	require.Equal(t, 0, observed.Offset)
@@ -550,7 +806,7 @@ func TestTenantService_Suspend_HappyPath(t *testing.T) {
 	pub := &fakePublisher{}
 	ob := &fakeOutbox{}
 
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, pub, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, pub, ob)
 	require.NoError(t, svc.Suspend(context.Background(), id, "non-payment"))
 	require.Equal(t, id, gotID)
 	require.Equal(t, api.TenantStatusSuspended, gotStatus)
@@ -573,7 +829,7 @@ func TestTenantService_Suspend_PropagatesStoreError(t *testing.T) {
 	pub := &fakePublisher{}
 	ob := &fakeOutbox{}
 
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, pub, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, pub, ob)
 	err := svc.Suspend(context.Background(), id, "")
 	require.ErrorIs(t, err, api.ErrNotFound)
 	require.Empty(t, pub.publishSuspendedFor, "publish must not run when store fails")
@@ -592,7 +848,7 @@ func TestTenantService_Resume_HappyPath(t *testing.T) {
 		},
 	}
 	ob := &fakeOutbox{}
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, ob)
 	require.NoError(t, svc.Resume(context.Background(), id))
 	require.Equal(t, api.TenantStatusActive, gotStatus)
 
@@ -615,7 +871,7 @@ func TestTenantService_Archive_HappyPath(t *testing.T) {
 	pub := &fakePublisher{}
 	ob := &fakeOutbox{}
 
-	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, pub, ob)
+	svc := service.NewTenantService(zaptest.NewLogger(t), &fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, pub, ob)
 	require.NoError(t, svc.Archive(context.Background(), id))
 	require.Equal(t, api.TenantStatusArchived, gotStatus)
 	require.Equal(t, []uuid.UUID{id}, pub.publishArchivedFor)
@@ -632,7 +888,7 @@ func TestTenantService_ImplementsAPIInterface(t *testing.T) {
 	// the struct in tenant_service.go; this test confirms the constructor
 	// itself returns a value that can be assigned to the interface.)
 	var _ api.TenantService = service.NewTenantService(zaptest.NewLogger(t),
-		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{})
+		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{})
 }
 
 // fakeKMSResolverForCache is a minimal api.KMSResolver double that records
@@ -683,7 +939,7 @@ func TestTenantServiceWithKMS_Suspend_InvalidatesCache(t *testing.T) {
 	}
 	resolver := &fakeKMSResolverForCache{}
 	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{}, resolver)
 
 	require.NoError(t, svc.Suspend(context.Background(), id, "test"))
 	require.Equal(t, []uuid.UUID{id}, resolver.snapshot(),
@@ -701,7 +957,7 @@ func TestTenantServiceWithKMS_Archive_InvalidatesCache(t *testing.T) {
 	}
 	resolver := &fakeKMSResolverForCache{}
 	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{}, resolver)
 
 	require.NoError(t, svc.Archive(context.Background(), id))
 	require.Equal(t, []uuid.UUID{id}, resolver.snapshot(),
@@ -722,7 +978,7 @@ func TestTenantServiceWithKMS_Suspend_DoesNotInvalidateOnFailure(t *testing.T) {
 	}
 	resolver := &fakeKMSResolverForCache{}
 	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{}, resolver)
 
 	err := svc.Suspend(context.Background(), id, "")
 	require.ErrorIs(t, err, api.ErrNotFound)
@@ -743,7 +999,7 @@ func TestTenantServiceWithKMS_Resume_DoesNotInvalidate(t *testing.T) {
 	}
 	resolver := &fakeKMSResolverForCache{}
 	svc := service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
-		&fakeTxRunner{}, store, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{}, resolver)
+		&fakeTxRunner{}, store, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{}, resolver)
 
 	require.NoError(t, svc.Resume(context.Background(), id))
 	require.Empty(t, resolver.snapshot(),
@@ -753,7 +1009,7 @@ func TestTenantServiceWithKMS_Resume_DoesNotInvalidate(t *testing.T) {
 func TestTenantServiceWithKMS_ImplementsAPIInterface(t *testing.T) {
 	t.Parallel()
 	var _ api.TenantService = service.NewTenantServiceWithKMS(zaptest.NewLogger(t),
-		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakePublisher{}, &fakeOutbox{},
+		&fakeTxRunner{}, &fakeStore{}, &fakeKMS{}, &fakeBucketProvisioner{}, &fakePublisher{}, &fakeOutbox{},
 		&fakeKMSResolverForCache{})
 }
 

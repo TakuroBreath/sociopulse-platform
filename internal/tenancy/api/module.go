@@ -48,6 +48,12 @@ type Deps struct {
 	// KMS — Yandex KMS client. Wraps yandex-cloud/go-sdk.
 	KMS KMSClient
 
+	// BucketProvisioner — per-tenant Object Storage bucket adapter. The
+	// concrete implementation is selected by `s3.provider` (yandex|local) in
+	// the host module.go. Nil is allowed only in tests; cmd/api always wires
+	// either the Yandex Object Storage adapter or the in-memory dev variant.
+	BucketProvisioner BucketProvisioner
+
 	// Config — module configuration parsed from config.yaml under `tenancy:`.
 	Config Config
 }

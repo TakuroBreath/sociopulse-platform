@@ -2,7 +2,7 @@
 
 > **Living document.** Updated at the end of every plan via `superpowers:grill-with-docs`. Future agents read this first to know what exists and what's next.
 
-**Last updated**: 2026-05-07 — после Plan 03 (`v0.0.5-database`).
+**Last updated**: 2026-05-08 — Plan 04 Task 6 lands BucketProvisioner + cmd/api app-user assertion.
 
 ---
 

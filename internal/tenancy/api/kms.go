@@ -48,10 +48,28 @@ type KMSResolver interface {
 	InvalidateCache(tenantID uuid.UUID)
 }
 
-// BucketProvisioner ensures the per-tenant S3 bucket exists with the
-// expected lifecycle policy and KMS encryption settings.
+// BucketProvisioner manages per-tenant Object Storage buckets used for
+// recordings. The implementation MUST be idempotent: re-calling Provision
+// for an existing tenant returns success without recreating the bucket.
+//
+// Bucket naming: implementations use a deterministic prefix so an operator
+// can locate a tenant's bucket without consulting the database. The exact
+// prefix is implementation-defined; today it is "sociopulse-recordings-<id>".
+//
+// Security invariants enforced by the implementation:
+//   - Default SSE is enabled (AES-256 or SSE-KMS keyed on the tenant KEK).
+//   - Public access is denied (bucket policy + ACL).
+//   - The bucket lifecycle is configured per spec §9.4 (hot then cold tier).
 type BucketProvisioner interface {
-	// EnsureBucket creates the bucket if it does not exist and returns its name.
-	// Idempotent — safe to call on every API request.
-	EnsureBucket(ctx context.Context, tenantID uuid.UUID) (bucket string, err error)
+	// Provision creates (if absent) the recordings bucket for tenant `id`,
+	// configures SSE with the tenant's KEK, applies a per-tenant IAM
+	// policy that limits s3:GetObject/s3:PutObject to the tenant's
+	// service account, and returns the bucket name. Idempotent — safe to
+	// call repeatedly during onboarding or via the /admin/repair surface.
+	Provision(ctx context.Context, tenantID uuid.UUID, kmsKeyID string) (bucketName string, err error)
+
+	// Decommission marks the bucket for deletion. Real DELETE happens via
+	// a separate worker after the grace period — synchronous deletion of
+	// recordings is never performed from a TenantService call.
+	Decommission(ctx context.Context, tenantID uuid.UUID) error
 }

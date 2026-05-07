@@ -122,7 +122,7 @@ func TestTenantService_Create_PersistsRowAndOutboxAtomically(t *testing.T) {
 	st := store.NewPostgresStore(pool)
 	kms := &integrationKMS{keyID: "yk-kek-integration"}
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		pool, st, kms, &recordingPublisher{}, outbox.NewPostgresWriter())
+		pool, st, kms, store.NewLocalBucketProvisioner("sociopulse-recordings-"), &recordingPublisher{}, outbox.NewPostgresWriter())
 
 	const orgCode = "CC-INT-CREATE"
 	tn, err := svc.Create(ctx, api.CreateTenantRequest{
@@ -165,7 +165,7 @@ func TestTenantService_Create_DuplicateRejectedWithoutKMSCall(t *testing.T) {
 	st := store.NewPostgresStore(pool)
 	kms := &countingKMS{keyID: "yk"}
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		pool, st, kms, &recordingPublisher{}, outbox.NewPostgresWriter())
+		pool, st, kms, store.NewLocalBucketProvisioner("sociopulse-recordings-"), &recordingPublisher{}, outbox.NewPostgresWriter())
 
 	_, err := svc.Create(ctx, api.CreateTenantRequest{OrgCode: "CC-DUP", Name: "First"})
 	require.NoError(t, err)
@@ -185,7 +185,7 @@ func TestTenantService_Suspend_PersistsRowAndOutboxAtomically(t *testing.T) {
 	pool := newServiceTestPool(t)
 	st := store.NewPostgresStore(pool)
 	svc := service.NewTenantService(zaptest.NewLogger(t),
-		pool, st, &integrationKMS{keyID: "yk"}, &recordingPublisher{}, outbox.NewPostgresWriter())
+		pool, st, &integrationKMS{keyID: "yk"}, store.NewLocalBucketProvisioner("sociopulse-recordings-"), &recordingPublisher{}, outbox.NewPostgresWriter())
 
 	tn, err := svc.Create(ctx, api.CreateTenantRequest{OrgCode: "CC-SUS", Name: "Suspend"})
 	require.NoError(t, err)

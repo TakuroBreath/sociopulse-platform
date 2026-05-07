@@ -36,6 +36,7 @@ type TenantService struct {
 	tx         TxRunner
 	store      api.Store
 	kms        api.KMSClient
+	bucketProv api.BucketProvisioner
 	pub        api.SettingsPublisher
 	outbox     outbox.Writer
 	auditWrite auditWriteFunc
@@ -66,11 +67,20 @@ var _ api.TenantService = (*TenantService)(nil)
 //
 // The caller owns the lifecycle of every dependency; this service holds
 // references only and does not close them on shutdown.
+//
+// bucketProv may be nil while a deployment hasn't wired Object Storage yet
+// (e.g. early dev). Create logs a warning and proceeds without bucket
+// provisioning when nil — the tenant lands in an "active, no recording bucket"
+// state that the operator promotes via /admin/tenants/{id}/repair once
+// storage is wired. In production wiring (module.go) the provisioner is
+// always non-nil; the nil-tolerant constructor only exists for tests that
+// don't exercise the bucket path.
 func NewTenantService(
 	logger *zap.Logger,
 	tx TxRunner,
 	store api.Store,
 	kms api.KMSClient,
+	bucketProv api.BucketProvisioner,
 	pub api.SettingsPublisher,
 	outboxWriter outbox.Writer,
 ) *TenantService {
@@ -82,6 +92,7 @@ func NewTenantService(
 		tx:         tx,
 		store:      store,
 		kms:        kms,
+		bucketProv: bucketProv,
 		pub:        pub,
 		outbox:     outboxWriter,
 		auditWrite: stubAuditLog(logger),
@@ -119,6 +130,13 @@ func stubAuditLog(logger *zap.Logger) auditWriteFunc {
 //     - Append tenant.<id>.created to event_outbox.
 //     - Write the audit row (currently a logger stub).
 //     - Commit (BypassRLS commits on nil error).
+//  6. Provision the per-tenant Object Storage bucket using the new tenant ID.
+//     A failure here does NOT roll back the tenant: the tenant is left in a
+//     "pending" state with ErrBucketProvisionPending wrapping the storage
+//     error; operators retry via /admin/tenants/{id}/repair.
+//  7. Persist the bucket name in tenant_settings (idempotent UPSERT) inside
+//     a second BypassRLS tx so a subsequent storage-side rename is a one-row
+//     update without re-provisioning.
 //
 // If step 5 fails after step 3 succeeded, the KEK is orphaned. We log a
 // warning so an operator can clean up via the runbook; the request still
@@ -222,12 +240,65 @@ func (s *TenantService) Create(ctx context.Context, req api.CreateTenantRequest)
 		)
 	}
 
+	bucketName, bucketErr := s.provisionAndPersistBucket(ctx, saved)
+	saved.RecordingBucket = bucketName
+
 	s.logger.Info("tenant created",
 		zap.Stringer("tenant_id", saved.ID),
 		zap.String("org_code", saved.OrgCode),
 		zap.String("kek_id", saved.KMSKEKID),
+		zap.String("recording_bucket", saved.RecordingBucket),
 	)
+	if bucketErr != nil {
+		return saved, bucketErr
+	}
 	return saved, nil
+}
+
+// provisionAndPersistBucket runs the post-tenant-insert bucket flow:
+// Provision the per-tenant Object Storage bucket, then persist the bucket
+// name into tenant_settings. Both steps are best-effort: a failure leaves
+// the tenant in the "pending" state with ErrBucketProvisionPending wrapping
+// the provider error so /admin/tenants/{id}/repair can retry idempotently.
+//
+// Returns the bucket name (empty when provisioning failed) and the
+// pending-state error, if any. When BucketProvisioner is nil (early-stage
+// deployments without Object Storage wired), the function logs a warning
+// and returns ("", nil) so the caller can return the tenant cleanly.
+func (s *TenantService) provisionAndPersistBucket(ctx context.Context, saved api.Tenant) (string, error) {
+	if s.bucketProv == nil {
+		s.logger.Warn("bucket provisioner not wired; tenant created without recording bucket",
+			zap.Stringer("tenant_id", saved.ID),
+		)
+		return "", nil
+	}
+
+	bucketName, err := s.bucketProv.Provision(ctx, saved.ID, saved.KMSKEKID)
+	if err != nil {
+		s.logger.Error("bucket provisioning failed; tenant left in pending",
+			zap.Stringer("tenant_id", saved.ID),
+			zap.String("kek_id", saved.KMSKEKID),
+			zap.Error(err),
+		)
+		return "", fmt.Errorf("%w: %w", api.ErrBucketProvisionPending, err)
+	}
+
+	// Persist bucket name in tenant_settings (idempotent insert). A failure
+	// here is the same kind of degraded state as a Provision failure — the
+	// bucket exists but the platform cannot find it via the canonical
+	// lookup. Surface ErrBucketProvisionPending so the operator retries
+	// via /admin/tenants/{id}/repair.
+	if err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+		return s.store.UpdateBucket(ctx, tx, saved.ID, bucketName)
+	}); err != nil {
+		s.logger.Error("persist bucket name failed; tenant left in pending",
+			zap.Stringer("tenant_id", saved.ID),
+			zap.String("bucket_name", bucketName),
+			zap.Error(err),
+		)
+		return bucketName, fmt.Errorf("%w: persist bucket name: %w", api.ErrBucketProvisionPending, err)
+	}
+	return bucketName, nil
 }
 
 // appendCreatedToOutbox writes the tenant.<id>.created event to the
@@ -344,11 +415,12 @@ func NewTenantServiceWithKMS(
 	tx TxRunner,
 	store api.Store,
 	kms api.KMSClient,
+	bucketProv api.BucketProvisioner,
 	pub api.SettingsPublisher,
 	outboxWriter outbox.Writer,
 	resolver api.KMSResolver,
 ) api.TenantService {
-	base := NewTenantService(logger, tx, store, kms, pub, outboxWriter)
+	base := NewTenantService(logger, tx, store, kms, bucketProv, pub, outboxWriter)
 	if resolver == nil {
 		return base
 	}

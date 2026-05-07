@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.uber.org/zap"
@@ -50,10 +51,50 @@ func openPool(ctx context.Context, cfg config.Config, logger *zap.Logger) (*post
 		return pool, err
 	}
 
+	if err := assertAppPoolUser(ctx, pool, cfg.Service.Env, logger); err != nil {
+		return pool, err
+	}
+
 	logger.Info("postgres pool open",
 		zap.String("dsn_redacted", redactDSN(cfg.Database.Postgres.DSN)),
 		zap.Int("max_conns", cfg.Database.Postgres.MaxConns))
 	return pool, nil
+}
+
+// assertAppPoolUser is the boot-time defence against a misconfigured DSN
+// connecting cmd/api as `tenancy_admin` (which has BYPASSRLS) instead of
+// the intended `app` user. A regression here would silently disable tenant
+// isolation on every query and is the kind of bug that only surfaces in a
+// security review months later. The assertion runs once at startup and is
+// O(1) — a single `select current_user` round-trip — so the cost is
+// negligible.
+//
+// In `development` and `staging` we tolerate the pool connecting as a
+// different user (testcontainers-postgres uses the `postgres` superuser by
+// default) and only WARN. In `production` the assertion is fatal: returning
+// a non-nil error here propagates up to openPool and refuses startup.
+func assertAppPoolUser(ctx context.Context, pool *postgres.Pool, env string, logger *zap.Logger) error {
+	pctx, cancel := context.WithTimeout(ctx, pingTimeout)
+	defer cancel()
+
+	var user string
+	if err := pool.RawQueryRow(pctx, "select current_user").Scan(&user); err != nil {
+		return fmt.Errorf("postgres: verify pool user: %w", err)
+	}
+	if user == "app" {
+		return nil
+	}
+
+	if env == "production" {
+		return fmt.Errorf(
+			"postgres: FATAL — app pool connected as %q, expected %q (refusing to start; tenancy_admin would silently bypass RLS)",
+			user, "app")
+	}
+	logger.Warn("app pool connected as non-`app` user (acceptable in dev/test only)",
+		zap.String("user", user),
+		zap.String("env", env),
+	)
+	return nil
 }
 
 // redactDSN returns the DSN with the password segment replaced by *** so

@@ -46,7 +46,7 @@ func registerModule(ctx context.Context, deps api.Deps) (*api.Module, error) {
 	tenantStore := store.NewPostgresStore(deps.Pool)
 	pub := newPublisher(deps.EventBus, deps.Logger)
 	outboxWriter := outbox.NewPostgresWriter()
-	tenantSvc := NewTenantService(deps.Logger, deps.Pool, tenantStore, deps.KMS, pub, outboxWriter)
+	tenantSvc := NewTenantService(deps.Logger, deps.Pool, tenantStore, deps.KMS, deps.BucketProvisioner, pub, outboxWriter)
 
 	resolverCfg := KMSResolverConfig{
 		DEKCacheTTL:  parseTTL(deps.Config.DEKCacheTTL, 5*time.Minute),

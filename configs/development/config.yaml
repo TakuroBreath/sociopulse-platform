@@ -53,10 +53,17 @@ nats:
   account: cmd-api
 
 s3:
+  # Dev uses the in-process bucket provisioner so `make dev-up` boots without
+  # MinIO bootstrap. Replace with `provider: yandex` plus endpoint/region/
+  # access keys for staging/prod (Yandex Object Storage = S3-compatible).
+  provider: local
   # Local dev: MinIO is exposed on host port 9090 (port 9000 is reserved for
-  # ClickHouse native protocol — see docker-compose.dev.yml).
+  # ClickHouse native protocol — see docker-compose.dev.yml). Endpoint/region
+  # are kept here as documentation of the dev MinIO surface; the local
+  # provider is in-memory and does not call them.
   endpoint: http://localhost:9090
   region: ru-central-1
+  bucket_prefix: sociopulse-recordings-
   buckets:
     backups: sociopulse-dev-backups
     reports: sociopulse-dev-reports

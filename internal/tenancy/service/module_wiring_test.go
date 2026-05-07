@@ -106,6 +106,47 @@ func TestModule_Register_PropagatesUnknownKMSProvider(t *testing.T) {
 // resilient to any sentinel the module may expose later.
 func errPlaceholder() error { return errors.New("placeholder") }
 
+func TestModule_Register_WiresLocalBucketProvisioner(t *testing.T) {
+	// The dev defaults select s3.provider=local, so Module.Register must
+	// instantiate the in-memory provisioner without surfacing an error and
+	// without requiring the Yandex S3 SDK to be on the module path.
+	t.Parallel()
+
+	cfg := config.DefaultDev()
+	require.Equal(t, config.S3ProviderLocal, cfg.S3.Provider, "precondition: dev default uses local S3")
+
+	mod := &tenancy.Module{}
+	err := mod.Register(modules.Deps{
+		Ctx:     context.Background(),
+		Logger:  zaptest.NewLogger(t),
+		Config:  &cfg,
+		Pool:    &postgres.Pool{},
+		Locator: newFakeLocator(),
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_ = mod.Stop()
+	})
+}
+
+func TestModule_Register_PropagatesUnknownS3Provider(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.DefaultDev()
+	cfg.S3.Provider = "no-such-provider"
+
+	mod := &tenancy.Module{}
+	err := mod.Register(modules.Deps{
+		Ctx:     context.Background(),
+		Logger:  zaptest.NewLogger(t),
+		Config:  &cfg,
+		Pool:    &postgres.Pool{},
+		Locator: newFakeLocator(),
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "s3", "err should mention s3 provider; got %v", err)
+}
+
 func TestModule_Register_PropagatesInvalidLocalKey(t *testing.T) {
 	t.Parallel()
 

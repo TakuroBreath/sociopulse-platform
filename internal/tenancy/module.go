@@ -15,6 +15,7 @@
 package tenancy
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -91,6 +92,7 @@ func (m *Module) Stop() error {
 // tenancy-specific api.Deps. The KMSClient is constructed here from
 // d.Config.KMS — the choice between the Yandex and local providers is
 // the only place in the codebase that depends on the provider value.
+// BucketProvisioner is built from d.Config.S3 in the same manner.
 func buildDeps(d modules.Deps) (api.Deps, error) {
 	if d.Logger == nil {
 		return api.Deps{}, errors.New("tenancy: logger is required")
@@ -102,12 +104,17 @@ func buildDeps(d modules.Deps) (api.Deps, error) {
 	if err != nil {
 		return api.Deps{}, fmt.Errorf("tenancy: build kms client: %w", err)
 	}
+	bucketProv, err := buildBucketProvisioner(d.Config.S3)
+	if err != nil {
+		return api.Deps{}, fmt.Errorf("tenancy: build bucket provisioner: %w", err)
+	}
 	return api.Deps{
-		Logger:     d.Logger.Named("tenancy"),
-		Pool:       d.Pool,
-		EventBus:   d.EventBus,
-		Subscriber: d.Subscriber,
-		KMS:        kmsClient,
+		Logger:            d.Logger.Named("tenancy"),
+		Pool:              d.Pool,
+		EventBus:          d.EventBus,
+		Subscriber:        d.Subscriber,
+		KMS:               kmsClient,
+		BucketProvisioner: bucketProv,
 		// Config: api.Config is module-scoped (DEKCacheTTL, etc.). It
 		// stays empty here so the resolver picks its built-in defaults
 		// — Task 4 maps yaml settings into api.Config when SettingsCache
@@ -136,6 +143,30 @@ func buildKMSClient(cfg config.KMSConfig) (api.KMSClient, error) {
 	default:
 		return nil, fmt.Errorf("kms: unknown provider %q (want %q or %q)",
 			cfg.Provider, config.KMSProviderYandex, config.KMSProviderLocal)
+	}
+}
+
+// buildBucketProvisioner picks the BucketProvisioner implementation based
+// on cfg.Provider. Empty/"local" → in-memory dev provisioner; "yandex" →
+// AWS-SDK-backed Yandex Object Storage adapter (gated behind the
+// `yandex_s3` build tag, mirroring the KMS pattern). Anywhere else in the
+// codebase, a switch on s3.provider would be a smell — this is the single
+// place the choice lives.
+func buildBucketProvisioner(cfg config.S3Config) (api.BucketProvisioner, error) {
+	switch cfg.Provider {
+	case "", config.S3ProviderLocal:
+		return store.NewLocalBucketProvisioner(cfg.EffectiveBucketPrefix()), nil
+	case config.S3ProviderYandex:
+		return store.NewYandexBucketProvisioner(context.Background(), store.YandexBucketConfig{
+			Endpoint:        cfg.Endpoint,
+			Region:          cfg.Region,
+			AccessKeyID:     cfg.AccessKeyID,
+			SecretAccessKey: cfg.SecretAccessKey,
+			BucketPrefix:    cfg.EffectiveBucketPrefix(),
+		})
+	default:
+		return nil, fmt.Errorf("s3: unknown provider %q (want %q or %q)",
+			cfg.Provider, config.S3ProviderYandex, config.S3ProviderLocal)
 	}
 }
 

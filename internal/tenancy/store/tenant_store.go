@@ -241,6 +241,35 @@ func (s *PostgresStore) GetSetting(ctx context.Context, tenantID uuid.UUID, key 
 	return api.SettingValueFromRaw(raw), nil
 }
 
+// UpdateBucket implements api.Store.UpdateBucket inside the caller's tx.
+// The bucket name is stored under SettingKeyRecordingBucket so it shares
+// the existing tenant_settings RLS/audit surface. Idempotent: re-issuing
+// the same name is a no-op (ON CONFLICT updates updated_at).
+func (s *PostgresStore) UpdateBucket(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, bucketName string) error {
+	v, err := api.SettingValueFromAny(bucketName)
+	if err != nil {
+		return fmt.Errorf("tenancy/store: marshal bucket name: %w", err)
+	}
+	if err := s.UpsertSetting(ctx, tx, tenantID, api.SettingKeyRecordingBucket, v); err != nil {
+		return fmt.Errorf("tenancy/store: upsert bucket setting: %w", err)
+	}
+	return nil
+}
+
+// GetBucket implements api.Store.GetBucket. Returns ErrNotFound when no
+// bucket has been provisioned yet for the tenant.
+func (s *PostgresStore) GetBucket(ctx context.Context, tenantID uuid.UUID) (string, error) {
+	v, err := s.GetSetting(ctx, tenantID, api.SettingKeyRecordingBucket)
+	if err != nil {
+		return "", err
+	}
+	name, err := v.AsString()
+	if err != nil {
+		return "", fmt.Errorf("tenancy/store: bucket setting not a string: %w", err)
+	}
+	return name, nil
+}
+
 // GetAllSettings implements api.Store.GetAllSettings.
 func (s *PostgresStore) GetAllSettings(ctx context.Context, tenantID uuid.UUID) (map[string]api.SettingValue, error) {
 	const q = `SELECT key, value FROM tenant_settings WHERE tenant_id = $1`
