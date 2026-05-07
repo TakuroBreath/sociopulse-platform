@@ -56,3 +56,16 @@ Headlines:
 5. Safety: comma-ok type assertion, no `defer` in loops, bounds-checked numeric conversion.
 6. Security: `crypto/rand` for tokens, AES-GCM only, parameterized SQL, `crypto/subtle.ConstantTimeCompare`.
 7. Testing: table-driven + `t.Parallel()`, `//go:build integration`, `goleak`.
+
+## Tech baseline (locked by ADRs)
+
+- **HTTP router**: `github.com/gin-gonic/gin` v1.10+ (ADR-0014). Handlers
+  are `func(c *gin.Context)`. JSON binding via `c.ShouldBindJSON`. Test
+  mode via `gin.SetMode(gin.TestMode)`.
+- **Logger**: `go.uber.org/zap` v1.27+ (ADR-0012). gin↔zap bridge:
+  `github.com/gin-contrib/zap`.
+- **Testing**: stdlib `testing` + `stretchr/testify` (helpers only) +
+  `go.uber.org/goleak` + `testcontainers/testcontainers-go`. TDD is
+  mandatory (ADR-0015). Methodology: `docs/architecture/08-tdd-discipline.md`.
+- **Linters**: `.golangci.yml` enforces all of the above mechanically.
+  See `docs/architecture/07-go-coding-standards.md` § Linter Mapping.
