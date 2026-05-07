@@ -120,3 +120,16 @@ CI runs `gitleaks` to catch leaked secrets.
 Significant architectural changes require an ADR. Add it to the system design
 doc (§22) or as a standalone file under `docs/adr/NNNN-<topic>.md` (4-digit
 zero-padded numbering).
+
+
+## Pre-commit hooks
+
+Optional but recommended for local development:
+
+```bash
+pip install pre-commit
+pre-commit install
+```
+
+After install, every `git commit` runs lint, secret-scan, formatters before
+the commit lands. Skip with `git commit --no-verify` if you must.
