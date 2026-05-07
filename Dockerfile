@@ -2,7 +2,7 @@
 # Multi-stage build for cmd/api.
 # Image: sociopulse-api:<tag>
 
-ARG GO_VERSION=1.26
+ARG GO_VERSION=1.26.3
 ARG ALPINE_VERSION=3.20
 
 # ----- builder -----
