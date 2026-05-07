@@ -1,5 +1,4 @@
 // Package modules — locator implementation.
-
 package modules
 
 import "sync"

@@ -10,8 +10,12 @@ func TestMapLocatorRoundTrip(t *testing.T) {
 	if !ok {
 		t.Fatal("expected foo registered")
 	}
-	if v.(int) != 42 {
-		t.Fatalf("got %v, want 42", v)
+	got, ok := v.(int)
+	if !ok {
+		t.Fatalf("expected int, got %T", v)
+	}
+	if got != 42 {
+		t.Fatalf("got %v, want 42", got)
 	}
 	if _, ok := l.Lookup("missing"); ok {
 		t.Fatal("expected missing not registered")

@@ -207,6 +207,53 @@ linters-settings:
             desc: "import from internal/tenancy/api instead"
           - pkg: "github.com/sociopulse/platform/internal/tenancy/store"
             desc: "import from internal/tenancy/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/telephony/service"
+            desc: "import from internal/telephony/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/telephony/store"
+            desc: "import from internal/telephony/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/telephony/events"
+            desc: "import from internal/telephony/api instead"
+
+      # pgxpool.Pool is reserved for pkg/postgres. Direct use elsewhere risks
+      # bypassing WithTenantTx and the SET LOCAL app.tenant_id path that powers
+      # RLS (Plan 03 Task 5). Allowed callers: pkg/postgres itself, and
+      # internal/tenancy/store admin paths that intentionally operate
+      # cross-tenant (Plan 04 Task 7).
+      pgxpool-isolation:
+        list-mode: lax
+        files:
+          - "!**/pkg/postgres/**"
+          - "!**/internal/tenancy/store/admin_*.go"
+          - "!**/cmd/migrator/**"
+        deny:
+          - pkg: "github.com/jackc/pgx/v5/pgxpool"
+            desc: "use pkg/postgres.Pool — direct pgxpool import bypasses SET LOCAL app.tenant_id and RLS"
+
+      # Yandex Cloud SDK is provider-specific. Reserved for KMS resolver
+      # (internal/tenancy/store) and recording-uploader (object storage).
+      # Anywhere else, the call must go through internal/tenancy/api or
+      # pkg/encryption abstractions.
+      yandex-sdk-isolation:
+        list-mode: lax
+        files:
+          - "!**/internal/tenancy/store/**"
+          - "!**/cmd/recording-uploader/**"
+          - "!**/cmd/api/main.go"
+        deny:
+          - pkg: "github.com/yandex-cloud/go-sdk"
+            desc: "Yandex SDK is provider-specific — use abstractions in internal/tenancy/api or pkg/encryption"
+
+      # Doc anchor for the time.After-in-loops policy. depguard cannot detect
+      # syntactic context ("inside a for loop"), so the actual enforcement
+      # lives in `make grep-time-after` (run in CI). This stanza exists so a
+      # reader scanning .golangci.yml finds the rule next to the others.
+      # samber/cc-skills-golang@golang-concurrency § BP8: time.After in a loop
+      # leaks one timer per iteration; reuse time.NewTimer + Reset.
+      time-after-policy:
+        list-mode: lax
+        deny:
+          - pkg: "this-is-a-doc-anchor-for-make-grep-time-after"
+            desc: "policy: forbid time.After inside for loops — see Makefile grep-time-after target"
 
 issues:
   exclude-rules:

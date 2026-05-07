@@ -13,7 +13,7 @@ GO         ?= go
 GOFLAGS    ?=
 LDFLAGS    ?= -s -w
 PKG        := github.com/sociopulse/platform
-COMMANDS   := api worker migrator telephony-bridge recording-uploader
+COMMANDS   := api worker migrator telephony-bridge recording-uploader synthetic status-page
 
 # Tooling pin (override locally if needed)
 # Note: v1.59.1 install fails due to broken transitive dep (asciicheck@v0.2.0).
@@ -73,5 +73,18 @@ docker-build: ## Build the cmd/api Docker image
 tidy: ## Tidy go.mod
 	$(GO) mod tidy
 
+.PHONY: grep-time-after
+grep-time-after: ## Fail if time.After appears within a for-loop scope (golang-concurrency § BP8)
+	@if grep -RnE --include='*.go' --exclude-dir=vendor --exclude='*_test.go' \
+	  -B1 'time\.After\(' . | grep -B1 -E '^\s*for\b' >/dev/null 2>&1; then \
+	  echo "ERROR: time.After found inside a for-loop — leaks a timer per iteration."; \
+	  echo "Use time.NewTimer + Reset (samber/cc-skills-golang@golang-concurrency § BP8)."; \
+	  echo ""; \
+	  grep -RnE --include='*.go' --exclude-dir=vendor --exclude='*_test.go' \
+	    -B1 'time\.After\(' . | grep -B1 -E '^\s*for\b' || true; \
+	  exit 1; \
+	fi
+	@echo "grep-time-after: OK"
+
 .PHONY: ci
-ci: lint vet test ## What CI runs
+ci: lint vet grep-time-after test ## What CI runs
