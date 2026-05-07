@@ -2098,7 +2098,39 @@ Task 1) и в `CONTRIBUTING.md` (Plan 00 Task 5).
   `slog.Attr`/`oops.With`, не интерполируются в message string.
 - `time.After` в loop — CI-grep guard (`make grep-time-after`, см. Plan 00a Task 8).
 
-**ADR-0014 candidate** (открыт): когда совершим miграцию `zap → slog`
+**HTTP testing pattern (gin, per ADR-0014):**
+
+```go
+gin.SetMode(gin.TestMode) // FIRST line of test file's TestMain or test func
+
+r := gin.New()
+r.POST("/api/auth/login", h.Login)
+
+req := httptest.NewRequest(http.MethodPost, "/api/auth/login",
+    strings.NewReader(`{"email":"x","password":"y"}`))
+req.Header.Set("Content-Type", "application/json")
+rec := httptest.NewRecorder()
+r.ServeHTTP(rec, req)
+
+assert.Equal(t, http.StatusXxx, rec.Code)
+```
+
+For handler-only unit tests (no routing), use `gin.CreateTestContext`:
+
+```go
+rec := httptest.NewRecorder()
+c, _ := gin.CreateTestContext(rec)
+c.Request = httptest.NewRequest(...)
+c.Params = gin.Params{{Key: "id", Value: "42"}}
+h.GetUser(c)
+```
+
+Full Red-Green-Refactor playbook lives in
+[`docs/architecture/08-tdd-discipline.md`](../../architecture/08-tdd-discipline.md).
+ADR-0015 makes TDD mandatory; ADR-0014 fixes the router choice; this section
+is the testing surface where they meet.
+
+**ADR-0016 candidate** (открыт): когда совершим miграцию `zap → slog`
 (ADR-0012 текущий), `loggercheck.zap` будет заменён на `loggercheck.slog`
 single-mode и `zap` уйдёт из allow-list импортов.
 
