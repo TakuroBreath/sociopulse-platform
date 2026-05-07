@@ -49,6 +49,7 @@
 
 ### `internal/`
 - **`internal/<module>/api/`** ✅ Contracts defined for 12 modules (auth, tenancy, crm, surveys, telephony, dialer, realtime, recording, analytics, reports, billing, audit). Each has `interfaces.go` + `dto.go` + `errors.go` + `events.go`. **No `service/`, `store/`, `http/`, `grpc/`, `events/` implementations yet.**
+  - **`internal/tenancy/api/`** ✅✅ Plan 04 Task 1 lands the per-interface refresh: `doc.go`, `errors.go`, `tenant_service.go`, `kms.go`, `phone_hasher.go`, `settings.go`, `module.go`, `events.go`, plus `types_test.go` (TDD-first). Adds `Tenant.Validate()`, `TenantStatus.Valid()`, `Module`/`Deps`/`KMSClient` types, and `api.Register` seam. SettingsCache uses Lookup/LookupWithDefault/LookupAll (renamed from Get* to avoid the Tenancy-aggregate method-name collision with TenantService.Get). depguard now also blocks `internal/tenancy/{events,transport}`.
 - **`internal/healthz/`** ✅ `Liveness`/`Readiness` handlers + `Checker` interface + `PostgresCheck`/`RedisCheck`/`NATSCheck`
 - **`internal/modules/`** ✅ `Module` interface + `Deps` struct + `MapLocator` + `Registry`
 - Per-module `internal/<X>/module.go` ✅ stubs with `Register(d modules.Deps) error { return nil }` — all 12 modules

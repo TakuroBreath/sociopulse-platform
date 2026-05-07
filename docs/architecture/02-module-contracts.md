@@ -167,9 +167,12 @@ type PhoneHasher interface {
 }
 
 type SettingsCache interface {
-    Get(ctx context.Context, tenantID uuid.UUID, key string) (SettingValue, error)
-    GetWithDefault(ctx context.Context, tenantID uuid.UUID, key string, def SettingValue) (SettingValue, error)
-    GetAll(ctx context.Context, tenantID uuid.UUID) (map[string]SettingValue, error)
+    // Lookup* methods avoid the Get-name collision with TenantService.Get
+    // so the Tenancy aggregate (below) can embed all four sub-interfaces
+    // directly. See `internal/tenancy/api/doc.go` for the rationale.
+    Lookup(ctx context.Context, tenantID uuid.UUID, key string) (SettingValue, error)
+    LookupWithDefault(ctx context.Context, tenantID uuid.UUID, key string, def SettingValue) (SettingValue, error)
+    LookupAll(ctx context.Context, tenantID uuid.UUID) (map[string]SettingValue, error)
     Set(ctx context.Context, tenantID uuid.UUID, key string, value SettingValue) error
     Delete(ctx context.Context, tenantID uuid.UUID, key string) error
     InvalidateLocal(tenantID uuid.UUID, key string)
@@ -182,17 +185,17 @@ type BucketProvisioner interface {
 
 // Aggregate exposed to other modules — saves them taking four deps.
 //
-// Note: simple embedding (`type Tenancy interface { TenantService; SettingsCache; KMSResolver; PhoneHasher }`)
-// is not Go-compilable here — `TenantService.Get(ctx, id) (Tenant, error)` and
-// `SettingsCache.Get(ctx, tenantID, key) (SettingValue, error)` collide on the
-// `Get` method name. The aggregate exposes four sub-getters instead so a
-// single concrete adapter still binds all four contracts at once. Implemented
-// in internal/tenancy/api/interfaces.go.
+// SettingsCache uses Lookup/LookupWithDefault/LookupAll (rather than the
+// historical Get/GetWithDefault/GetAll) so the four sub-interfaces have a
+// disjoint method set and can be embedded directly. The compile-time test
+// fixture `var _ interface{ TenantService; SettingsCache; KMSResolver;
+// PhoneHasher } = (Tenancy)(nil)` in `internal/tenancy/api/types_test.go`
+// guards this invariant.
 type Tenancy interface {
-    Tenants() TenantService
-    Settings() SettingsCache
-    KMS() KMSResolver
-    Phones() PhoneHasher
+    TenantService
+    SettingsCache
+    KMSResolver
+    PhoneHasher
 }
 ```
 

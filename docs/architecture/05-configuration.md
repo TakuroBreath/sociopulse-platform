@@ -36,7 +36,7 @@ The two boundaries deserve emphasis:
   (`config.yaml: dialer.defaults.attempt_max` is the process default;
   `tenant_settings(tenant_id, 'dialer.attempt_max')` overrides per
   tenant). The lookup pattern is fixed: every consumer of a per-tenant
-  setting calls `tenancy.SettingsCache.GetWithDefault(ctx, tenantID,
+  setting calls `tenancy.SettingsCache.LookupWithDefault(ctx, tenantID,
   key, def)` and the YAML default is the `def` argument.
 - **Lockbox holds secrets only**: TLS key passphrases, JWT signing
   secret, KMS service-account key, Postgres passwords, Docker Hub
@@ -237,7 +237,7 @@ def, err := api.SettingValueFromAny(3)
 if err != nil {
     return fmt.Errorf("default for dialer.attempt_max: %w", err)
 }
-v, err := s.tenancy.GetWithDefault(ctx, tenantID, "dialer.attempt_max", def)
+v, err := s.tenancy.LookupWithDefault(ctx, tenantID, "dialer.attempt_max", def)
 if err != nil {
     return fmt.Errorf("get dialer.attempt_max: %w", err)
 }

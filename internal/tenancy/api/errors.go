@@ -2,22 +2,30 @@ package api
 
 import "errors"
 
-// Sentinel errors returned by tenancy interfaces.
-// Other modules use errors.Is to discriminate.
+// Sentinel errors returned by tenancy. Wrap with %w; check with errors.Is.
 var (
-	// ErrNotFound is returned when a tenant or setting cannot be found.
+	// ErrNotFound — the tenant or setting key does not exist.
 	ErrNotFound = errors.New("tenancy: not found")
-	// ErrAlreadyExists is returned by TenantService.Create when OrgCode collides.
+
+	// ErrAlreadyExists — duplicate org_code on Create, or duplicate setting key on insert.
 	ErrAlreadyExists = errors.New("tenancy: already exists")
-	// ErrInvalidArgument is returned for malformed request fields (e.g. empty OrgCode).
+
+	// ErrInvalidArgument — caller-provided value violates an invariant
+	// (empty org_code, unknown status, unknown setting key, value type mismatch).
 	ErrInvalidArgument = errors.New("tenancy: invalid argument")
-	// ErrSuspended is returned by guards that refuse to operate on a suspended tenant.
+
+	// ErrSuspended — a tenant is suspended and cannot perform the requested op.
+	// Service-Owner CRUD is still allowed; only data-plane operations should
+	// surface this to end-users.
 	ErrSuspended = errors.New("tenancy: suspended")
-	// ErrArchived is returned by guards that refuse to operate on an archived tenant.
+
+	// ErrArchived — a tenant is archived (read-only graveyard).
 	ErrArchived = errors.New("tenancy: archived")
-	// ErrKMSUnavailable is returned when the KMS provider is unreachable
-	// after retries; the boundary maps it to HTTP 503 / gRPC Unavailable.
+
+	// ErrKMSUnavailable — Yandex KMS is unreachable / returned a transient error.
+	// Callers must retry with backoff, NOT degrade silently.
 	ErrKMSUnavailable = errors.New("tenancy: kms unavailable")
-	// ErrPermissionDenied is returned by Service-Owner guards.
+
+	// ErrPermissionDenied — request lacks Service-Owner mTLS identity.
 	ErrPermissionDenied = errors.New("tenancy: permission denied")
 )
