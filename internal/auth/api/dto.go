@@ -10,6 +10,7 @@ package api
 
 import (
 	"net/netip"
+	"slices"
 	"time"
 
 	"github.com/google/uuid"
@@ -40,12 +41,7 @@ type Claims struct {
 
 // HasRole reports whether the claims hold the given role.
 func (c Claims) HasRole(role Role) bool {
-	for _, r := range c.Roles {
-		if r == role {
-			return true
-		}
-	}
-	return false
+	return slices.Contains(c.Roles, role)
 }
 
 // AuthResult is returned from a successful Login or Refresh.

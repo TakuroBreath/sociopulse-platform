@@ -39,7 +39,7 @@ type Event struct {
 	Action    string         `json:"action"`             // e.g. "auth.login", "recording.accessed"
 	Target    string         `json:"target"`             // resource pointer ("call:<id>", "user:<id>")
 	Payload   map[string]any `json:"payload,omitempty"`  // jsonb, redacted
-	IP        netip.Addr     `json:"ip,omitempty"`
+	IP        netip.Addr     `json:"ip,omitzero"`
 	UserAgent string         `json:"user_agent,omitempty"`
 	Timestamp time.Time      `json:"ts"`
 }
