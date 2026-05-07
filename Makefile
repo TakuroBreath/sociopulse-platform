@@ -16,7 +16,9 @@ PKG        := github.com/sociopulse/platform
 COMMANDS   := api worker migrator telephony-bridge recording-uploader
 
 # Tooling pin (override locally if needed)
-GOLANGCI_LINT_VERSION ?= v1.59.1
+# Note: v1.59.1 install fails due to broken transitive dep (asciicheck@v0.2.0).
+# v1.64.8+ avoids the issue and supports all linters from .golangci.yml.
+GOLANGCI_LINT_VERSION ?= v1.64.8
 
 # ----- targets -----
 
