@@ -7,32 +7,90 @@
 // directly. The contract surfaces, log fields, metric names, span
 // names, and PII redaction rules are documented in
 // docs/architecture/06-observability.md.
-//
-// Concrete wiring (zap encoder + sampler, OTLP exporter, redaction
-// regex compilation, gin instrumentation) lands in Plan 02 Task 2.
 package observability
 
-import "go.uber.org/zap"
+import (
+	"errors"
+	"fmt"
+	"os"
+	"time"
 
-// NewLogger returns a *zap.Logger configured per
-// docs/architecture/06-observability.md.
+	"go.uber.org/zap"
+	"go.uber.org/zap/zapcore"
+
+	"github.com/sociopulse/platform/pkg/config"
+)
+
+// NewLogger constructs a production-grade *zap.Logger with PII redaction.
 //
-//   - env selects the encoder ("development" → console, anything else
-//     → JSON) and the sampler.
-//   - level is the minimum level ("debug" / "info" / "warn" / "error").
-//   - The returned logger has the redaction encoder layered over zap's
-//     own JSON encoder (see Plan 02 Task 2).
+// Encoder: JSON for production/staging, console for development. Sampling for
+// non-development environments uses a fixed bucket of 100 initial / 100
+// thereafter per second per (level,message) tuple, preventing a hot loop from
+// drowning the log pipeline.
 //
-// Callers SHOULD attach the standard fields (service, service.environment,
-// module, request_id, ...) immediately via .With(...).
-func NewLogger(env, level string) (*zap.Logger, error) {
-	panic("not implemented: see Plan 02 Task 2")
+// The returned logger has the redaction encoder layered over zap's own JSON
+// (or console) encoder; patterns come from cfg.Observability.Logging.
+//
+// Caller must call Sync() at process exit.
+func NewLogger(cfg config.Config) (*zap.Logger, error) {
+	return newLoggerWithSink(cfg, zapcore.Lock(zapcore.AddSync(os.Stderr)))
 }
 
-// MaskPhone returns a phone number rendered for safe logging:
-// "+7 (***) ***-**-12". Use this for intentionally logged phone
-// values; the encoder's redaction filter is a safety net for
-// accidents.
-func MaskPhone(phone string) string {
-	panic("not implemented: see Plan 02 Task 2")
+// newLoggerWithSink is the testable form of NewLogger that accepts an explicit
+// write syncer. Production callers go through NewLogger.
+func newLoggerWithSink(cfg config.Config, sink zapcore.WriteSyncer) (*zap.Logger, error) {
+	level, err := parseLevel(cfg.Service.LogLevel)
+	if err != nil {
+		return nil, err
+	}
+
+	var encCfg zapcore.EncoderConfig
+	var innerEnc zapcore.Encoder
+	var sampling *zap.SamplingConfig
+	if cfg.Service.Env == "development" {
+		encCfg = zap.NewDevelopmentEncoderConfig()
+		encCfg.EncodeLevel = zapcore.CapitalColorLevelEncoder
+		innerEnc = zapcore.NewConsoleEncoder(encCfg)
+	} else {
+		encCfg = zap.NewProductionEncoderConfig()
+		innerEnc = zapcore.NewJSONEncoder(encCfg)
+		sampling = &zap.SamplingConfig{Initial: 100, Thereafter: 100}
+	}
+
+	enc, err := NewRedactingEncoder(innerEnc, cfg.Observability.Logging.RedactPatterns)
+	if err != nil {
+		return nil, fmt.Errorf("redacting encoder: %w", err)
+	}
+
+	atomLevel := zap.NewAtomicLevelAt(level)
+	core := zapcore.NewCore(enc, sink, atomLevel)
+	if sampling != nil {
+		core = zapcore.NewSamplerWithOptions(core, time.Second, sampling.Initial, sampling.Thereafter)
+	}
+
+	logger := zap.New(core,
+		zap.AddCaller(),
+		zap.AddStacktrace(zap.ErrorLevel),
+		zap.Fields(
+			zap.String("service", cfg.Service.Name),
+			zap.String("env", cfg.Service.Env),
+			zap.String("region", cfg.Service.Region),
+		),
+	)
+	return logger, nil
+}
+
+func parseLevel(s string) (zapcore.Level, error) {
+	switch s {
+	case "debug":
+		return zapcore.DebugLevel, nil
+	case "info":
+		return zapcore.InfoLevel, nil
+	case "warn":
+		return zapcore.WarnLevel, nil
+	case "error":
+		return zapcore.ErrorLevel, nil
+	default:
+		return zapcore.InfoLevel, errors.New("unknown log level: " + s)
+	}
 }
