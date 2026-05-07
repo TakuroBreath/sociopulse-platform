@@ -64,7 +64,8 @@ sociopulse-platform/
 │   │   ├── 03-error-handling.md
 │   │   ├── 04-testing-strategy.md
 │   │   ├── 05-configuration.md
-│   │   └── 06-observability.md
+│   │   ├── 06-observability.md
+│   │   └── 07-go-coding-standards.md                 # samber/cc-skills-golang distilled
 │   └── agents/                                      # already from setup-matt-pocock-skills
 │       ├── issue-tracker.md
 │       ├── triage-labels.md
@@ -121,6 +122,7 @@ sociopulse-platform/
 - Create: `docs/architecture/04-testing-strategy.md`
 - Create: `docs/architecture/05-configuration.md`
 - Create: `docs/architecture/06-observability.md`
+- Create: `docs/architecture/07-go-coding-standards.md`
 
 - [ ] **Step 1: `00-overview.md` — module map + dependency graph**
 
@@ -268,11 +270,157 @@ Conventions:
 3. **Trace span names**: `<module>.<Service>.<Method>` (e.g. `auth.AuthService.Login`).
 4. **PII redaction**: any field matching `phone|password|token` regex masked at zap encoder level. Tested in CI.
 
-- [ ] **Step 8: Commit**
+- [ ] **Step 8: `07-go-coding-standards.md` — distilled samber/cc-skills-golang**
+
+This document distils the **`samber/cc-skills-golang`** community skill pack
+(MIT, 12 skills under `~/.agents/skills/golang-*/`) into project-specific
+standards. The skill pack itself is the authoritative source of rationale and
+examples; this document is the project-specific *application* of those
+standards. Updated whenever a new Go version is adopted or a skill version
+bumps.
+
+Sections (write each as 3–6 paragraphs of guidance, not just a bullet list):
+
+1. **Skill pack inventory.** Table of the 12 skills with one-line summaries:
+   `golang-concurrency`, `golang-context`, `golang-data-structures`,
+   `golang-design-patterns`, `golang-error-handling`, `golang-grpc`,
+   `golang-modernize`, `golang-safety`, `golang-security`,
+   `golang-structs-interfaces`, `golang-testing`, `golang-troubleshooting`.
+   Note which are user-invocable (`/golang-modernize`, `/golang-security`,
+   `/golang-testing`, `/golang-troubleshooting`) and which auto-trigger by
+   description match.
+
+2. **Errors (`golang-error-handling`).** Wrap with `fmt.Errorf("ctx: %w", err)`.
+   Inspect with `errors.Is` / `errors.As`. Sentinel errors live in
+   `internal/<module>/api/errors.go` as `var ErrXxx = errors.New("module:
+   description")`. **Single-handling rule**: an error is either logged or
+   returned, never both — duplicate logs flood Loki/Grafana. **Low cardinality
+   only** in the error string: variable data (tenant_id, call_id, request_id)
+   goes into structured `slog.Attr` or `oops.With(...)`, never interpolated
+   into the message string. `samber/oops` used at the outermost handler
+   (HTTP/gRPC/worker) for stack-trace + structured-attrs production errors.
+   gRPC errors mapped via `status.Errorf(codes.X, ...)` + `errdetails`. HTTP
+   errors mapped in `pkg/httputil/error_handler.go` to a stable JSON envelope.
+
+3. **Context (`golang-context`).** `ctx context.Context` is always the first
+   parameter. Same `ctx` propagated through HTTP handler → service → store →
+   external client; never `context.Background()` mid-chain. `defer cancel()`
+   immediately after `WithCancel/WithTimeout/WithDeadline`. **Background work
+   that must outlive the parent request** (audit log writes, outbox-relay
+   publishes after commit, async fire-and-forget telemetry) uses
+   `context.WithoutCancel` (Go 1.21+) — preserves trace-id values, drops
+   cancellation. Never store ctx in a struct.
+
+4. **Concurrency (`golang-concurrency`).** Every goroutine has a clear exit
+   (ctx.Done / explicit done channel / WaitGroup). For worker pools use
+   `errgroup.WithContext` + `SetLimit(n)` rather than hand-rolled semaphores
+   (matches dialer Worker design). Channel ownership: only sender closes;
+   specify direction (`chan<-`, `<-chan`). **No `time.After` in loops** —
+   each call leaks a timer until it fires; reuse `time.NewTimer` + `Reset`.
+   `goleak.VerifyTestMain` is mandatory in every Go package that spawns
+   goroutines: `pkg/outbox`, `internal/dialer/service`,
+   `internal/realtime/service`, `internal/telephony/...`,
+   `internal/recording/service`. Race detector required: CI runs
+   `go test -race -count=1 ./...`.
+
+5. **Interfaces and structs (`golang-structs-interfaces`).** Small (1–3
+   methods); compose larger contracts. Defined where consumed
+   (`internal/<consumer>/...` imports `internal/<producer>/api/`). Constructors
+   return concrete types (`*Service`), never interface — caller assigns to
+   interface var if they want. Premature interfaces forbidden — extract when
+   second consumer or test mock arrives. **Compile-time interface check**
+   `var _ api.X = (*concrete.X)(nil)` mandatory near every adapter type that
+   implements an `api/` interface — catches drift at build time.
+
+6. **Safety (`golang-safety`).** Comma-ok type assertion only (enforced by
+   `forcetypeassert` linter). Typed nil ≠ nil interface — return untyped `nil`
+   when the nil case is intended. Never write to nil map. `defer` extracted
+   from loops: bodies become a function with own `defer Close()`. Integer
+   conversions bounds-checked (`int64 → int32` may silently wrap). Float
+   comparison via epsilon, never `==`. **Zero-value design**: structs work
+   without explicit initialisation — embed `noCopy` sentinel for types
+   containing `sync.Mutex`/channels.
+
+7. **Security (`golang-security`).** `crypto/rand` for tokens, session IDs,
+   API keys, recording-DEK, password salts. `math/rand/v2` only for
+   non-security randomness (jitter, sampling). `math/rand` (the v1 package)
+   forbidden by depguard. AES-256-GCM for envelope encryption (recordings,
+   Lockbox secrets, KMS DEK wrap). CBC/ECB/DES/MD5/SHA1 forbidden by depguard.
+   Parameterized SQL only — string concat is a depguard violation. Secret
+   comparison via `crypto/subtle.ConstantTimeCompare`. `gosec` linter +
+   `govulncheck` in CI (Plan 00 Task 11).
+
+8. **Modernize (`golang-modernize`).** Project targets Go 1.22+. Use:
+   - `any` over `interface{}`
+   - `min`/`max`/`clear` builtins
+   - `range` over int (Go 1.22)
+   - `slices`/`maps` packages over hand-rolled helpers
+   - `cmp.Or` for default values
+   - `sync.OnceValue`/`OnceFunc` over manual `sync.Once` patterns
+   - `t.Context()` in tests (Go 1.24+, when CI Go version supports it)
+   - `wg.Go()` (Go 1.25+, when adopted)
+   - `errors.Join` for accumulating independent errors
+   - `slog.Attr` builders (`slog.String`, `slog.Int64`, `slog.Group`) over
+     interface-typed key/value pairs
+
+   Loop variable shadow copies (`for _, x := range xs { go f(x) }`) — no
+   longer needed since Go 1.22 fixed the semantics, but explicit copy still
+   preferred in cross-iteration goroutines for readability.
+
+9. **Testing (`golang-testing`).** Table-driven tests with named subtests
+   (`t.Run(tt.name, ...)`). `t.Parallel()` mandatory in unit tests
+   (paralleltest linter). `//go:build integration` build tag for
+   testcontainers-go integration tests; run via
+   `go test -tags=integration ./...`. testify is used as helpers (`require`,
+   `assert`), not as a replacement for the standard library — failure
+   reporting must include enough context to debug from the CI log alone.
+   Mock interfaces, never concrete types — every `internal/<module>/api/`
+   interface gets a `mockery`-generated mock under `internal/<module>/api/mocks/`.
+   `goleak.VerifyTestMain` for goroutine-spawning packages. Coverage targets
+   match `04-testing-strategy.md` (≥85% service, ≥70% store, ≥60% http/grpc).
+
+10. **gRPC (`golang-grpc`).** Used in two places only: `internal/recording/grpc/`
+    (recording-uploader → cmd/api Commit) and `internal/telephony/grpc/`
+    (cmd/api → telephony-bridge Router). Health check service registered.
+    `GracefulStop()` with timeout fallback. Reflection disabled in production
+    (`SOCIOPULSE_GRPC_REFLECTION=false` default). Always `status.Errorf(codes.X,
+    ...)` — raw `error` becomes `codes.Unknown` and breaks client retry. Sentinel
+    `internal/<module>/api/errors.go` errors mapped to gRPC codes in a single
+    interceptor per service. mTLS via `pkg/grpc.NewMTLSServer/Client`.
+
+11. **Troubleshooting (`golang-troubleshooting`).** Reproduce before fix —
+    failing test first, then code change. Race detector + `goleak` are
+    diagnostic, not optional. `pprof` enabled on `cmd/api` admin port (auth
+    required, separate listener) for production debugging. Delve in dev only.
+
+12. **Linter mapping table.** Reference table — for each rule above, name the
+    `golangci-lint` linter that mechanically enforces it (see Plan 00 Task 9
+    for the canonical list):
+
+    | Rule | Linter |
+    |---|---|
+    | `%w` for error wrapping | `errorlint` |
+    | `errors.Is/As` over `==`/type assertion | `errorlint` |
+    | Comma-ok type assertion | `forcetypeassert` |
+    | HTTP request without context | `noctx` |
+    | Context propagation through chain | `contextcheck` |
+    | `t.Parallel()` in tests | `paralleltest` |
+    | `t.Helper()` in helpers | `thelper` |
+    | testify idioms | `testifylint` |
+    | slog/zap key-value pairs correct | `loggercheck` |
+    | exhaustive switch over enum | `exhaustive` |
+    | Module isolation `internal/X/api/` only | `depguard:module-boundaries` |
+    | `math/rand`, weak crypto | `depguard:banned-stdlib` |
+    | Body close on `*http.Response` | `bodyclose` |
+    | `rows.Close()` / `rows.Err()` | `sqlclosecheck`, `rowserrcheck` |
+    | Security patterns (gosec rules) | `gosec` |
+    | Vulnerability scan | `govulncheck` (CI job, not lint) |
+
+- [ ] **Step 9: Commit**
 
 ```bash
 git add docs/architecture/
-git commit -m "docs(architecture): add 7 design documents (overview, layout, contracts, errors, testing, config, obs)"
+git commit -m "docs(architecture): add 8 design documents (overview, layout, contracts, errors, testing, config, obs, go-coding-standards)"
 ```
 
 ---
@@ -431,6 +579,43 @@ git commit -m "docs: add CONTEXT.md domain glossary"
 - `internal/<module>/api/dto.go`
 - `internal/<module>/api/errors.go`
 - `internal/<module>/api/events.go` (only for modules that publish events)
+
+**Style requirements** (apply to every adapter type created in downstream plans
+02-14 — recorded here so reviewers reject violations early):
+
+1. **Compile-time interface check.** Every adapter type that implements an
+   `api.X` interface MUST include `var _ api.X = (*ConcreteType)(nil)` near the
+   type declaration. This catches drift between contract and implementation at
+   build time rather than at runtime. Source:
+   `samber/cc-skills-golang@golang-structs-interfaces` § Compile-Time Interface
+   Check.
+
+   Example for a future plan: when Plan 03 introduces `internal/auth/store.UserStore`,
+   the file MUST contain:
+   ```go
+   var _ api.UserStore = (*UserStore)(nil)
+   ```
+
+2. **Accept interfaces, return concrete types.** Constructors return
+   `*ConcreteType`, never the interface — the caller can assign to interface
+   variable if they need narrowed access. Source:
+   `samber/cc-skills-golang@golang-structs-interfaces` § Accept Interfaces,
+   Return Structs.
+
+3. **No premature interfaces in `service/`.** If a `service` struct has a
+   single implementation, it stays as a concrete type. Extract an interface
+   only when (a) a second implementation appears, or (b) a test requires
+   mocking. The `api/` package interfaces are the *consumer-facing* contract;
+   internal `service/` types are concrete until proven otherwise. Source:
+   `samber/cc-skills-golang@golang-structs-interfaces` § Don't Create Interfaces
+   Prematurely.
+
+4. **Errors in `api/errors.go` use low-cardinality strings.** Sentinel
+   declaration: `var ErrTenantNotFound = errors.New("tenancy: tenant not found")`.
+   Variable data (tenant_id, request_id) attaches via `slog.Attr` or
+   `oops.With(...)` at the log site, never interpolated into the sentinel
+   string. Source: `samber/cc-skills-golang@golang-error-handling` § Best
+   Practice 15.
 
 **Process:** for each module, follow this 4-step pattern. Below I give the full pattern for `auth` as a worked example. For the other 11 modules, derive the contracts from the corresponding plan (see "Source plan" column) using the same pattern.
 
@@ -662,6 +847,8 @@ After the per-module commits in Step 1-11 and the verify in Step 5, no extra com
 **Files** (per package):
 - `pkg/<name>/<file>.go` with type definitions and stub implementations
 - One `_test.go` file per package with a "compile-only" test
+- For packages that will spawn goroutines (`pkg/outbox`, `pkg/eventbus`):
+  `pkg/<name>/main_test.go` with `goleak.VerifyTestMain` (see Step 9 below)
 
 - [ ] **Step 1: `pkg/postgres/`**
 
@@ -737,12 +924,53 @@ NATS-specific implementation in Plan 02.
 
 Stub helper functions: `NewMTLSServer`, `NewMTLSClient`, `IdempotencyMiddleware`, `RateLimitMiddleware`. Plan 02 fills.
 
-- [ ] **Step 8: Compile-check + commit**
+- [ ] **Step 8: Add `go.uber.org/goleak` dependency**
+
+```bash
+go get go.uber.org/goleak@latest
+```
+
+Expected: `go.uber.org/goleak` added to `go.mod`. Reference:
+[`samber/cc-skills-golang@golang-concurrency`](~/.agents/skills/golang-concurrency/SKILL.md)
+§ Best Practice 9 — track goroutine leaks in tests.
+
+- [ ] **Step 9: Add `goleak.VerifyTestMain` to packages that will spawn goroutines**
+
+For each package that will spawn goroutines in its real implementation, create
+a `main_test.go` with leak detection. Even though stubs panic, the file is in
+place so the leak guard activates the moment Plan 02/03 fills in real code.
+
+```go
+// pkg/outbox/main_test.go
+package outbox
+
+import (
+    "testing"
+
+    "go.uber.org/goleak"
+)
+
+func TestMain(m *testing.M) {
+    goleak.VerifyTestMain(m)
+}
+```
+
+Required for: `pkg/outbox`, `pkg/eventbus`, `pkg/grpc`. (Other `pkg/*`
+packages — `postgres`, `encryption`, `observability`, `config`, `httputil`
+— have no goroutines and don't need this guard.)
+
+The same `main_test.go` template will be added to every `internal/<module>/service/`
+in Plans 09, 10, 11, 12 (telephony-bridge worker pool, dialer Worker pool,
+realtime Hub goroutines, recording uploader). The skill's Common Mistakes
+table flags fire-and-forget goroutines as the #1 mistake.
+
+- [ ] **Step 10: Compile-check + commit**
 
 ```bash
 go build ./pkg/...
-git add pkg/
-git commit -m "feat(pkg): scaffold shared abstractions (postgres, outbox, encryption, observability, config, eventbus)"
+go test -count=1 ./pkg/...    # only compile-smoke tests pass; goleak guard active
+git add pkg/ go.mod go.sum
+git commit -m "feat(pkg): scaffold shared abstractions + goleak guard for goroutine packages"
 ```
 
 ---
@@ -975,6 +1203,44 @@ linters-settings:
           - pkg: "github.com/yandex-cloud/go-sdk"
             desc: "Yandex SDK is provider-specific. Use abstractions in internal/tenancy/api."
 
+      # Internal store/events implementations are reserved for their own module
+      # plus cmd/* composition roots. Outside those, the api/ contract is the
+      # only sanctioned import. Already configured in Plan 00 Task 9 — listed
+      # here for completeness; depguard merges rules with the same name.
+      cross-module-isolation:
+        list-mode: lax
+        files:
+          - "internal/*/service/**"
+          - "internal/*/store/**"
+          - "internal/*/http/**"
+          - "internal/*/grpc/**"
+          - "internal/*/events/**"
+        deny:
+          # For every <module>, deny imports of every other <module>'s
+          # service/, store/, http/, grpc/, events/. The 12-module list is
+          # generated from the canonical module list — see Plan 00 Task 9 for
+          # the auth/tenancy/crm/... entries; this section reuses that list.
+          - pkg: "social-pulse/internal/auth/service"
+            desc: "import only via internal/auth/api"
+          - pkg: "social-pulse/internal/auth/store"
+            desc: "import only via internal/auth/api"
+          # ... full enumeration in Plan 00 Task 9 .golangci.yml block.
+
+      # samber/cc-skills-golang@golang-concurrency § BP 8 — time.After in a
+      # loop leaks one timer per iteration. Use time.NewTimer + Reset.
+      # Allow time.After in test files and in `select` outside loops; we can't
+      # easily express "outside loops" in depguard, so the rule lives in code
+      # review + a CI grep guard instead. Keep this entry as a doc anchor:
+      time-after-policy:
+        list-mode: lax
+        deny:
+          # depguard cannot detect "in a loop"; this rule is intentionally a
+          # no-op pkg entry to anchor the policy. Enforcement: a CI step greps
+          # for `for ` followed by `time.After(` within 20 lines and fails the
+          # build. See Plan 00 Task 11 — add a `make grep-time-after` target.
+          - pkg: "this-is-a-doc-anchor-not-a-real-import"
+            desc: "time.After in loops leaks timers — see samber/cc-skills-golang@golang-concurrency § BP8 + Common Mistakes table. Use time.NewTimer + Reset. CI greps for the pattern."
+
 run:
   timeout: 5m
 
@@ -983,6 +1249,24 @@ issues:
     - vendor
     - dist
 ```
+
+- [ ] **Step 1b: Add `make grep-time-after` to Makefile + CI**
+
+The `time.After`-in-loop pattern is hard to detect with depguard alone (it
+needs syntactic context, not just import path). Add a fast grep guard.
+
+In `Makefile` (created in Plan 00 Task 7):
+
+```makefile
+.PHONY: grep-time-after
+grep-time-after: ## Fail if time.After appears within a for-loop scope
+	@! grep -RnE --include='*.go' --exclude-dir=vendor 'for[ \t].*\{[^}]*time\.After\(' . \
+	  || (echo 'time.After in loops leaks timers — use time.NewTimer + Reset (samber/cc-skills-golang@golang-concurrency § BP8)'; exit 1)
+```
+
+In `.github/workflows/ci.yml` (created in Plan 00 Task 11), add `make
+grep-time-after` to the lint job. Approximate; refine after the first false
+positive — CI greps are tradeoffs, not absolutes.
 
 - [ ] **Step 2: Verify lint passes**
 

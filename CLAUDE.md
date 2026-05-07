@@ -35,3 +35,24 @@ Five canonical labels (`needs-triage`, `needs-info`, `ready-for-agent`, `ready-f
 ### Domain docs
 
 Single-context layout — one `CONTEXT.md` + `docs/adr/` at the repo root. See `docs/agents/domain.md`.
+
+### Go coding skills (samber/cc-skills-golang)
+
+The Go codebase follows the `samber/cc-skills-golang` community skill pack
+(MIT, 12 skills) installed locally at `~/.agents/skills/golang-*/SKILL.md`.
+Skills auto-trigger by description match; four are user-invocable:
+`/golang-modernize`, `/golang-security`, `/golang-testing`, `/golang-troubleshooting`.
+
+Distilled project-specific standards: [`docs/architecture/07-go-coding-standards.md`](docs/architecture/07-go-coding-standards.md)
+(created in Plan 00a Task 1). Mechanical enforcement via `.golangci.yml`
++ depguard (Plan 00 Task 9, Plan 00a Task 8). Spec reference: §17.8 in
+[`docs/superpowers/specs/2026-05-06-sociopulse-system-design.md`](docs/superpowers/specs/2026-05-06-sociopulse-system-design.md).
+
+Headlines:
+1. Errors: `fmt.Errorf("ctx: %w", err)`, single-handling rule, low-cardinality strings.
+2. Context: `ctx context.Context` first param, `context.WithoutCancel` for outlive-parent work.
+3. Concurrency: clear goroutine exit, `errgroup.SetLimit` over hand-rolled pools, `goleak.VerifyTestMain`.
+4. Interfaces: small, defined where consumed; accept interface, return struct; `var _ api.X = (*Y)(nil)` compile-check.
+5. Safety: comma-ok type assertion, no `defer` in loops, bounds-checked numeric conversion.
+6. Security: `crypto/rand` for tokens, AES-GCM only, parameterized SQL, `crypto/subtle.ConstantTimeCompare`.
+7. Testing: table-driven + `t.Parallel()`, `//go:build integration`, `goleak`.

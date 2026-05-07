@@ -2047,6 +2047,61 @@ DR-runbook — отдельный документ `docs/runbooks/disaster-recov
 - **DAST**: OWASP ZAP против staging раз в неделю.
 - **Penetration test**: external раз в год для production (если бизнес-требование).
 
+### 17.8 Go Coding Standards
+
+Backend Go-codebase следует распакованному и адаптированному набору
+**`samber/cc-skills-golang`** (MIT, 12 скиллов) — community-стандарту от
+автора `samber/lo`/`samber/oops`. Скиллы установлены в
+`~/.agents/skills/golang-*/SKILL.md` и автоматически активируются по описанию
+при работе с релевантным кодом. Полная distilled-версия для нашего проекта
+живёт в `docs/architecture/07-go-coding-standards.md` (создаётся в Plan 00a
+Task 1) и в `CONTRIBUTING.md` (Plan 00 Task 5).
+
+**Двенадцать областей (заголовок каждой — название скилла):**
+
+| # | Скилл | Project enforcement |
+|---|---|---|
+| 1 | `golang-error-handling` | `errorlint`, single-handling rule, `samber/oops` на boundary |
+| 2 | `golang-context` | `contextcheck`, `noctx`, `WithoutCancel` для outbox-relay |
+| 3 | `golang-concurrency` | `errgroup.SetLimit` для worker pools, `goleak.VerifyTestMain` обязателен, race detector в CI |
+| 4 | `golang-structs-interfaces` | small interfaces, accept interface/return struct, compile-time check `var _ api.X = (*Y)(nil)` |
+| 5 | `golang-safety` | `forcetypeassert`, comma-ok, no `defer` в loops, bounds-checked numeric conversion |
+| 6 | `golang-security` | `crypto/rand` для secrets, AES-GCM, `crypto/subtle.ConstantTimeCompare`, `gosec`, `govulncheck` в CI |
+| 7 | `golang-modernize` | Go 1.22+: `any`, `min`/`max`, `range` over int, `slices`/`maps`, `cmp.Or` |
+| 8 | `golang-data-structures` | preallocate slices/maps, `strings.Builder`, generic constraints |
+| 9 | `golang-design-patterns` | functional options, `defer Close()` сразу после открытия, no `init()` для injectable deps |
+| 10 | `golang-grpc` | health check service, `GracefulStop`, `status.Errorf` с правильным code, mTLS |
+| 11 | `golang-testing` | table-driven + named subtests + `t.Parallel()` (paralleltest), testify как helper, `goleak` |
+| 12 | `golang-troubleshooting` | reproduce-before-fix, `pprof` на admin порту, `dlv` только в dev |
+
+**Механическая enforcement (см. Plan 00 Task 9 + Plan 00a Task 8 для полного
+списка линтеров и depguard правил):**
+
+- `forcetypeassert` — все type assertions через comma-ok.
+- `errorlint` — `%w` в `fmt.Errorf`, `errors.Is/As` вместо `==` и type-switch.
+- `contextcheck` + `noctx` — context propagation через цепочку.
+- `paralleltest` + `thelper` + `testifylint` — testing-идиомы.
+- `loggercheck` — корректность ключ-значение пар у `slog`/`zap`.
+- `exhaustive` — switch по enum покрывает все варианты.
+- `bodyclose` + `sqlclosecheck` + `rowserrcheck` — закрытие resources.
+- `depguard:banned-stdlib` — `math/rand`, MD5, SHA1, DES, CBC/ECB запрещены.
+- `depguard:cross-module-isolation` — модули общаются только через `internal/<X>/api/`.
+- `depguard:pgxpool-blocked` — direct `pgxpool.Pool` блокирован вне `pkg/postgres` (защита RLS).
+- `depguard:yandex-sdk-isolation` — Yandex SDK только в `internal/tenancy/store` и `cmd/recording-uploader`.
+
+**Не-механический enforcement (code review):**
+
+- Single-handling rule — линтер не ловит, ловит ревью.
+- Premature interfaces — review-проверка: extract interface когда появился
+  второй consumer или test mock.
+- Low-cardinality error strings — review-проверка: переменные данные через
+  `slog.Attr`/`oops.With`, не интерполируются в message string.
+- `time.After` в loop — CI-grep guard (`make grep-time-after`, см. Plan 00a Task 8).
+
+**ADR-0014 candidate** (открыт): когда совершим miграцию `zap → slog`
+(ADR-0012 текущий), `loggercheck.zap` будет заменён на `loggercheck.slog`
+single-mode и `zap` уйдёт из allow-list импортов.
+
 ---
 
 ## 18. Риски и митигации
