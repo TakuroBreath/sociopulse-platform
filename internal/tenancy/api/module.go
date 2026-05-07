@@ -102,23 +102,37 @@ type KMSClient interface {
 }
 
 // Module is the top-level handle for the tenancy module.
+//
+// During the iterative landing of Plan 04, the Module exposes individual
+// sub-services as they become available. The aggregate Tenancy is filled
+// in later (Plan 04 Task 7) once all four sub-interfaces have concrete
+// implementations.
 type Module struct {
-	deps    Deps
-	tenancy Tenancy
-	closer  io.Closer
+	deps          Deps
+	tenancy       Tenancy
+	tenantService TenantService
+	closer        io.Closer
 }
 
 // NewModule constructs a Module from already-wired dependencies. Use this
-// when an integrator has built the four sub-interfaces by hand (e.g. during
+// when an integrator has built the sub-interfaces by hand (e.g. during
 // tests). Production callers go through Register, which performs the full
 // store/service composition.
-func NewModule(deps Deps, tenancy Tenancy, closer io.Closer) *Module {
-	return &Module{deps: deps, tenancy: tenancy, closer: closer}
+//
+// tenancy may be nil while Plan 04 is being landed in stages — callers must
+// not call Module.Tenancy() until the aggregate is complete.
+func NewModule(deps Deps, tenancy Tenancy, tenantService TenantService, closer io.Closer) *Module {
+	return &Module{deps: deps, tenancy: tenancy, tenantService: tenantService, closer: closer}
 }
 
-// Tenancy returns the aggregate interface. Safe to call after Register
-// returns no error.
+// Tenancy returns the aggregate interface. Safe to call once every
+// sub-interface (TenantService, SettingsCache, KMSResolver, PhoneHasher)
+// has been wired. Returns nil while Plan 04 is being landed in stages.
 func (m *Module) Tenancy() Tenancy { return m.tenancy }
+
+// TenantService returns the cross-tenant CRUD surface. Available as soon as
+// Plan 04 Task 2 lands; the rest of the aggregate follows later tasks.
+func (m *Module) TenantService() TenantService { return m.tenantService }
 
 // Deps returns the dependency bundle the module was constructed with.
 // Useful in tests and at shutdown.

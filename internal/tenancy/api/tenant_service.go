@@ -31,15 +31,18 @@ func (s TenantStatus) Valid() bool {
 
 // Tenant is the public DTO for a tenant row.
 //
-// PhoneHashPepper is *not* exposed in the DTO — it never leaves the database
-// boundary in serialised form. Use PhoneHasher to operate over phone numbers.
+// PhoneHashPepper is *not* exposed in any external response. The JSON tag is
+// "-" so it never leaks into HTTP/JSON output; the field is populated only
+// inside the tenancy module (PhoneHasher / store-layer queries). Other
+// modules read peppers through PhoneHasher, never through this struct.
 type Tenant struct {
-	ID        uuid.UUID    `json:"id"`
-	OrgCode   string       `json:"org_code"` // e.g. "CC-MOSKVA-01"
-	Name      string       `json:"name"`     // e.g. "ВЦИОМ-Москва"
-	Status    TenantStatus `json:"status"`
-	KMSKEKID  string       `json:"kms_kek_id"` // Yandex KMS symmetric key ID
-	CreatedAt time.Time    `json:"created_at"`
+	ID              uuid.UUID    `json:"id"`
+	OrgCode         string       `json:"org_code"` // e.g. "CC-MOSKVA-01"
+	Name            string       `json:"name"`     // e.g. "ВЦИОМ-Москва"
+	Status          TenantStatus `json:"status"`
+	KMSKEKID        string       `json:"kms_kek_id"` // Yandex KMS symmetric key ID
+	PhoneHashPepper []byte       `json:"-"`          // 32 random bytes; never serialised
+	CreatedAt       time.Time    `json:"created_at"`
 }
 
 // Validate enforces the invariants that aren't already enforced by the DB

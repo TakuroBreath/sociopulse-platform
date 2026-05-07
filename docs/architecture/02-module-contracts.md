@@ -197,6 +197,41 @@ type Tenancy interface {
     KMSResolver
     PhoneHasher
 }
+
+// Module-internal interfaces declared in api/ so that test doubles in
+// service-layer tests can satisfy them without importing the internal
+// store package. Plan 04 Task 2 wires the concrete PostgresStore.
+//
+// Mutating Store methods accept a postgres.Tx so the service can
+// co-locate the row write with a transactional outbox Append (and an
+// eventual audit row) inside a single tenancy_admin transaction.
+type Store interface {
+    // Mutating: caller owns tx (tenancy_admin BypassRLS path).
+    Insert(ctx context.Context, tx postgres.Tx, t Tenant) (Tenant, error)
+    UpdateStatus(ctx context.Context, tx postgres.Tx, id uuid.UUID, status TenantStatus) error
+    UpsertSetting(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, key string, value SettingValue) error
+    DeleteSetting(ctx context.Context, tx postgres.Tx, tenantID uuid.UUID, key string) error
+
+    // Read-only: store opens a short-lived BypassRLS tx internally.
+    Get(ctx context.Context, id uuid.UUID) (Tenant, error)
+    GetByOrgCode(ctx context.Context, orgCode string) (Tenant, error)
+    List(ctx context.Context, filter ListTenantsFilter) ([]Tenant, error)
+    GetPhoneHashPepper(ctx context.Context, tenantID uuid.UUID) ([]byte, error)
+    GetSetting(ctx context.Context, tenantID uuid.UUID, key string) (SettingValue, error)
+    GetAllSettings(ctx context.Context, tenantID uuid.UUID) (map[string]SettingValue, error)
+}
+
+// SettingsPublisher abstracts the message-bus emission of lifecycle and
+// cache-invalidation events so the service layer is testable without
+// NATS. The durable lifecycle path is the transactional outbox (pkg/outbox);
+// SettingsPublisher is best-effort cache invalidation.
+type SettingsPublisher interface {
+    PublishCreated(ctx context.Context, t Tenant) error
+    PublishSuspended(ctx context.Context, tenantID uuid.UUID) error
+    PublishArchived(ctx context.Context, tenantID uuid.UUID) error
+    PublishSettingUpdated(ctx context.Context, tenantID uuid.UUID, key string) error
+    PublishSettingDeleted(ctx context.Context, tenantID uuid.UUID, key string) error
+}
 ```
 
 ### DTOs
@@ -211,12 +246,13 @@ const (
 )
 
 type Tenant struct {
-    ID        uuid.UUID
-    OrgCode   string         // public code, e.g. "CC-MOSKVA-01"
-    Name      string
-    Status    TenantStatus
-    KMSKEKID  string         // Yandex KMS symmetric key ID
-    CreatedAt time.Time
+    ID              uuid.UUID
+    OrgCode         string         // public code, e.g. "CC-MOSKVA-01"
+    Name            string
+    Status          TenantStatus
+    KMSKEKID        string         // Yandex KMS symmetric key ID
+    PhoneHashPepper []byte         // 32 bytes; json:"-" — never serialised
+    CreatedAt       time.Time
 }
 
 type CreateTenantRequest struct {

@@ -143,6 +143,79 @@ linters-settings:
 
       module-boundaries:
         list-mode: lax
+        files:
+          # Same-module composition is allowed: a module's own service/,
+          # store/, events/, transport/, module.go composes its own
+          # internal packages. The rule denies CROSS-module imports of
+          # those packages, not intra-module wiring. cmd/api is the
+          # blank-import seam that triggers each service package's init().
+          #
+          # api/ packages stay subject to the rule on purpose: they are
+          # the public surface and must never reach down into
+          # service/store/events/transport. The boundary check there is
+          # performed by the absence of those imports in api/*.go (and a
+          # compile-time test fixture in internal/tenancy/api).
+          - "!**/internal/auth/service/**"
+          - "!**/internal/auth/store/**"
+          - "!**/internal/auth/events/**"
+          - "!**/internal/auth/transport/**"
+          - "!**/internal/auth/module.go"
+          - "!**/internal/crm/service/**"
+          - "!**/internal/crm/store/**"
+          - "!**/internal/crm/events/**"
+          - "!**/internal/crm/transport/**"
+          - "!**/internal/crm/module.go"
+          - "!**/internal/surveys/service/**"
+          - "!**/internal/surveys/store/**"
+          - "!**/internal/surveys/events/**"
+          - "!**/internal/surveys/transport/**"
+          - "!**/internal/surveys/module.go"
+          - "!**/internal/dialer/service/**"
+          - "!**/internal/dialer/store/**"
+          - "!**/internal/dialer/events/**"
+          - "!**/internal/dialer/transport/**"
+          - "!**/internal/dialer/module.go"
+          - "!**/internal/realtime/service/**"
+          - "!**/internal/realtime/store/**"
+          - "!**/internal/realtime/events/**"
+          - "!**/internal/realtime/transport/**"
+          - "!**/internal/realtime/module.go"
+          - "!**/internal/recording/service/**"
+          - "!**/internal/recording/store/**"
+          - "!**/internal/recording/events/**"
+          - "!**/internal/recording/transport/**"
+          - "!**/internal/recording/module.go"
+          - "!**/internal/analytics/service/**"
+          - "!**/internal/analytics/store/**"
+          - "!**/internal/analytics/events/**"
+          - "!**/internal/analytics/transport/**"
+          - "!**/internal/analytics/module.go"
+          - "!**/internal/reports/service/**"
+          - "!**/internal/reports/store/**"
+          - "!**/internal/reports/events/**"
+          - "!**/internal/reports/transport/**"
+          - "!**/internal/reports/module.go"
+          - "!**/internal/billing/service/**"
+          - "!**/internal/billing/store/**"
+          - "!**/internal/billing/events/**"
+          - "!**/internal/billing/transport/**"
+          - "!**/internal/billing/module.go"
+          - "!**/internal/audit/service/**"
+          - "!**/internal/audit/store/**"
+          - "!**/internal/audit/events/**"
+          - "!**/internal/audit/transport/**"
+          - "!**/internal/audit/module.go"
+          - "!**/internal/tenancy/service/**"
+          - "!**/internal/tenancy/store/**"
+          - "!**/internal/tenancy/events/**"
+          - "!**/internal/tenancy/transport/**"
+          - "!**/internal/tenancy/module.go"
+          - "!**/internal/telephony/service/**"
+          - "!**/internal/telephony/store/**"
+          - "!**/internal/telephony/events/**"
+          - "!**/internal/telephony/transport/**"
+          - "!**/internal/telephony/module.go"
+          - "!**/cmd/**"
         deny:
           # All cross-module imports must go through the api/ subpackage.
           - pkg: "github.com/sociopulse/platform/internal/auth/service"

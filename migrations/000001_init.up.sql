@@ -429,4 +429,10 @@ begin
   execute format('grant usage, select on all sequences in schema public to %I', app_user);
 end$$;
 
+-- tenancy_admin needs DML on the tables the tenancy module owns. BYPASSRLS
+-- at the role level lets `set local role tenancy_admin` skip RLS predicates,
+-- but the role still has to be granted base table privileges.
+grant select, insert, update, delete on tenants to tenancy_admin;
+grant select, insert, update, delete on tenant_settings to tenancy_admin;
+
 commit;

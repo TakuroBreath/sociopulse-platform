@@ -3,11 +3,13 @@
 // This file is a thin shim that delegates to internal/tenancy/api.Register.
 // The actual seam is set by internal/tenancy/service/register.go (Plan 04
 // Task 2 onwards), which keeps internal/tenancy/api/ free of any service/
-// import.
+// import. cmd/api blank-imports the service package to trigger the seam's
+// init().
 //
-// Until Plan 04 Task 2 wires the seam, api.Register is nil and Register
-// here returns no error — the module simply registers nothing on Deps.
-// cmd/api boots cleanly either way.
+// Once Plan 04 Task 2 lands, api.Register is non-nil; this file builds the
+// api.Deps from modules.Deps, calls the seam, and registers the resulting
+// TenantService in the modules.Locator under "tenancy.TenantService".
+// SettingsCache, KMSResolver, and PhoneHasher are added in later tasks.
 package tenancy
 
 import (
@@ -54,7 +56,14 @@ func (m *Module) Register(d modules.Deps) error {
 	}
 	m.apiModule = mod
 	if d.Locator != nil {
-		d.Locator.Register("tenancy.Tenancy", mod.Tenancy())
+		// Plan 04 Task 2 only wires TenantService. The aggregate Tenancy is
+		// registered later when SettingsCache/KMSResolver/PhoneHasher land.
+		if ts := mod.TenantService(); ts != nil {
+			d.Locator.Register("tenancy.TenantService", ts)
+		}
+		if t := mod.Tenancy(); t != nil {
+			d.Locator.Register("tenancy.Tenancy", t)
+		}
 	}
 	return nil
 }
