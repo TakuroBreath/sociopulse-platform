@@ -9,8 +9,9 @@
 // SIGINT/SIGTERM to drive graceful shutdown.
 //
 // Subsequent plans plug into this skeleton:
-//   - Plan 03: real *postgres.Pool wired through Deps; outbox relay's
-//     Run(ctx) call is enabled.
+//   - Plan 03 Task 6 (this commit): outbox relay wired with a noop
+//     eventbus.Publisher; the relay drains event_outbox to that publisher
+//     until Plan 04 swaps in the real NATS-backed Publisher.
 //   - Plan 04+: each business module's Register() runs inside this run() —
 //     they receive the same Deps and mount their handlers on the gin
 //     engine via Deps.HTTPRouter.
@@ -30,9 +31,11 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sociopulse/platform/internal/healthz"
+	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/observability"
+	"github.com/sociopulse/platform/pkg/outbox"
 )
 
 const (
@@ -131,25 +134,42 @@ func run(ctx context.Context, configDir string) error {
 	//    at module-Register time.
 	metrics := observability.NewMetrics(cfg)
 
-	// 5. Infrastructure clients. STUBS — real wiring lands later:
-	//      - *postgres.Pool        → Plan 03 Task 4
+	// 5. Infrastructure clients.
+	//      - *postgres.Pool        → Plan 03 Task 4 (wired below)
 	//      - *redis.Client         → Plan 04 (auth module)
-	//      - *nats.Conn + JetStream → Plan 03 Task 6 / Plan 04 (eventbus)
+	//      - *nats.Conn + JetStream → Plan 04 (eventbus); a noopPublisher
+	//        stands in until then so the outbox relay can boot without
+	//        NATS being available.
 	//
-	//    Until they exist, healthz readiness has no checkers (an empty list
-	//    short-circuits to 200). The gateway happily serves /healthz, /readyz,
-	//    and /metrics; module routes are not yet mounted.
+	//    Pool open is non-blocking when MinConns is 0 (the default). A
+	//    short Ping decides whether to start the outbox relay: in dev/test
+	//    where Postgres is not running we skip the relay rather than
+	//    flooding the log with connection-refused warnings. Production
+	//    config sets MinConns >= 1 so failed dials surface here.
 	var checks []healthz.Checker
+
+	pool, pingErr := openPool(ctx, cfg, logger)
+	if pool != nil {
+		defer pool.Close()
+		checks = append(checks, healthchecks.PostgresCheck{Pool: pool})
+	}
 
 	// 6. Module Deps. Modules will be added here in later plans. The locator
 	//    is created up-front so order-dependent lookups (e.g. tenancy → auth
 	//    → realtime) work the moment Module.Register starts being called.
+	//
+	//    EventBus is the noop publisher until Plan 04 wires NATS — it lets
+	//    the outbox relay run end-to-end (drain rows, mark them published)
+	//    without a NATS cluster being available. Modules that need NATS
+	//    publishing today should wait for Plan 04.
+	publisher := newNoopPublisher(logger.Named("eventbus"))
 	locator := modules.NewMapLocator()
 	deps := modules.Deps{
-		Ctx:    ctx,
-		Logger: logger,
-		Config: &cfg,
-		// Pool, EventBus, Subscriber, GRPCServer left nil until later plans.
+		Ctx:        ctx,
+		Logger:     logger,
+		Config:     &cfg,
+		Pool:       pool,
+		EventBus:   publisher,
 		HTTPRouter: nil, // populated below once buildHTTPServer returns
 		Locator:    locator,
 	}
@@ -166,11 +186,22 @@ func run(ctx context.Context, configDir string) error {
 
 	// 8. Outbox relay.
 	//
-	//    TODO(Plan 03 Task 6): wire outbox relay once *postgres.Pool is real.
-	//    Until then pkg/outbox.Relay.Run panics; we log the deferral and
-	//    move on. Running this on every replica is intentional — the relay
-	//    uses FOR UPDATE SKIP LOCKED so leader election is unnecessary.
-	logger.Info("outbox relay deferred to Plan 03 Task 6 (real *postgres.Pool required)")
+	//    Started only when Postgres is reachable: pingErr above tells us
+	//    whether boot-time ping succeeded. Running this on every replica
+	//    is intentional — the relay uses FOR UPDATE SKIP LOCKED so leader
+	//    election is unnecessary; replicas naturally split the queue.
+	var relay *outbox.Relay
+	if pool != nil && pingErr == nil {
+		relay = outbox.NewRelay(pool, publisher, outbox.RelayConfig{
+			BatchSize:      cfg.Outbox.BatchSize,
+			Tick:           cfg.Outbox.Tick,
+			MaxRetry:       cfg.Outbox.MaxRetry,
+			PublishTimeout: 5 * time.Second, //nolint:mnd // matches pkg/outbox default
+		}, logger.Named("outbox"))
+	} else {
+		logger.Info("outbox relay skipped: Postgres unreachable",
+			zap.Error(pingErr))
+	}
 
 	// 9. errgroup orchestration. Each long-running goroutine returns from
 	//    its Run/ListenAndServe when the parent context is cancelled.
@@ -189,6 +220,14 @@ func run(ctx context.Context, configDir string) error {
 		}
 		return nil
 	})
+	if relay != nil {
+		g.Go(func() error {
+			if err := relay.Run(gctx); err != nil {
+				return fmt.Errorf("outbox relay: %w", err)
+			}
+			return nil
+		})
+	}
 
 	// 10. Wait for shutdown signal — either ctx.Done (SIGTERM) or one of the
 	//     errgroup goroutines failing.
