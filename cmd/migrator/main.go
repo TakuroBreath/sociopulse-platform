@@ -37,11 +37,14 @@ import (
 	"strconv"
 
 	"github.com/golang-migrate/migrate/v4"
-	// Blank import: registers golang-migrate's pgx/v5 database driver under
-	// the postgres scheme. The migrate.New URL scheme is derived from the
-	// DSN (postgres://…), and the database driver registry lives entirely
-	// in init() — there are no exported symbols we use directly. Required
-	// by revive's blank-imports rule.
+	// Blank import: registers golang-migrate's "postgres" database driver
+	// (lib/pq-based). DSNs in the form postgres://user:pass@host/db?sslmode=…
+	// are handled by this driver. The driver lives entirely in init() — no
+	// exported symbols we use directly. Required by revive's blank-imports rule.
+	_ "github.com/golang-migrate/migrate/v4/database/postgres"
+	// Blank import: pgx/v5 driver registers under the "pgx5" scheme. Kept in
+	// case operators want to opt in via DSN scheme like pgx5://… though we
+	// default to postgres:// for compatibility with golang-migrate examples.
 	_ "github.com/golang-migrate/migrate/v4/database/pgx/v5"
 	// Blank import: registers the file:// source driver. Same init()-only
 	// registration pattern as the database driver above.
