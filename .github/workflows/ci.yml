@@ -16,7 +16,10 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  GO_VERSION: "1.26"
+  # Pin to 1.26.3+ — govulncheck flagged stdlib CVEs (GO-2026-4982 html/template,
+  # GO-2026-4980 html/template, GO-2026-4971 net) fixed in 1.26.3. The "1.26"
+  # alias resolves to the latest cached patch on GitHub runners which may lag.
+  GO_VERSION: "1.26.3"
   GOLANGCI_LINT_VERSION: v1.64.8
   # Docker Hub repository — public, owned by maxtakuro.
   # Image:   docker.io/maxtakuro/sociopulse-api:<tag>
