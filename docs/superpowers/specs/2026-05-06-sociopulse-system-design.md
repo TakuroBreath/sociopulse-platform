@@ -2657,7 +2657,7 @@ message CommitResponse {
 - [x] **Placeholder scan**: нет TBD/TODO в основных разделах. Открытый вопрос — ADR-008 (WASM-runtime) помечен как Proposed.
 - [x] **Internal consistency**: feature lists, modules, data model, NFR — все ссылаются на одни и те же сущности. FSM в разделах 4.3, 5, 8 — согласована.
 - [x] **Scope check**: документ для одной системы, описывает её целиком, но реализация будет идти по подсистемам — каждая получит свой implementation plan через `writing-plans` skill.
-- [x] **Ambiguity check**: где могло быть двусмысленно — зафиксировал решением (ADR-001..014) или пометил как открытый вопрос (ADR-008).
+- [x] **Ambiguity check**: где могло быть двусмысленно — зафиксировал решением (ADR-001..015) или пометил как открытый вопрос (ADR-008).
 - [x] **Self-review issues C1-C4 / I1-I4 / U1-U10** — все включены в финальную доку: WebRTC оператор (ADR-001), recording-uploader как systemd (раздел 5.3.2), envelope KMS (раздел 9.2), 99.95% (ADR-005), processing-state маппинг (раздел 4.3), AES-GCM в приложении (раздел 6.2 + 12.4), gRPC между uploader и api (раздел 9.1, B.4), pgbouncer txn mode (ADR-006), worker-binary (раздел 5.4), regions.yaml (раздел 8.3), idempotency (NFR-12), trunk-capacity и caller-ID (раздел 7.3, 14.3), backpressure (раздел 8.6), recording integrity audit (раздел 9.3), WS-auth refresh (раздел 10.1), backup/DR (раздел 16.6), config registry (раздел 14).
 
 ---

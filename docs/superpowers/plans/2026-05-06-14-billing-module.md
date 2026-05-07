@@ -3027,7 +3027,7 @@ billingPG := billingstore.New(pgPool)
 billingSvc := billingsvc.New(billingPG, settingsBackend, billingsvc.Config{
 	DefaultTariffs: cfg.Billing.Defaults,
 }, logger)
-billingSvc.Endpoints().Mount(r, struct{ Admin func(http.Handler) http.Handler }{
+billingSvc.Endpoints().Mount(r, struct{ Admin gin.HandlerFunc }{
 	Admin: authMW.RequireRole("admin"),
 })
 
