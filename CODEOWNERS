@@ -1,0 +1,10 @@
+# Default owners
+* @TakuroBreath
+
+# Specific module ownership (fill in as team grows)
+/internal/dialer/        @TakuroBreath
+/internal/recording/     @TakuroBreath
+/cmd/telephony-bridge/   @TakuroBreath
+/cmd/recording-uploader/ @TakuroBreath
+/web/                    @TakuroBreath
+/deployments/            @TakuroBreath

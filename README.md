@@ -1,39 +1,46 @@
-# sociopulse-platform
+# СоциоПульс
 
-Backend platform for **СоциоПульс** — multi-tenant SaaS for telephone sociological surveys (call-centres running political/social polls).
-
-## Services in this repo
-
-| Binary | Purpose |
-|---|---|
-| `cmd/api` | HTTP/WS/gRPC API; modular monolith hosting auth, crm, surveys, dialer, realtime, recording, analytics, billing, reports, tenancy modules |
-| `cmd/telephony-bridge` | ESL ↔ NATS bridge between dialer and FreeSWITCH cluster |
-| `cmd/recording-uploader` | systemd-deployed uploader on FS-VMs: fsnotify → ffmpeg → KMS envelope encrypt → S3 → gRPC commit |
-| `cmd/migrator` | golang-migrate CLI for schema migrations |
-| `cmd/worker` | asynq workers (retention, integrity, retry orchestration, etc.) |
-| `cmd/synthetic` | canary monitor running production-like user journeys |
-| `cmd/status-page` | minimal in-house status page |
-
-## Stack
-
-Go 1.22+, PostgreSQL 16 (RLS + PgBouncer transaction-mode), Redis 7, ClickHouse, NATS JetStream, gRPC mTLS, OpenTelemetry, Prometheus, Yandex Cloud (Object Storage, KMS, Managed services).
+SaaS-платформа для проведения телефонных социологических опросов: автодозвон,
+анкетирование, контроль операторов, контроль качества записей.
 
 ## Documentation
 
-Specification, architecture decisions, and 22 implementation plans live in [`docs/superpowers/`](docs/superpowers/):
+- **System design:** [docs/superpowers/specs/2026-05-06-sociopulse-system-design.md](docs/superpowers/specs/2026-05-06-sociopulse-system-design.md)
+- **Architecture overview:** [ARCHITECTURE.md](ARCHITECTURE.md)
+- **Contributing:** [CONTRIBUTING.md](CONTRIBUTING.md)
+- **Implementation plans:** [docs/superpowers/plans/](docs/superpowers/plans/)
 
-- `specs/` — system design spec
-- `plans/` — implementation plans (Phase 1: 00, 00a, 02-14, 20 Task 1; Phase 2: 01, 08, 20 Tasks 2-7)
-- `reviews/` — architecture & plans review with Phase 1 / Phase 2 split
+## Quickstart
 
-This repo is the **master location** for all project documentation; sibling repos reference these via GitHub URLs.
+Requirements: Go 1.22+, Docker, Make.
 
-## Repos in the project
+```bash
+# Run linters
+make lint
 
-- **sociopulse-platform** — this repo (backend Go monorepo)
-- **sociopulse-web** — React 18 + TypeScript frontend
-- **sociopulse-infra** — Terraform (Yandex Cloud) + Packer/Ansible (FS-cluster) + Helm/ArgoCD
+# Run tests
+make test
 
-## Status
+# Build all binaries
+make build
 
-Pre-implementation. Specification approved (157 KB), 21 plans written and reviewed (1.85 MB total), no code yet.
+# Run cmd/api locally on :8080
+make run
+```
+
+Visit http://localhost:8080/healthz to verify.
+
+## Repository layout
+
+- `cmd/` — executable entry points (api, worker, migrator, telephony-bridge, recording-uploader)
+- `internal/` — private domain modules (auth, crm, surveys, dialer, realtime, recording, ...)
+- `pkg/` — shareable utility packages
+- `migrations/` — SQL migrations
+- `configs/` — YAML configs (per environment)
+- `deployments/` — IaC + Kubernetes manifests
+- `web/` — React frontend
+- `docs/` — documentation tree
+
+## License
+
+Proprietary. See [LICENSE](LICENSE).
