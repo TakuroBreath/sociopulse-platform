@@ -24,6 +24,24 @@ alter table users add constraint users_status_check
     check (status in ('active','archived'));
 
 -- ─── restore single-role text from roles[] ───────────────────────────────────
+-- DATA-LOSS GUARD: the legacy schema only held one role per user; rolling
+-- back when ANY user has 2+ roles would silently drop everything except
+-- roles[1]. Refuse to migrate down in that case rather than corrupt data.
+-- An operator who really wants to roll back must first manually consolidate
+-- roles via UPDATE or be ready to write a custom rollback.
+do $$
+declare multi_role_count int;
+begin
+    select count(*) into multi_role_count
+    from users
+    where cardinality(coalesce(roles, '{}'::text[])) > 1;
+    if multi_role_count > 0 then
+        raise exception
+            'down migration would drop role data for % user(s) with multiple roles; '
+            'consolidate roles to a single value before rolling back', multi_role_count;
+    end if;
+end $$;
+
 alter table users add column if not exists role text;
 update users set role = roles[1] where role is null and cardinality(coalesce(roles, '{}')) > 0;
 alter table users alter column role set not null;

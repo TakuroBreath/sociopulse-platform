@@ -72,6 +72,14 @@ type UserService struct {
 	hasher passwords.Hasher
 	audit  auditapi.Logger
 	clock  func() time.Time
+
+	// dummyHash is a pre-computed Argon2id hash of a fixed string. We
+	// run hasher.Verify against it on the missing-user branch of
+	// ChangePassword so that path spends the same wall-clock time as
+	// a wrong-password attempt against an existing user. Without it,
+	// an attacker could enumerate active user ids by latency.
+	dummyHash string
+
 	// TODO Plan 06+: add tenancy.KMSResolver here once full_name encryption
 	// is the project-wide standard. Today we keep the DTO plaintext per
 	// the 152-ФЗ pragmatic stance documented in CLAUDE.md.
@@ -84,6 +92,12 @@ var _ authapi.UserService = (*UserService)(nil)
 // caller (the module composition root) owns the lifecycle of every
 // dependency. clock may be nil — the constructor falls back to
 // time.Now so callers do not have to repeat that boilerplate.
+//
+// auditLogger MUST NOT be nil: every state-changing UserService method
+// emits an audit row inside the same transaction as the data write,
+// and a misconfigured composition root that registered nil would
+// silently drop those rows. Tests that genuinely don't care about the
+// audit trail must inject a no-op fake logger explicitly.
 func NewUserService(
 	pool userTxRunner,
 	store authapi.UserStorePort,
@@ -91,15 +105,41 @@ func NewUserService(
 	auditLogger auditapi.Logger,
 	clock func() time.Time,
 ) *UserService {
+	if pool == nil {
+		panic("auth/service: NewUserService: pool is required")
+	}
+	if store == nil {
+		panic("auth/service: NewUserService: store is required")
+	}
+	if hasher == nil {
+		panic("auth/service: NewUserService: hasher is required")
+	}
+	if auditLogger == nil {
+		panic("auth/service: NewUserService: auditLogger is required (use a no-op fake in tests, never nil)")
+	}
 	if clock == nil {
 		clock = time.Now
 	}
+
+	// Pre-bake a dummy Argon2id hash so the timing-safe missing-user
+	// branch of ChangePassword can call Verify without paying a Hash
+	// per request. We use a context.Background here because Hash is
+	// CPU-bound and uncancellable mid-derivation; if it fails (it
+	// shouldn't — Argon2 is deterministic) we panic loudly because a
+	// UserService without timing protection is a security regression
+	// that should not silently start.
+	dummyHash, err := hasher.Hash(context.Background(), "auth-service-dummy-hash-input")
+	if err != nil {
+		panic(fmt.Sprintf("auth/service: NewUserService: precompute dummy hash: %v", err))
+	}
+
 	return &UserService{
-		tx:     pool,
-		store:  store,
-		hasher: hasher,
-		audit:  auditLogger,
-		clock:  clock,
+		tx:        pool,
+		store:     store,
+		hasher:    hasher,
+		audit:     auditLogger,
+		clock:     clock,
+		dummyHash: dummyHash,
 	}
 }
 
@@ -363,12 +403,17 @@ func (s *UserService) ResetPassword(ctx context.Context, id uuid.UUID) (string, 
 	return tempPwd, nil
 }
 
-// ChangePassword implements api.UserService.ChangePassword. Verifies
-// the old password constant-time inside the project Hasher, then
-// updates the stored hash and clears MustChangePwd. A wrong old
-// password surfaces api.ErrInvalidCredentials so the timing is
-// indistinguishable from a non-existent user (the store layer also
-// maps the missing-id case to ErrUserNotFound).
+// ChangePassword implements api.UserService.ChangePassword.
+//
+// Timing-safety: an attacker probing this endpoint must NOT learn whether
+// the user id exists from the response time. We achieve this by ALWAYS
+// running hasher.Verify exactly once on the request — against the real
+// stored hash if the user exists, against a pre-computed dummy hash
+// otherwise. Both paths surface api.ErrInvalidCredentials so the
+// observable response is identical (modulo the audit row written on
+// success, which is server-side-only). The new-password Argon2id hash
+// is computed AFTER Verify succeeds so a flood of wrong-old-password
+// attempts costs one Argon2 (verify) instead of two (verify + hash).
 func (s *UserService) ChangePassword(ctx context.Context, id uuid.UUID, oldPassword, newPassword string) error {
 	if id == uuid.Nil {
 		return fmt.Errorf("auth/service: change password: id required")
@@ -376,36 +421,24 @@ func (s *UserService) ChangePassword(ctx context.Context, id uuid.UUID, oldPassw
 	if newPassword == "" {
 		return fmt.Errorf("auth/service: change password: new password must be non-empty")
 	}
-	tenantID, err := s.resolveTenant(ctx, id)
-	if err != nil {
-		return err
+
+	tenantID, resolveErr := s.resolveTenant(ctx, id)
+	if resolveErr != nil && !errors.Is(resolveErr, authapi.ErrUserNotFound) {
+		return resolveErr
+	}
+	userMissing := errors.Is(resolveErr, authapi.ErrUserNotFound)
+
+	if userMissing {
+		// Spend the same Argon2 cost on a dummy hash so the response
+		// time matches the wrong-password path exactly. The hash is
+		// pre-baked in the constructor (see s.dummyHash) so we don't
+		// pay an extra Hash here on every miss.
+		_, _ = s.hasher.Verify(ctx, s.dummyHash, oldPassword)
+		return authapi.ErrInvalidCredentials
 	}
 
-	newHash, err := s.hasher.Hash(ctx, newPassword)
-	if err != nil {
-		return fmt.Errorf("auth/service: hash new password: %w", err)
-	}
-
-	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
-		oldHash, err := s.store.GetPasswordHash(ctx, tx, id)
-		if err != nil {
-			return err
-		}
-		ok, err := s.hasher.Verify(ctx, oldHash, oldPassword)
-		if err != nil {
-			return fmt.Errorf("verify old password: %w", err)
-		}
-		if !ok {
-			return authapi.ErrInvalidCredentials
-		}
-		if err := s.store.UpdatePassword(ctx, tx, id, newHash, false); err != nil {
-			return err
-		}
-		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: tenantID,
-			Action:   "user.password_changed",
-			Target:   "user:" + id.String(),
-		})
+	err := s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		return s.applyPasswordChange(ctx, tx, id, tenantID, oldPassword, newPassword)
 	})
 	if err != nil {
 		if errors.Is(err, authapi.ErrInvalidCredentials) || errors.Is(err, authapi.ErrUserNotFound) {
@@ -414,6 +447,45 @@ func (s *UserService) ChangePassword(ctx context.Context, id uuid.UUID, oldPassw
 		return fmt.Errorf("auth/service: change password: %w", err)
 	}
 	return nil
+}
+
+// applyPasswordChange is the inner closure of ChangePassword. Extracted
+// so ChangePassword stays under the gocognit threshold and so the
+// timing-equalization branches are easier to audit independently.
+func (s *UserService) applyPasswordChange(ctx context.Context, tx postgres.Tx, id, tenantID uuid.UUID, oldPassword, newPassword string) error {
+	oldHash, err := s.store.GetPasswordHash(ctx, tx, id)
+	if err != nil {
+		// Race: the user was archived/deleted between resolveTenant
+		// and this read. Equalize timing with the missing-user branch
+		// above (run Verify against the dummy hash) and surface the
+		// same sentinel.
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			_, _ = s.hasher.Verify(ctx, s.dummyHash, oldPassword)
+			return authapi.ErrInvalidCredentials
+		}
+		return err
+	}
+	ok, err := s.hasher.Verify(ctx, oldHash, oldPassword)
+	if err != nil {
+		return fmt.Errorf("verify old password: %w", err)
+	}
+	if !ok {
+		return authapi.ErrInvalidCredentials
+	}
+	// Only compute the new hash when the old one is verified —
+	// rejecting wrong-old fast saves the second Argon2 derivation.
+	newHash, err := s.hasher.Hash(ctx, newPassword)
+	if err != nil {
+		return fmt.Errorf("hash new password: %w", err)
+	}
+	if err := s.store.UpdatePassword(ctx, tx, id, newHash, false); err != nil {
+		return err
+	}
+	return s.writeAudit(ctx, auditapi.Event{
+		TenantID: tenantID,
+		Action:   "user.password_changed",
+		Target:   "user:" + id.String(),
+	})
 }
 
 // resolveTenant returns the TenantID for the given user id by reading

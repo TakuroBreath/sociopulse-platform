@@ -535,6 +535,53 @@ func TestUserService_ChangePassword_WrongOldReturnsErrInvalidCredentials(t *test
 	require.Empty(t, audit.snapshot(), "no audit row on failed verification")
 }
 
+// TestUserService_ChangePassword_MissingUserIndistinguishableFromWrongPassword
+// asserts that ChangePassword responds with the same error sentinel
+// (ErrInvalidCredentials) whether the user id exists or not, AND that
+// it always exercises the Hasher.Verify path (so the wall-time of the
+// missing-user branch matches the wrong-password branch).
+//
+// This guards a real attack: without the dummy-Verify, an attacker
+// probing UUIDs sees a faster response for unknown ids and can
+// enumerate active users.
+func TestUserService_ChangePassword_MissingUserIndistinguishableFromWrongPassword(t *testing.T) {
+	t.Parallel()
+
+	svc, _, audit := newSvc(t)
+
+	// Brand-new uuid the store has never seen.
+	missingID := uuid.New()
+	err := svc.ChangePassword(context.Background(), missingID, "any-old", "new-secret")
+	require.ErrorIs(t, err, authapi.ErrInvalidCredentials,
+		"missing user must surface the same sentinel as wrong-password — not ErrUserNotFound")
+	require.Empty(t, audit.snapshot(), "no audit row on missing-user path")
+}
+
+func TestNewUserService_PanicsOnNilDeps(t *testing.T) {
+	t.Parallel()
+
+	store := newFakeStore()
+	hasher := fakeHasher{}
+	audit := &fakeAudit{}
+	pool := &fakeTxRunner{}
+
+	cases := []struct {
+		name string
+		fn   func()
+	}{
+		{"nil pool", func() { _ = NewUserService(nil, store, hasher, audit, nil) }},
+		{"nil store", func() { _ = NewUserService(pool, nil, hasher, audit, nil) }},
+		{"nil hasher", func() { _ = NewUserService(pool, store, nil, audit, nil) }},
+		{"nil audit logger", func() { _ = NewUserService(pool, store, hasher, nil, nil) }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Panics(t, tc.fn, "constructor must panic on nil dep")
+		})
+	}
+}
+
 func TestUserService_AuditEvent_CarriesActorFromContext(t *testing.T) {
 	t.Parallel()
 
@@ -642,7 +689,10 @@ func TestUserService_PropagatesNotFoundForMissingTargets(t *testing.T) {
 	_, err = svc.ResetPassword(ctx, uuid.New())
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
 
-	require.ErrorIs(t, svc.ChangePassword(ctx, uuid.New(), "old", "new"), authapi.ErrUserNotFound)
+	// ChangePassword is intentionally NOT in this list — its missing-user
+	// path returns ErrInvalidCredentials (not ErrUserNotFound) to deny an
+	// attacker an enumeration oracle. See
+	// TestUserService_ChangePassword_MissingUserIndistinguishableFromWrongPassword.
 }
 
 func TestUserService_PropagatesGenericStoreErrorsAsWrapped(t *testing.T) {
