@@ -132,6 +132,23 @@ func TestLoadEmptyDirErrors(t *testing.T) {
 	require.Error(t, err)
 }
 
+func TestLoadFileMissingFallsBackToDefaults(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir() // empty directory, no config.yaml
+	snap, err := Load(LoadOptions{Dir: dir})
+	require.NoError(t, err, "Load with empty dir should fall back to DefaultDev seeds")
+	require.NotNil(t, snap)
+	t.Cleanup(func() { _ = snap.Close() })
+
+	cfg := snap.Get()
+	assert.Equal(t, "development", cfg.Service.Env)
+	assert.Equal(t, ":8080", cfg.HTTP.Bind)
+	assert.Equal(t, ":9090", cfg.Observability.Metrics.Bind)
+	assert.Equal(t, "yc-ru-central-1", cfg.Service.Region)
+	assert.NotEmpty(t, cfg.NATS.URLs, "NATS URLs should be seeded from DefaultDev")
+	assert.NotEmpty(t, cfg.Database.Postgres.DSN, "Postgres DSN should be seeded from DefaultDev")
+}
+
 // TestLoadRealDevConfig reads configs/development/config.yaml from the
 // repository root. It is a smoke test that proves the on-disk dev fixture
 // stays in sync with the Config struct shape.

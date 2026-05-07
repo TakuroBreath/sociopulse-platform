@@ -7,8 +7,10 @@ type viperDefaulter interface {
 }
 
 // seedDefaults pushes a Config tree into Viper so missing yaml keys resolve.
-// We only seed fields whose zero value would fail Validate or surprise an
-// operator — sub-trees with no validation (S3, KMS, recording, etc.) are
+// We seed every field that Validate requires (and a few quality-of-life
+// extras like log_level / metrics namespace) so Load can succeed against an
+// empty directory and fall through to DefaultDev. Sub-trees with no
+// validation (S3, KMS, recording, telephony, dialer, reports) are
 // intentionally left for the YAML to populate.
 func seedDefaults(v viperDefaulter, c Config) {
 	// service
@@ -33,6 +35,24 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("grpc.bind", c.GRPC.Bind)
 	v.SetDefault("grpc.reflection_enabled", c.GRPC.ReflectionEnabled)
 	v.SetDefault("grpc.conn_timeout", c.GRPC.ConnTimeout)
+	// database.postgres
+	v.SetDefault("database.postgres.dsn", c.Database.Postgres.DSN)
+	v.SetDefault("database.postgres.max_conns", c.Database.Postgres.MaxConns)
+	v.SetDefault("database.postgres.max_idle_time", c.Database.Postgres.MaxIdleTime)
+	v.SetDefault("database.postgres.statement_cache", c.Database.Postgres.StatementCache)
+	// database.redis
+	v.SetDefault("database.redis.addr", c.Database.Redis.Addr)
+	v.SetDefault("database.redis.password", c.Database.Redis.Password)
+	v.SetDefault("database.redis.pool_size", c.Database.Redis.PoolSize)
+	v.SetDefault("database.redis.db", c.Database.Redis.DB)
+	// nats
+	v.SetDefault("nats.urls", c.NATS.URLs)
+	v.SetDefault("nats.account", c.NATS.Account)
+	// auth.jwt
+	v.SetDefault("auth.jwt.issuer", c.Auth.JWT.Issuer)
+	v.SetDefault("auth.jwt.access_ttl", c.Auth.JWT.AccessTTL)
+	v.SetDefault("auth.jwt.refresh_ttl", c.Auth.JWT.RefreshTTL)
+	v.SetDefault("auth.jwt.algorithm", c.Auth.JWT.Algorithm)
 	// observability
 	v.SetDefault("observability.otel.endpoint", c.Observability.OTel.Endpoint)
 	v.SetDefault("observability.otel.sampling_ratio", c.Observability.OTel.SamplingRatio)

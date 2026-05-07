@@ -77,6 +77,13 @@ func (s *Snapshot) Close() error {
 	return closer()
 }
 
+// replace atomically swaps the active Config and notifies subscribers.
+//
+// Single-producer assumption: replace MUST be called from a single goroutine
+// (currently the reload loop in startHotReload). Concurrent invocations would
+// race on the drain-and-resend path used when a listener channel is full. If
+// a future change adds a second producer, switch the inner mutex from
+// RWMutex.RLock to Mutex.Lock.
 func (s *Snapshot) replace(c Config) {
 	s.value.Store(&c)
 	s.mu.RLock()
