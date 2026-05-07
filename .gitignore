@@ -1,41 +1,43 @@
-# Binaries
+# Go build artifacts
 /bin/
+/dist/
 *.exe
-*.dll
-*.so
-*.dylib
-
-# Test artefacts
 *.test
 *.out
 coverage.txt
 coverage.html
 
-# Vendor / build cache
+# Go module cache (when vendored locally)
 /vendor/
-
-# Environment / secrets
-.env
-.env.local
-.env.*.local
-*.pem
-*.key
-!docs/**/*.pem
-!docs/**/*.key
 
 # IDE / editor
 .idea/
 .vscode/
 *.swp
-*~
-
-# OS
+*.swo
 .DS_Store
-Thumbs.db
 
-# Generated artefacts
-/dist/
+# Environment / secrets
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# Frontend
+/web/node_modules/
+/web/dist/
+/web/.vite/
+/web/coverage/
+
+# Local dev databases / volumes
+/data/
+/var/
+
+# Generated docs/openapi
+/docs/api/generated/
+
+# tmp / scratch
 /tmp/
-
-# Container builds
-*.tar
+*.bak
