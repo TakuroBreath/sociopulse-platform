@@ -1,3 +1,154 @@
-# Development environment configuration.
+# Development environment configuration for cmd/api.
+#
+# Layered onto DefaultDev() defaults from pkg/config; ENV vars with the
+# SOCIOPULSE_* prefix override individual keys (e.g.
+# SOCIOPULSE_DATABASE_POSTGRES_DSN). See docs/architecture/05-configuration.md
+# for the full layering order.
 
-Plan 02 fills this in.
+service:
+  env: development
+  log_level: debug
+  region: yc-ru-central-1
+  name: sociopulse-api
+
+http:
+  bind: ":8080"
+  read_timeout: 10s
+  write_timeout: 30s
+  idle_timeout: 120s
+  max_body_size: 10MB
+
+ws:
+  bind: ":8081"
+  ping_interval: 20s
+  read_buffer_size: 4096
+  write_buffer_size: 4096
+  max_message_size: 65536
+  handshake_timeout: 10s
+
+grpc:
+  bind: ":9091"
+  reflection_enabled: true
+  conn_timeout: 10s
+
+database:
+  postgres:
+    dsn: postgres://app:devpass@localhost:5432/sociopulse?sslmode=disable
+    max_conns: 20
+    max_idle_time: 5m
+    statement_cache: 100
+    migrations_path: ./migrations
+  clickhouse:
+    dsn: clickhouse://app:devpass@localhost:9000/sociopulse
+    batch_size: 10000
+    flush_interval: 5s
+  redis:
+    addr: localhost:6379
+    password: ""
+    pool_size: 20
+    db: 0
+
+nats:
+  urls: ["nats://localhost:4222"]
+  account: cmd-api
+
+s3:
+  endpoint: http://localhost:9000
+  region: ru-central-1
+  buckets:
+    backups: sociopulse-dev-backups
+    reports: sociopulse-dev-reports
+    consent_prompts: sociopulse-dev-consent-prompts
+
+kms:
+  endpoint: kms.api.cloud.yandex.net:443
+
+auth:
+  jwt:
+    issuer: https://app.sociopulse.local
+    access_ttl: 15m
+    refresh_ttl: 720h
+    algorithm: HS256
+    secret_lockbox_key: jwt-signing-secret-dev
+  password:
+    argon2id_memory_kb: 65536
+    argon2id_iterations: 3
+    argon2id_parallelism: 4
+  rate_limit:
+    login_per_ip_per_hour: 30
+    login_per_account_per_hour: 10
+    lockout_after_failures: 5
+    lockout_duration: 15m
+  totp:
+    issuer: SocioPulse
+    period_sec: 30
+    digits: 6
+
+dialer:
+  defaults:
+    attempt_max: 3
+    retry_no_answer_delay: 4h
+    retry_busy_delay: 30m
+    retry_dropped_delay: 2h
+    retry_tech_failure_delay: 5m
+    dialing_timeout: 25s
+    pause_max: 15m
+    rdd:
+      enabled: true
+      max_rate_per_sec: 10
+      fallback_threshold: 0.3
+      max_attempts_per_call: 50
+    working_hours:
+      weekdays: { from: "09:00", to: "21:00" }
+      weekends: { from: "10:00", to: "20:00" }
+
+telephony:
+  bridge:
+    fs_nodes: []
+    healthcheck_interval: 5s
+    max_concurrent_per_node: 60
+  trunks: []
+  routing:
+    default_strategy: least_cost_with_fallback
+
+recording:
+  local_buffer_path: /var/spool/sociopulse
+  staging_path: /var/spool/sociopulse/.staging
+  ffmpeg:
+    codec: libopus
+    bitrate: 32k
+    sample_rate: 16000
+  upload:
+    retry_initial_delay: 5s
+    retry_max_delay: 5m
+    retry_max_attempts: 100
+  retention:
+    default_hot_days: 365
+    default_cold_days: 730
+    cold_storage_class: COLD
+
+reports:
+  async_threshold_period_days: 30
+  async_threshold_records: 100000
+  job_ttl: 24h
+  presigned_url_ttl: 24h
+
+observability:
+  otel:
+    endpoint: localhost:4317
+    sampling_ratio: 1.0
+    insecure: true
+    service_name: sociopulse-api
+  metrics:
+    bind: ":9090"
+    namespace: sociopulse
+  logging:
+    redact_patterns:
+      - 'phone:\+?7\d{10}'
+      - 'token:[A-Za-z0-9._-]+'
+      - 'password:\S+'
+    sample_info_logs: 1.0
+    sample_debug_logs: 0.05
+
+shutdown:
+  grace_period: 15s
