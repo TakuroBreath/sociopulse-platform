@@ -30,4 +30,18 @@ var (
 	// ErrRefreshReplay is returned when a refresh token is reused after rotation.
 	// Triggers RevokeAllForUser on the affected session.
 	ErrRefreshReplay = errors.New("auth: refresh-token replay detected")
+	// ErrLoginTaken is returned by UserService.Create when a user with the
+	// same (tenant_id, login) already exists. Translated from the Postgres
+	// unique-violation SQLSTATE 23505 in the store layer.
+	ErrLoginTaken = errors.New("auth: login already taken")
+	// ErrUserNotFound is returned by user-lookup methods when no row matches
+	// the supplied id (or id+tenant). Mapped from pgx.ErrNoRows in the store.
+	ErrUserNotFound = errors.New("auth: user not found")
+	// ErrUserNotArchived is returned by UserService.Restore when called on
+	// a user whose archived_at is NULL — restore is a no-op there and
+	// callers should distinguish it from a successful idempotent restore.
+	ErrUserNotArchived = errors.New("auth: user is not archived")
+	// ErrEmptyRoles is returned by UserService.UpdateRole when the supplied
+	// role slice is empty — every user must hold at least one role.
+	ErrEmptyRoles = errors.New("auth: roles must be non-empty")
 )

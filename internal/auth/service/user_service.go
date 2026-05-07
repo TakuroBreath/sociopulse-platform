@@ -1,0 +1,465 @@
+package service
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+
+	auditapi "github.com/sociopulse/platform/internal/audit/api"
+	authapi "github.com/sociopulse/platform/internal/auth/api"
+	"github.com/sociopulse/platform/pkg/passwords"
+	"github.com/sociopulse/platform/pkg/postgres"
+)
+
+// userTxRunner is the cross-tenant transaction owner UserService uses
+// for write paths. *postgres.Pool satisfies this interface via its
+// WithTenant method; tests substitute an in-memory implementation that
+// invokes fn with a zero postgres.Tx.
+//
+// Defined here at the consumer per project convention (07-go-coding
+// -standards § Interfaces): the producer (*postgres.Pool) returns a
+// concrete struct, the consumer narrows it to the methods it actually
+// needs.
+type userTxRunner interface {
+	WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error
+	BypassRLS(ctx context.Context, fn func(postgres.Tx) error) error
+}
+
+// actorContextKey is the unexported context key UserService uses to
+// pull the acting user id when emitting audit rows. Middleware in
+// pkg/middleware/auth threads claims through *gin.Context today; once
+// that landing surfaces a context.Context-shaped helper, this key is
+// what UserService keys on. Until then, tests inject the actor via
+// WithActorID directly.
+type actorContextKey struct{}
+
+// WithActorID returns a context that carries the supplied actor user
+// id. UserService inspects the context for this value when writing
+// audit rows; absent value -> nil ActorID (system bootstrap).
+func WithActorID(ctx context.Context, actorID uuid.UUID) context.Context {
+	return context.WithValue(ctx, actorContextKey{}, actorID)
+}
+
+// actorIDFromContext returns the actor id stored on ctx by WithActorID,
+// or a nil pointer when no actor is present.
+func actorIDFromContext(ctx context.Context) *uuid.UUID {
+	v, ok := ctx.Value(actorContextKey{}).(uuid.UUID)
+	if !ok || v == uuid.Nil {
+		return nil
+	}
+	return &v
+}
+
+// UserService implements api.UserService.
+//
+// Mutating methods open a per-tenant transaction (Pool.WithTenant), run
+// the store write, and emit an audit row inside the same transaction
+// so the audit log is durable iff the row write committed. List/Get
+// open a similar transaction for RLS enforcement; the read paths do
+// not need audit.
+//
+// 152-ФЗ note (pragmatic stance — see CLAUDE.md compliance section):
+// full_name is stored as plaintext in the DB. The KMSResolver hook is
+// plumbed via DI for forward compatibility but UserService does NOT
+// call Encrypt/Decrypt on full_name in this task. Plan 06+ may flip
+// the column to bytea + encrypt; the DTO surface stays string-typed.
+type UserService struct {
+	tx     userTxRunner
+	store  authapi.UserStorePort
+	hasher passwords.Hasher
+	audit  auditapi.Logger
+	clock  func() time.Time
+	// TODO Plan 06+: add tenancy.KMSResolver here once full_name encryption
+	// is the project-wide standard. Today we keep the DTO plaintext per
+	// the 152-ФЗ pragmatic stance documented in CLAUDE.md.
+}
+
+// Compile-time assertion: *UserService must satisfy api.UserService.
+var _ authapi.UserService = (*UserService)(nil)
+
+// NewUserService constructs a UserService from already-built deps. The
+// caller (the module composition root) owns the lifecycle of every
+// dependency. clock may be nil — the constructor falls back to
+// time.Now so callers do not have to repeat that boilerplate.
+func NewUserService(
+	pool userTxRunner,
+	store authapi.UserStorePort,
+	hasher passwords.Hasher,
+	auditLogger auditapi.Logger,
+	clock func() time.Time,
+) *UserService {
+	if clock == nil {
+		clock = time.Now
+	}
+	return &UserService{
+		tx:     pool,
+		store:  store,
+		hasher: hasher,
+		audit:  auditLogger,
+		clock:  clock,
+	}
+}
+
+// Create implements api.UserService.Create. Generates a 16-char temp
+// password, hashes it via the project Hasher, inserts the user with
+// MustChangePwd=true, and emits a "user.created" audit row inside the
+// same transaction as the row write. Returns the saved user and the
+// temp password — the caller must surface the temp password to the
+// administrator exactly once and never re-fetch it.
+func (s *UserService) Create(ctx context.Context, in authapi.CreateUserInput) (authapi.User, string, error) {
+	if in.TenantID == uuid.Nil {
+		return authapi.User{}, "", fmt.Errorf("auth/service: create user: tenant id required")
+	}
+	if in.Login == "" {
+		return authapi.User{}, "", fmt.Errorf("auth/service: create user: login required")
+	}
+	if len(in.Roles) == 0 {
+		return authapi.User{}, "", fmt.Errorf("%w: create user", authapi.ErrEmptyRoles)
+	}
+
+	tempPwd, err := GenerateTempPassword()
+	if err != nil {
+		return authapi.User{}, "", fmt.Errorf("auth/service: generate temp password: %w", err)
+	}
+	hash, err := s.hasher.Hash(ctx, tempPwd)
+	if err != nil {
+		return authapi.User{}, "", fmt.Errorf("auth/service: hash temp password: %w", err)
+	}
+
+	candidate := authapi.User{
+		TenantID:      in.TenantID,
+		Login:         in.Login,
+		FullName:      in.FullName,
+		Email:         in.Email,
+		Roles:         in.Roles,
+		MustChangePwd: true,
+	}
+
+	var saved authapi.User
+	err = s.tx.WithTenant(ctx, in.TenantID, func(tx postgres.Tx) error {
+		var err error
+		saved, err = s.store.Insert(ctx, tx, candidate, hash)
+		if err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: saved.TenantID,
+			Action:   "user.created",
+			Target:   "user:" + saved.ID.String(),
+			Payload: map[string]any{
+				"login": saved.Login,
+				"email": saved.Email,
+				"roles": saved.Roles,
+			},
+		})
+	})
+	if err != nil {
+		// Bubble the sentinel as-is when it's a known error so callers
+		// can errors.Is without losing the kind.
+		if errors.Is(err, authapi.ErrLoginTaken) {
+			return authapi.User{}, "", err
+		}
+		return authapi.User{}, "", fmt.Errorf("auth/service: create user: %w", err)
+	}
+	return saved, tempPwd, nil
+}
+
+// List implements api.UserService.List. Limit/Offset are clamped to the
+// documented 50/500 bounds before the store call so a careless caller
+// does not request millions of rows in one shot.
+func (s *UserService) List(ctx context.Context, in authapi.ListUsersInput) ([]authapi.User, int64, error) {
+	if in.TenantID == uuid.Nil {
+		return nil, 0, fmt.Errorf("auth/service: list users: tenant id required")
+	}
+	if in.Limit <= 0 {
+		in.Limit = 50
+	}
+	if in.Limit > 500 {
+		in.Limit = 500
+	}
+	if in.Offset < 0 {
+		in.Offset = 0
+	}
+
+	var (
+		rows  []authapi.User
+		total int64
+	)
+	err := s.tx.WithTenant(ctx, in.TenantID, func(tx postgres.Tx) error {
+		var err error
+		rows, total, err = s.store.List(ctx, tx, in)
+		return err
+	})
+	if err != nil {
+		return nil, 0, fmt.Errorf("auth/service: list users: %w", err)
+	}
+	return rows, total, nil
+}
+
+// Get implements api.UserService.Get. The lookup uses a BypassRLS
+// transaction because the caller has not (necessarily) supplied a
+// tenant context — admin tooling routinely needs to resolve a user id
+// to its tenant before any per-tenant flow.
+func (s *UserService) Get(ctx context.Context, id uuid.UUID) (authapi.User, error) {
+	if id == uuid.Nil {
+		return authapi.User{}, fmt.Errorf("auth/service: get user: id required")
+	}
+	var u authapi.User
+	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+		var err error
+		u, err = s.store.GetByID(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return authapi.User{}, err
+		}
+		return authapi.User{}, fmt.Errorf("auth/service: get user: %w", err)
+	}
+	return u, nil
+}
+
+// UpdateRole implements api.UserService.UpdateRole. The role list must
+// be non-empty; the DB enforces a CHECK constraint, but we surface a
+// clearer error here.
+func (s *UserService) UpdateRole(ctx context.Context, id uuid.UUID, roles []authapi.Role) (authapi.User, error) {
+	if id == uuid.Nil {
+		return authapi.User{}, fmt.Errorf("auth/service: update role: id required")
+	}
+	if len(roles) == 0 {
+		return authapi.User{}, authapi.ErrEmptyRoles
+	}
+
+	tenantID, err := s.resolveTenant(ctx, id)
+	if err != nil {
+		return authapi.User{}, err
+	}
+
+	var refreshed authapi.User
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		refreshed, err = s.store.UpdateRoles(ctx, tx, id, roles)
+		if err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: refreshed.TenantID,
+			Action:   "user.roles_updated",
+			Target:   "user:" + refreshed.ID.String(),
+			Payload:  map[string]any{"roles": refreshed.Roles},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return authapi.User{}, err
+		}
+		return authapi.User{}, fmt.Errorf("auth/service: update role: %w", err)
+	}
+	return refreshed, nil
+}
+
+// Archive implements api.UserService.Archive. Idempotent: archiving a
+// user whose archived_at is already set returns nil. The audit row is
+// emitted on every call so a re-archive is still observable.
+func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
+	if id == uuid.Nil {
+		return fmt.Errorf("auth/service: archive: id required")
+	}
+	tenantID, err := s.resolveTenant(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		if err := s.store.Archive(ctx, tx, id); err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: tenantID,
+			Action:   "user.archived",
+			Target:   "user:" + id.String(),
+		})
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return err
+		}
+		return fmt.Errorf("auth/service: archive: %w", err)
+	}
+	return nil
+}
+
+// Restore implements api.UserService.Restore. Returns
+// ErrUserNotArchived when the user is currently active so callers
+// distinguish that from a transparent no-op.
+func (s *UserService) Restore(ctx context.Context, id uuid.UUID) error {
+	if id == uuid.Nil {
+		return fmt.Errorf("auth/service: restore: id required")
+	}
+	tenantID, err := s.resolveTenant(ctx, id)
+	if err != nil {
+		return err
+	}
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		if err := s.store.Restore(ctx, tx, id); err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: tenantID,
+			Action:   "user.restored",
+			Target:   "user:" + id.String(),
+		})
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) || errors.Is(err, authapi.ErrUserNotArchived) {
+			return err
+		}
+		return fmt.Errorf("auth/service: restore: %w", err)
+	}
+	return nil
+}
+
+// ResetPassword implements api.UserService.ResetPassword. Generates a
+// fresh 16-char temp password, hashes it, swaps the stored hash, and
+// flips MustChangePwd to true so the user is forced to rotate on next
+// login. Returns the temp password — single-use, must be displayed to
+// the admin once and never persisted by the caller.
+func (s *UserService) ResetPassword(ctx context.Context, id uuid.UUID) (string, error) {
+	if id == uuid.Nil {
+		return "", fmt.Errorf("auth/service: reset password: id required")
+	}
+	tenantID, err := s.resolveTenant(ctx, id)
+	if err != nil {
+		return "", err
+	}
+
+	tempPwd, err := GenerateTempPassword()
+	if err != nil {
+		return "", fmt.Errorf("auth/service: reset password: %w", err)
+	}
+	hash, err := s.hasher.Hash(ctx, tempPwd)
+	if err != nil {
+		return "", fmt.Errorf("auth/service: hash reset password: %w", err)
+	}
+
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		if err := s.store.UpdatePassword(ctx, tx, id, hash, true); err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: tenantID,
+			Action:   "user.password_reset",
+			Target:   "user:" + id.String(),
+		})
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return "", err
+		}
+		return "", fmt.Errorf("auth/service: reset password: %w", err)
+	}
+	return tempPwd, nil
+}
+
+// ChangePassword implements api.UserService.ChangePassword. Verifies
+// the old password constant-time inside the project Hasher, then
+// updates the stored hash and clears MustChangePwd. A wrong old
+// password surfaces api.ErrInvalidCredentials so the timing is
+// indistinguishable from a non-existent user (the store layer also
+// maps the missing-id case to ErrUserNotFound).
+func (s *UserService) ChangePassword(ctx context.Context, id uuid.UUID, oldPassword, newPassword string) error {
+	if id == uuid.Nil {
+		return fmt.Errorf("auth/service: change password: id required")
+	}
+	if newPassword == "" {
+		return fmt.Errorf("auth/service: change password: new password must be non-empty")
+	}
+	tenantID, err := s.resolveTenant(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	newHash, err := s.hasher.Hash(ctx, newPassword)
+	if err != nil {
+		return fmt.Errorf("auth/service: hash new password: %w", err)
+	}
+
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		oldHash, err := s.store.GetPasswordHash(ctx, tx, id)
+		if err != nil {
+			return err
+		}
+		ok, err := s.hasher.Verify(ctx, oldHash, oldPassword)
+		if err != nil {
+			return fmt.Errorf("verify old password: %w", err)
+		}
+		if !ok {
+			return authapi.ErrInvalidCredentials
+		}
+		if err := s.store.UpdatePassword(ctx, tx, id, newHash, false); err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: tenantID,
+			Action:   "user.password_changed",
+			Target:   "user:" + id.String(),
+		})
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrInvalidCredentials) || errors.Is(err, authapi.ErrUserNotFound) {
+			return err
+		}
+		return fmt.Errorf("auth/service: change password: %w", err)
+	}
+	return nil
+}
+
+// resolveTenant returns the TenantID for the given user id by reading
+// the row through a BypassRLS transaction. The mutation methods need
+// the tenant id to call WithTenant, but the caller surface (api.User
+// Service) does not include it for ergonomics. A single read up front
+// keeps the public surface tight at the cost of one extra round-trip
+// per write — acceptable given users-CRUD is an admin path.
+func (s *UserService) resolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	var u authapi.User
+	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+		var err error
+		u, err = s.store.GetByID(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return uuid.Nil, err
+		}
+		return uuid.Nil, fmt.Errorf("auth/service: resolve tenant: %w", err)
+	}
+	return u.TenantID, nil
+}
+
+// writeAudit fills in the boilerplate fields (timestamp, actor) and
+// invokes the audit Logger. A nil Logger short-circuits — the auth
+// module composition root may register a no-op logger in tests, and we
+// don't want a missing audit dependency to take down user CRUD.
+func (s *UserService) writeAudit(ctx context.Context, ev auditapi.Event) error {
+	if s.audit == nil {
+		return nil
+	}
+	if ev.ActorKind == "" {
+		ev.ActorKind = auditapi.ActorUser
+	}
+	if ev.ActorID == nil {
+		ev.ActorID = actorIDFromContext(ctx)
+		if ev.ActorID == nil {
+			ev.ActorKind = auditapi.ActorSystem
+		}
+	}
+	if ev.Timestamp.IsZero() {
+		ev.Timestamp = s.clock()
+	}
+	if err := s.audit.Write(ctx, ev); err != nil {
+		return fmt.Errorf("audit write: %w", err)
+	}
+	return nil
+}
