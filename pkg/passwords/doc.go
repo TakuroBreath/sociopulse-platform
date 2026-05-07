@@ -47,17 +47,21 @@
 //
 // # Typical use
 //
+// Package-level helpers (no ctx, no concurrency cap):
+//
 //	encoded, err := passwords.Hash(plain, passwords.DefaultParams())
 //	ok, err := passwords.Verify(encoded, plain)
 //
-// or via the Hasher interface for dependency injection in tests:
+// Or via the Hasher interface for dependency injection in tests:
 //
 //	h := passwords.Default()
-//	encoded, _ := h.Hash(plain)
-//	ok, _ := h.Verify(encoded, plain)
+//	encoded, _ := h.Hash(ctx, plain)
+//	ok, _ := h.Verify(ctx, encoded, plain)
 //
 // In production handlers wrap Default with BoundedHasher so a request
 // flood cannot exhaust memory:
 //
 //	h := passwords.NewBoundedHasher(passwords.Default(), runtime.NumCPU())
+//	encoded, err := h.Hash(ctx, plain)
+//	ok, err := h.Verify(ctx, encoded, plain)
 package passwords

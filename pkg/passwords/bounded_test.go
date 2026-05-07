@@ -17,9 +17,10 @@ import (
 // gateHasher is a Hasher fake whose Hash blocks until release is signaled.
 // Used to drive concurrency tests without paying real Argon2 cost.
 type gateHasher struct {
-	release  chan struct{}
-	inFlight int64 // atomic
-	maxSeen  int64 // atomic
+	release     chan struct{}
+	releaseOnce sync.Once
+	inFlight    int64 // atomic
+	maxSeen     int64 // atomic
 }
 
 func newGateHasher() *gateHasher {
@@ -53,7 +54,10 @@ func (g *gateHasher) Verify(ctx context.Context, _, _ string) (bool, error) {
 	}
 }
 
-func (g *gateHasher) Release() { close(g.release) }
+// Release unblocks all in-flight callers. Safe to call multiple times so
+// tests can both release explicitly and register t.Cleanup(Release) for
+// safety on early failure.
+func (g *gateHasher) Release() { g.releaseOnce.Do(func() { close(g.release) }) }
 
 // fastHasher is a Hasher fake whose Hash returns immediately. Used for
 // behavior tests that don't care about concurrency.
@@ -98,6 +102,9 @@ func TestBoundedHasher_LimitsConcurrencyToMaxConcurrent(t *testing.T) {
 
 	inner := newGateHasher()
 	bh := passwords.NewBoundedHasher(inner, maxConcurrent)
+	// Guarantee the goroutines unblock even if the test fails partway
+	// through — otherwise we'd leak workers across the suite.
+	t.Cleanup(inner.Release)
 
 	// Launch totalCallers goroutines all racing into Hash. Only maxConcurrent
 	// should ever be inside inner.Hash at once.
@@ -110,16 +117,14 @@ func TestBoundedHasher_LimitsConcurrencyToMaxConcurrent(t *testing.T) {
 		}()
 	}
 
-	// Give the gateHasher time to ramp up — sample maxSeen for ~50 ms.
-	deadline := time.Now().Add(50 * time.Millisecond)
-	for time.Now().Before(deadline) {
-		time.Sleep(time.Millisecond)
-	}
+	// Block until exactly maxConcurrent callers have entered inner.Hash.
+	// This is deterministic — no fixed sleep — so a slow CI runner cannot
+	// false-fail the assertion below.
+	require.Eventually(t, func() bool {
+		return atomic.LoadInt64(&inner.inFlight) == int64(maxConcurrent)
+	}, time.Second, time.Millisecond,
+		"expected exactly %d in-flight goroutines", maxConcurrent)
 
-	// At this point: maxConcurrent goroutines should be blocked inside
-	// gateHasher.Hash, the rest should be blocked at the semaphore.
-	assert.Equal(t, int64(maxConcurrent), atomic.LoadInt64(&inner.inFlight),
-		"semaphore must hold concurrency at the configured ceiling")
 	assert.LessOrEqual(t, atomic.LoadInt64(&inner.maxSeen), int64(maxConcurrent),
 		"never more than maxConcurrent in-flight")
 
@@ -153,6 +158,12 @@ func TestBoundedHasher_RespectsContextDeadline(t *testing.T) {
 	require.Error(t, err)
 	assert.ErrorIs(t, err, passwords.ErrHasherBusy,
 		"deadline-expired waiters must surface ErrHasherBusy")
+	// The original deadline error must remain reachable too — this is the
+	// documented dual-unwrap contract (handlers want both: ErrHasherBusy
+	// to know "saturated, retry later" AND DeadlineExceeded to know the
+	// specific reason for telemetry).
+	assert.ErrorIs(t, err, context.DeadlineExceeded,
+		"deadline context error must remain reachable via errors.Is")
 
 	// Cleanup: release the gate so the saturating goroutine can exit.
 	inner.Release()
@@ -166,12 +177,19 @@ func TestBoundedHasher_PropagatesInnerError(t *testing.T) {
 	inner := errHasher{err: wantErr}
 	bh := passwords.NewBoundedHasher(inner, 4)
 
+	// Hash path
 	_, err := bh.Hash(context.Background(), "x")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, wantErr,
-		"wrapping must preserve errors.Is on the inner error")
+		"Hash wrapping must preserve errors.Is on the inner error")
 	assert.NotErrorIs(t, err, passwords.ErrHasherBusy,
 		"unrelated inner errors must NOT look like a busy signal")
+
+	// Verify path — same contract.
+	_, verr := bh.Verify(context.Background(), "encoded", "x")
+	require.Error(t, verr)
+	assert.ErrorIs(t, verr, wantErr, "Verify must propagate inner error too")
+	assert.NotErrorIs(t, verr, passwords.ErrHasherBusy)
 }
 
 func TestBoundedHasher_ReleasesSlotOnInnerError(t *testing.T) {
