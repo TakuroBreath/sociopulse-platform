@@ -63,6 +63,11 @@ s3:
     consent_prompts: sociopulse-dev-consent-prompts
 
 kms:
+  # Dev uses the in-process AES-256-GCM keychain so `make dev-up` boots
+  # without touching real Yandex KMS. Replace with `provider: yandex`
+  # plus endpoint/folder_id/service_account_key_path for staging/prod.
+  provider: local
+  local_key_hex: "4242424242424242424242424242424242424242424242424242424242424242"
   endpoint: kms.api.cloud.yandex.net:443
 
 auth:

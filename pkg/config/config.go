@@ -79,6 +79,9 @@ func (c *Config) Validate() error {
 	if err := c.Outbox.validate(); err != nil {
 		return fmt.Errorf("outbox: %w", err)
 	}
+	if err := c.KMS.Validate(); err != nil {
+		return fmt.Errorf("kms: %w", err)
+	}
 
 	// Production-only invariants: explicit DSN+secrets must come from Lockbox/ENV
 	// and must not contain literal placeholders like "${PG_PASSWORD}".
@@ -88,6 +91,9 @@ func (c *Config) Validate() error {
 		}
 		if c.Auth.JWT.SecretLockboxKey == "" {
 			return errors.New("production: auth.jwt.secret_lockbox_key required")
+		}
+		if c.KMS.effective() == KMSProviderLocal {
+			return errors.New("production: kms.provider must be \"yandex\"; the local provider is dev-only")
 		}
 	}
 	return nil
@@ -198,6 +204,14 @@ func DefaultDev() Config {
 			BatchSize: 100,
 			Tick:      1 * time.Second,
 			MaxRetry:  10,
+		},
+		KMS: KMSConfig{
+			// Dev uses the in-process keychain so `make dev-up` boots
+			// without a real Yandex KMS endpoint. The hex string below
+			// is a fixed dev seed: 32 bytes of 0x42. Replace per-tenant
+			// in tests via store.NewLocalKMSClient.
+			Provider:    KMSProviderLocal,
+			LocalKeyHex: "4242424242424242424242424242424242424242424242424242424242424242",
 		},
 	}
 }

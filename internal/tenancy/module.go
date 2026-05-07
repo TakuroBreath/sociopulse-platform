@@ -8,8 +8,10 @@
 //
 // Once Plan 04 Task 2 lands, api.Register is non-nil; this file builds the
 // api.Deps from modules.Deps, calls the seam, and registers the resulting
-// TenantService in the modules.Locator under "tenancy.TenantService".
-// SettingsCache, KMSResolver, and PhoneHasher are added in later tasks.
+// TenantService in the modules.Locator under "tenancy.TenantService". As
+// of Plan 04 Task 3, the resolver lands too — registered as
+// "tenancy.KMSResolver". SettingsCache and PhoneHasher are added in later
+// tasks.
 package tenancy
 
 import (
@@ -18,6 +20,8 @@ import (
 
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/internal/tenancy/api"
+	"github.com/sociopulse/platform/internal/tenancy/store"
+	"github.com/sociopulse/platform/pkg/config"
 )
 
 // Module is the top-level registration handle for the tenancy module. The
@@ -56,10 +60,14 @@ func (m *Module) Register(d modules.Deps) error {
 	}
 	m.apiModule = mod
 	if d.Locator != nil {
-		// Plan 04 Task 2 only wires TenantService. The aggregate Tenancy is
-		// registered later when SettingsCache/KMSResolver/PhoneHasher land.
+		// Plan 04 Task 2 wires TenantService; Task 3 wires KMSResolver.
+		// SettingsCache and PhoneHasher follow in later tasks; the
+		// aggregate Tenancy is registered once all four have landed.
 		if ts := mod.TenantService(); ts != nil {
 			d.Locator.Register("tenancy.TenantService", ts)
+		}
+		if r := mod.KMSResolver(); r != nil {
+			d.Locator.Register("tenancy.KMSResolver", r)
 		}
 		if t := mod.Tenancy(); t != nil {
 			d.Locator.Register("tenancy.Tenancy", t)
@@ -77,21 +85,55 @@ func (m *Module) Stop() error {
 }
 
 // buildDeps translates the cross-cutting modules.Deps into the
-// tenancy-specific api.Deps. KMSClient and Config are not on modules.Deps
-// today; service-layer wiring (Plan 04 Task 3+) constructs them from
-// d.Config and Lockbox-mounted secrets.
+// tenancy-specific api.Deps. The KMSClient is constructed here from
+// d.Config.KMS — the choice between the Yandex and local providers is
+// the only place in the codebase that depends on the provider value.
 func buildDeps(d modules.Deps) (api.Deps, error) {
 	if d.Logger == nil {
 		return api.Deps{}, errors.New("tenancy: logger is required")
+	}
+	if d.Config == nil {
+		return api.Deps{}, errors.New("tenancy: config is required")
+	}
+	kmsClient, err := buildKMSClient(d.Config.KMS)
+	if err != nil {
+		return api.Deps{}, fmt.Errorf("tenancy: build kms client: %w", err)
 	}
 	return api.Deps{
 		Logger:     d.Logger.Named("tenancy"),
 		Pool:       d.Pool,
 		EventBus:   d.EventBus,
 		Subscriber: d.Subscriber,
-		// KMS and Config: filled by service/register.go from cmd/api's
-		// config block before it sets api.Register.
+		KMS:        kmsClient,
+		// Config: api.Config is module-scoped (DEKCacheTTL, etc.). It
+		// stays empty here so the resolver picks its built-in defaults
+		// — Task 4 maps yaml settings into api.Config when SettingsCache
+		// arrives.
 	}, nil
+}
+
+// buildKMSClient picks the KMSClient implementation based on
+// cfg.Provider. The empty string and "local" both select the in-process
+// keychain so dev/test ergonomics don't require yaml.
+//
+// Anywhere else in the codebase, a switch on KMS provider would be a
+// smell — this is the single place the choice lives.
+func buildKMSClient(cfg config.KMSConfig) (api.KMSClient, error) {
+	switch cfg.Provider {
+	case "", config.KMSProviderLocal:
+		return store.NewLocalKMSClient(cfg.LocalKeyHex)
+	case config.KMSProviderYandex:
+		// Yandex SDK is gated behind the `yandex_kms` build tag. The
+		// default-build stub returns a clear error pointing operators at
+		// the right escape hatch (rebuild with the tag, or drop back to
+		// the local provider for dev).
+		return nil, errors.New(
+			"yandex KMS provider requires `-tags=yandex_kms` build; " +
+				"use `kms.provider: local` for the in-process dev fallback")
+	default:
+		return nil, fmt.Errorf("kms: unknown provider %q (want %q or %q)",
+			cfg.Provider, config.KMSProviderYandex, config.KMSProviderLocal)
+	}
 }
 
 // Compile-time assertion that *Module satisfies the modules.Module contract.

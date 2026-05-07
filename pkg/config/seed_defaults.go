@@ -69,4 +69,11 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("outbox.batch_size", c.Outbox.BatchSize)
 	v.SetDefault("outbox.tick", c.Outbox.Tick)
 	v.SetDefault("outbox.max_retry", c.Outbox.MaxRetry)
+	// kms — provider-specific fields are optional in YAML; the local
+	// fallback is the dev default.
+	v.SetDefault("kms.provider", string(c.KMS.Provider))
+	v.SetDefault("kms.local_key_hex", c.KMS.LocalKeyHex)
+	v.SetDefault("kms.endpoint", c.KMS.Endpoint)
+	v.SetDefault("kms.folder_id", c.KMS.FolderID)
+	v.SetDefault("kms.service_account_key_path", c.KMS.ServiceAccountKeyPath)
 }

@@ -111,6 +111,7 @@ type Module struct {
 	deps          Deps
 	tenancy       Tenancy
 	tenantService TenantService
+	kmsResolver   KMSResolver
 	closer        io.Closer
 }
 
@@ -133,6 +134,16 @@ func (m *Module) Tenancy() Tenancy { return m.tenancy }
 // TenantService returns the cross-tenant CRUD surface. Available as soon as
 // Plan 04 Task 2 lands; the rest of the aggregate follows later tasks.
 func (m *Module) TenantService() TenantService { return m.tenantService }
+
+// KMSResolver returns the per-tenant envelope-encryption surface. Available
+// once Plan 04 Task 3 wires the in-process resolver. Returns nil before the
+// service-layer Register populates it; callers must gate.
+func (m *Module) KMSResolver() KMSResolver { return m.kmsResolver }
+
+// SetKMSResolver injects the resolver into the Module after construction.
+// Used by service.registerModule to keep NewModule's signature stable as
+// new sub-interfaces land. Idempotent; the last call wins.
+func (m *Module) SetKMSResolver(r KMSResolver) { m.kmsResolver = r }
 
 // Deps returns the dependency bundle the module was constructed with.
 // Useful in tests and at shutdown.

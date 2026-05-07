@@ -26,6 +26,17 @@ var (
 	// Callers must retry with backoff, NOT degrade silently.
 	ErrKMSUnavailable = errors.New("tenancy: kms unavailable")
 
+	// ErrKEKNotFound — the requested KEK ID is unknown to the KMS provider.
+	// Distinct from ErrKMSUnavailable: this is a permanent failure, not a
+	// transient one. Callers must not retry.
+	ErrKEKNotFound = errors.New("tenancy: kek not found")
+
+	// ErrInvalidWrappedDEK — a wrapped DEK could not be decoded or its
+	// authentication tag failed. Indicates ciphertext corruption or that the
+	// DEK was encrypted with a different KEK. Distinct from ErrKMSUnavailable:
+	// this is a permanent failure on the input, not on the KMS service.
+	ErrInvalidWrappedDEK = errors.New("tenancy: invalid wrapped dek")
+
 	// ErrPermissionDenied — request lacks Service-Owner mTLS identity.
 	ErrPermissionDenied = errors.New("tenancy: permission denied")
 )
