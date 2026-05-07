@@ -6,7 +6,7 @@
 
 **Architecture:** Standard module shape `internal/billing/{api,service,store,events}`. Public surface in `api/`: `CostCalculator`, `TariffStore`, `RevenueCalculator`, `MarginReport`, plus DTOs. `service/` holds aggregation logic (SQL fan-in, breakdown, margin). `store/` — pgx queries against `calls`, `call_costs` (new table), `call_recordings`, `operator_sessions`, `tenant_settings`. `events/` subscribes to `dialer.call.finalized` and writes a `call_costs` row synchronously inside a transaction (idempotent on `(call_id)`). Endpoints registered through `gateway` from Plan 02 — admin-only RBAC.
 
-**Tech Stack:** Go 1.22+, `github.com/jackc/pgx/v5` (pool already provided by `internal/store/db.go` from Plan 03), `github.com/stretchr/testify`, `github.com/google/uuid`, `github.com/shopspring/decimal` (only inside cost-calculator math — never serialized; result rounded to int64 minor). HTTP via standard `net/http` + the gateway's chi router from Plan 02. NATS subscription via the shared `events.Bus` interface (Plan 02). Configuration loaded by the standard `config.Load()` (Plan 02). Database access via `internal/tenancy.RLSContext()` so all queries are tenant-scoped (Plan 04).
+**Tech Stack:** Go 1.22+, `github.com/jackc/pgx/v5` (pool already provided by `internal/store/db.go` from Plan 03), `github.com/stretchr/testify`, `github.com/google/uuid`, `github.com/shopspring/decimal` (only inside cost-calculator math — never serialized; result rounded to int64 minor). HTTP via standard `net/http` + the gateway's gin router from Plan 02. NATS subscription via the shared `events.Bus` interface (Plan 02). Configuration loaded by the standard `config.Load()` (Plan 02). Database access via `internal/tenancy.RLSContext()` so all queries are tenant-scoped (Plan 04).
 
 **Spec sections covered:** §FR-H (full), §5.2 module catalog row "billing", §6.3 (`tenant_settings`, `calls`, `call_recordings`, `operator_sessions` schemas) — extends with `call_costs`, §14.3 (`tenant_settings.surveys.cost_per_completed_rub`), §22 prototype `admin-pages-2.jsx::AdminFinance`.
 
@@ -2216,36 +2216,37 @@ All six endpoints share three concerns:
 package api
 
 import (
-	"net/http"
-
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 )
 
 // Endpoints assembles the billing module's HTTP routes. Caller wires
 // `mw` middleware (auth, tenancy, RBAC) before passing here.
 type Endpoints struct {
-	Dashboard  http.Handler
-	Projects   http.Handler
-	Breakdown  http.Handler
-	ByMonth    http.Handler
-	GetTariffs http.Handler
-	UpdateTariffs http.Handler
+	Dashboard     gin.HandlerFunc
+	Projects      gin.HandlerFunc
+	Breakdown     gin.HandlerFunc
+	ByMonth       gin.HandlerFunc
+	GetTariffs    gin.HandlerFunc
+	UpdateTariffs gin.HandlerFunc
 }
 
 // Mount registers routes on r. /api/billing/tariffs is admin-only — caller
 // supplies the admin-guard middleware via mw.Admin.
-func (e Endpoints) Mount(r chi.Router, mw struct{ Admin func(http.Handler) http.Handler }) {
-	r.Route("/api/finance", func(r chi.Router) {
-		r.Get("/dashboard", e.Dashboard.ServeHTTP)
-		r.Get("/projects", e.Projects.ServeHTTP)
-		r.Get("/breakdown", e.Breakdown.ServeHTTP)
-		r.Get("/byMonth", e.ByMonth.ServeHTTP)
-	})
-	r.Route("/api/billing/tariffs", func(r chi.Router) {
-		r.Use(mw.Admin)
-		r.Get("/", e.GetTariffs.ServeHTTP)
-		r.Patch("/", e.UpdateTariffs.ServeHTTP)
-	})
+func (e Endpoints) Mount(r *gin.RouterGroup, mw struct{ Admin gin.HandlerFunc }) {
+	finance := r.Group("/api/finance")
+	{
+		finance.GET("/dashboard", e.Dashboard)
+		finance.GET("/projects", e.Projects)
+		finance.GET("/breakdown", e.Breakdown)
+		finance.GET("/byMonth", e.ByMonth)
+	}
+
+	tariffs := r.Group("/api/billing/tariffs")
+	tariffs.Use(mw.Admin)
+	{
+		tariffs.GET("", e.GetTariffs)
+		tariffs.PATCH("", e.UpdateTariffs)
+	}
 }
 ```
 
@@ -2264,7 +2265,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	billingapi "github.com/sociopulse/platform/internal/billing/api"
 	"github.com/sociopulse/platform/internal/billing/service"
@@ -2308,13 +2309,15 @@ func TestDashboardEndpoint_HappyPath(t *testing.T) {
 
 	svc, _ := buildHTTPSvc(t, pg)
 
-	r := chi.NewRouter()
-	r.Use(injectTenant(tid))
-	svc.Endpoints().Mount(r, struct{ Admin func(http.Handler) http.Handler }{Admin: passthrough})
+	gin.SetMode(gin.TestMode)
+	router := gin.New()
+	router.Use(injectTenant(tid))
+	rg := router.Group("")
+	svc.Endpoints().Mount(rg, struct{ Admin gin.HandlerFunc }{Admin: passthrough})
 
 	req := httptest.NewRequest(http.MethodGet, "/api/finance/dashboard?period=month", nil)
 	rec := httptest.NewRecorder()
-	r.ServeHTTP(rec, req)
+	router.ServeHTTP(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	var resp billingapi.DashboardResponse
@@ -2323,16 +2326,15 @@ func TestDashboardEndpoint_HappyPath(t *testing.T) {
 	require.Equal(t, int64(3*38100), resp.RevenueMin)
 }
 
-func injectTenant(tid uuid.UUID) func(http.Handler) http.Handler {
-	return func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			ctx := tenancyapi.WithContext(r.Context(), tid)
-			next.ServeHTTP(w, r.WithContext(ctx))
-		})
+func injectTenant(tid uuid.UUID) gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ctx := tenancyapi.WithContext(c.Request.Context(), tid)
+		c.Request = c.Request.WithContext(ctx)
+		c.Next()
 	}
 }
 
-func passthrough(next http.Handler) http.Handler { return next }
+func passthrough(c *gin.Context) { c.Next() }
 ```
 
 (`buildHTTPSvc` wires `Service` against the pool; expand in Task 11.)
