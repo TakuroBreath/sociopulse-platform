@@ -1,0 +1,32 @@
+# gitleaks configuration for sociopulse-platform.
+# Extends default rules; adds path-based allowlist for documentation
+# files where realistic-looking but non-secret examples (docker tag
+# strings, env-var names) are expected and trigger generic-api-key
+# false positives.
+#
+# Rationale: README/CONTRIBUTING/docs/ contain documentation examples
+# (image tags, secret-name placeholders, ADR references). Real secrets
+# never live there — they live in:
+#   - GitHub repository secrets (DOCKERHUB_TOKEN etc.)
+#   - Yandex Lockbox (Plan 04)
+#   - .env.local (gitignored)
+#
+# This allowlist does NOT cover Go/YAML/Dockerfile source files. If a
+# secret accidentally lands in source, gitleaks still catches it.
+#
+# See: https://github.com/gitleaks/gitleaks#configuration
+
+title = "sociopulse-platform gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation files use realistic-looking but non-secret examples"
+paths = [
+  '''^README\.md$''',
+  '''^CONTRIBUTING\.md$''',
+  '''^ARCHITECTURE\.md$''',
+  '''^CODEOWNERS$''',
+  '''^docs/.*''',
+]

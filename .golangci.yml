@@ -3,7 +3,10 @@
 
 run:
   timeout: 5m
-  go: "1.26"
+  # Note: `go:` not pinned. golangci-lint v1.64.8 was built with Go 1.24 and
+  # rejects targeting newer (1.26+); without the pin, it uses go.mod's version
+  # and passes. When golangci-lint v2.0+ (built with Go 1.26+) is available,
+  # we can re-add `go: "1.26"` for explicit targeting.
   tests: true
 
 output:

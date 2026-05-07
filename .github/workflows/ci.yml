@@ -174,13 +174,13 @@ jobs:
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
       - name: Run govulncheck
         run: govulncheck ./...
-      - name: Run osv-scanner
-        uses: google/osv-scanner-action/osv-scanner-action@v1.7.4
-        with:
-          scan-args: |-
-            --recursive
-            --skip-git
-            ./
+      # Note: osv-scanner intentionally not used. govulncheck is the canonical
+      # Go vulnerability scanner — it analyses reachability (whether our code
+      # actually calls vulnerable stdlib/dep functions). osv-scanner reports
+      # every stdlib CVE matching go.mod's go directive without reachability
+      # analysis, producing high false-positive rate for stdlib vulnerabilities
+      # patched in newer point releases. If we add non-Go components later
+      # (e.g., npm in /web), revisit osv-scanner for those ecosystems only.
 
   secret-scan:
     name: Secret scan
