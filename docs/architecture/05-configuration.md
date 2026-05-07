@@ -233,19 +233,27 @@ is the **only** allowed access path. Direct Postgres reads of
 violation. The cache pattern:
 
 ```go
-maxAttempts, err := s.tenancy.GetWithDefault(
-    ctx, tenantID, "dialer.attempt_max",
-    api.SettingValueFromInt(3),
-).AsInt()
+def, err := api.SettingValueFromAny(3)
+if err != nil {
+    return fmt.Errorf("default for dialer.attempt_max: %w", err)
+}
+v, err := s.tenancy.GetWithDefault(ctx, tenantID, "dialer.attempt_max", def)
+if err != nil {
+    return fmt.Errorf("get dialer.attempt_max: %w", err)
+}
+maxAttempts, err := v.AsInt()
+if err != nil {
+    return fmt.Errorf("parse dialer.attempt_max: %w", err)
+}
 ```
 
 The cache:
 
 - Loads on first miss from Postgres.
 - TTL = 30 s (process-local).
-- Invalidates on `tenant.<id>.settings.updated` NATS event published
-  by `TenantService.SetSetting`.
-- `InvalidateAllLocal(tenantID)` on `tenant.<id>.archived`.
+- Invalidates on `tenant.<t>.settings.updated` NATS event published
+  by `SettingsCache.Set`.
+- `InvalidateAllLocal(tenantID)` on `tenant.<t>.archived`.
 
 The 30 s TTL is the **maximum staleness** any tenant change tolerates;
 the NATS invalidation makes the typical case immediate.

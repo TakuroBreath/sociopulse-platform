@@ -258,13 +258,13 @@ Publishes (best-effort core-NATS, no retention):
 
 | Subject | Payload |
 |---|---|
-| `tenant.<id>.created` | `Tenant` |
-| `tenant.<id>.suspended` | `{tenant_id, reason}` |
-| `tenant.<id>.resumed` | `{tenant_id}` |
-| `tenant.<id>.archived` | `{tenant_id}` |
-| `tenant.<id>.settings.updated` | `{tenant_id, key}` (cache invalidation) |
+| `tenant.<t>.created` | `Tenant` |
+| `tenant.<t>.suspended` | `{tenant_id, reason}` |
+| `tenant.<t>.resumed` | `{tenant_id}` |
+| `tenant.<t>.archived` | `{tenant_id}` |
+| `tenant.<t>.settings.updated` | `{tenant_id, key}` (cache invalidation) |
 
-Consumes: `tenant.<id>.settings.updated` (peers invalidate local cache).
+Consumes: `tenant.<t>.settings.updated` (peers invalidate local cache).
 
 asynq tasks: none.
 
@@ -1990,11 +1990,14 @@ asynq tasks: `reports:job.run` — single task type; payload carries
 ## 12. `billing`
 
 **Responsibility.** Per-tenant tariff store (telecom rates per trunk,
-operator wages per completed survey, storage rate, fixed monthly fees),
-CostCalculator (pure function: call → cost in int64 minor units), per-
-month spend breakdowns, per-project margin reports, finance dashboard.
-Subscribes to `dialer.call.finalized` and writes a `call_costs` row
-exactly-once (ON CONFLICT DO NOTHING on `call_id`).
+operator wages per completed survey, storage rate, respondent-base
+purchase rate, fixed monthly fees), CostCalculator (pure function:
+call → cost in int64 minor units), per-month spend breakdowns, per-
+project margin reports, finance dashboard. Subscribes to
+`dialer.call.finalized` and writes a `call_costs` row exactly-once
+(ON CONFLICT DO NOTHING on `call_id`). Respondent bases are purchased
+datasets — the platform charges tenants per-record pulled from a
+base, alongside telecom and wages.
 
 ### Interfaces
 
@@ -2032,13 +2035,14 @@ type CallFinalizedHook interface {
 
 ```go
 type Tariffs struct {
-    TenantID            uuid.UUID
-    Version             int
-    UpdatedAt           time.Time
-    TrunkCostsMinor     map[string]int64  // trunk_id → cost per minute (RUB minor)
-    WagePerSurveyMinor  int64             // operator pay per completed survey
-    StorageMinorPerGBMo int64             // S3 storage rate
-    FixedFeesMinor      int64             // monthly fixed fees
+    TenantID             uuid.UUID
+    Version              int
+    UpdatedAt            time.Time
+    TrunkCostsMinor      map[string]int64  // trunk_id → cost per minute (RUB minor)
+    WagePerSurveyMinor   int64             // operator pay per completed survey
+    StorageMinorPerGBMo  int64             // S3 storage rate
+    RespondentBasesMinor int64             // purchased respondent-base records, per-record
+    FixedFeesMinor       int64             // monthly fixed fees
 }
 
 type Period struct {
@@ -2061,12 +2065,12 @@ type CallCostOutput struct {
 }
 
 type MonthBreakdown struct {
-    TenantID                                  uuid.UUID
-    Period                                    Period
-    TelecomMin, WagesMin, BasesMin            int64
-    StorageMin, FixedFeeMin, TotalMin         int64
-    CompletedSurveys                          int64
-    TotalCallSeconds                          int64
+    TenantID                                       uuid.UUID
+    Period                                         Period
+    TelecomMin, WagesMin, RespondentBasesMin       int64
+    StorageMin, FixedFeeMin, TotalMin              int64
+    CompletedSurveys                               int64
+    TotalCallSeconds                               int64
 }
 
 func (b MonthBreakdown) CostPerSurveyMinor() int64
@@ -2076,7 +2080,7 @@ type ProjectMargin struct {
     ProjectID                  uuid.UUID
     ProjectCode, ProjectName   string
     Surveys                    int64
-    TelecomMin, WagesMin, BasesMin, StorageMin, TotalMin int64
+    TelecomMin, WagesMin, RespondentBasesMin, StorageMin, TotalMin int64
     RevenueMin, MarginMin      int64
     CostPerSrvMn               int64
 }
@@ -2094,10 +2098,11 @@ type TariffsResponse struct {
 }
 
 type TariffsPatchRequest struct {
-    TrunkCostsMinor     map[string]int64  // null entries delete the key
-    WagePerSurveyMinor  *int64
-    StorageMinorPerGBMo *int64
-    FixedFeesMinor      *int64
+    TrunkCostsMinor      map[string]int64  // null entries delete the key
+    WagePerSurveyMinor   *int64
+    StorageMinorPerGBMo  *int64
+    RespondentBasesMinor *int64
+    FixedFeesMinor       *int64
 }
 ```
 

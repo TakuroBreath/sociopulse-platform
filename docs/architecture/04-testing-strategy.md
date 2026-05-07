@@ -37,7 +37,7 @@ Unit tests are the project's bread and butter. They:
   that drive the sentinel errors of `02-module-contracts.md`.
 
 Mocking is via **mockery v2** (per ADR-0016 candidate; locked in Plan
-00 Task 7) generating one mock file per `api/` interface:
+00a Task 7) generating one mock file per `api/` interface:
 
 ```
 internal/<module>/api/mocks/
@@ -65,6 +65,7 @@ import (
     "errors"
     "testing"
 
+    "github.com/google/uuid"
     "github.com/stretchr/testify/assert"
     "github.com/stretchr/testify/require"
 
@@ -75,6 +76,9 @@ import (
 
 func TestAuthenticator_Login_BadPassword_ReturnsErrInvalidCredentials(t *testing.T) {
     t.Parallel()
+
+    tenantID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+    userID := uuid.MustParse("22222222-2222-2222-2222-222222222222")
 
     users := mocks.NewUserStore(t)
     hasher := mocks.NewPasswordHasher(t)

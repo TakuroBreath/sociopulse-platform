@@ -138,7 +138,7 @@ log.Info("msg", zap.String("a", "1"), zap.String("a", "2"))
 ```
 
 Configuration enables both `slog` and `zap` modes; once we (eventually)
-migrate to slog (ADR-0016 candidate) we will flip
+migrate to slog (ADR-0017 candidate) we will flip
 `loggercheck.zap = false` and remove the zap entry.
 
 ## Metrics — Prometheus

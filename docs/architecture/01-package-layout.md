@@ -211,12 +211,15 @@ project verbatim goes in `pkg/`. Today's inhabitants:
 | `pkg/passwords` | argon2id PHC string encode/decode. |
 | `pkg/obs` | zap logger factory, OTel tracer/meter init, Prometheus registry, redaction encoder. |
 | `pkg/clock` | `clockwork.Clock` wrapper exposed to deterministic tests. |
-| `pkg/middleware/auth` | gin middleware that validates Bearer token via `auth.api.JWTIssuer` and stores `Claims` in `*gin.Context`. |
+| `pkg/middleware/auth` | gin middleware that consumes the `auth.api.ClaimsValidator` interface to validate a Bearer token; stores the resulting `Claims` opaquely in `*gin.Context` for downstream handlers to read via interface methods. |
 
 Rules for `pkg/`:
 
 1. **No business types** (`Project`, `Tenant`, `Claims`). Those live in
-   `internal/<module>/api/`.
+   `internal/<module>/api/`. **Exception:** `pkg/middleware/*` may
+   thread domain types through `*gin.Context` as opaque values — it
+   never reaches into a type's internals, only reads interface methods.
+   Many projects keep HTTP middleware in `pkg/` for the same reason.
 2. **No imports from `internal/`.** `pkg/` is below `internal/` in the
    dependency DAG, full stop. If you find yourself reaching upward,
    either invert the dependency or move the helper into the module.
@@ -293,7 +296,7 @@ full discipline.
 
 ## What Linters Enforce Here
 
-`.golangci.yml` (Plan 00 Task 9) enforces the layout mechanically:
+`.golangci.yml` (Plan 00a Task 8) enforces the layout mechanically:
 
 - **`depguard:module-boundaries`** — denies imports of
   `internal/<module>/{service,store,events}` from outside that module.

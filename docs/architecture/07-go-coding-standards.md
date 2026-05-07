@@ -22,23 +22,18 @@ user-invocable as slash commands (`/golang-modernize`,
 
 | # | Skill | One-line summary |
 |---|---|---|
-| 1 | `golang-error-handling` | `%w` wrapping, `errors.Is/As`, sentinel design, `samber/oops` at the boundary, structured logs |
+| 1 | `golang-error-handling` | `%w` wrapping, `errors.Is/As`, sentinel design, `samber/oops` at the boundary, structured logs, low-cardinality strings, single-handling rule, `errors.Join`, `slog.Attr` / `oops.With` |
 | 2 | `golang-context` | First-parameter `ctx`, propagation, `WithoutCancel`, `WithTimeout/Deadline`, immediate `defer cancel()` |
 | 3 | `golang-concurrency` | `errgroup.WithContext` + `SetLimit`, channel ownership, `time.NewTimer + Reset` over `time.After`, `goleak` |
 | 4 | `golang-data-structures` | Slice growth and preallocation, `slices`/`maps` packages, `strings.Builder`, generic constraints |
 | 5 | `golang-design-patterns` | Functional options, lifecycle and resource-management, graceful shutdown, DI via constructors |
-| 6 | `golang-error-handling` (cont.) | low-cardinality strings, single-handling rule, `errors.Join`, `slog.Attr` / `oops.With` |
-| 7 | `golang-grpc` | health-check service, `GracefulStop`, `status.Errorf` with `errdetails`, mTLS, bufconn tests |
-| 8 | `golang-modernize` | Go 1.22+ idioms (`any`, `min/max/clear`, range over int, `slices`/`maps`), Go 1.24 `t.Context()`, Go 1.25 `wg.Go()` |
-| 9 | `golang-safety` | comma-ok type assertions, typed nil ≠ nil interface, no nil-map writes, no `defer` in loops, bounds-checked numeric conversion |
-| 10 | `golang-security` | `crypto/rand` for tokens/keys, AES-GCM only, parameterised SQL, `crypto/subtle.ConstantTimeCompare`, `gosec`, `govulncheck` |
-| 11 | `golang-structs-interfaces` | small interfaces (1-3 methods), defined where consumed, accept-interfaces / return-structs, compile-time `var _ I = (*T)(nil)` checks |
-| 12 | `golang-testing` | table-driven + `t.Parallel()`, `//go:build integration`, testify as helper, mockery, goleak |
-| 13 | `golang-troubleshooting` | reproduce-before-fix, race detector, goleak diagnostics, `pprof` on admin port, Delve in dev only |
-
-(`golang-error-handling` is split across rows 1 and 6 above to make the
-themes legible — there is one skill file, the standard reflects two
-distinct sets of rules drawn from it.)
+| 6 | `golang-grpc` | health-check service, `GracefulStop`, `status.Errorf` with `errdetails`, mTLS, bufconn tests |
+| 7 | `golang-modernize` | Go 1.22+ idioms (`any`, `min/max/clear`, range over int, `slices`/`maps`), Go 1.24 `t.Context()`, Go 1.25 `wg.Go()` |
+| 8 | `golang-safety` | comma-ok type assertions, typed nil ≠ nil interface, no nil-map writes, no `defer` in loops, bounds-checked numeric conversion |
+| 9 | `golang-security` | `crypto/rand` for tokens/keys, AES-GCM only, parameterised SQL, `crypto/subtle.ConstantTimeCompare`, `gosec`, `govulncheck` |
+| 10 | `golang-structs-interfaces` | small interfaces (1-3 methods), defined where consumed, accept-interfaces / return-structs, compile-time `var _ I = (*T)(nil)` checks |
+| 11 | `golang-testing` | table-driven + `t.Parallel()`, `//go:build integration`, testify as helper, mockery, goleak |
+| 12 | `golang-troubleshooting` | reproduce-before-fix, race detector, goleak diagnostics, `pprof` on admin port, Delve in dev only |
 
 ## 2. Errors
 
@@ -358,7 +353,7 @@ We are on Go 1.26.1 and use it like it. Common modernisations:
   patterns.
 - `errors.Join` for aggregating multiple errors.
 - `slog.Attr` builders when slog appears (we are still on zap; this
-  applies after the ADR-0016 migration).
+  applies after the ADR-0017 migration).
 - `t.Context()` (Go 1.24+) in tests instead of `context.Background()` —
   cancels on test failure / cleanup.
 - `wg.Go()` (Go 1.25): wraps the typical
@@ -425,13 +420,25 @@ Tests use `bufconn`:
 lis := bufconn.Listen(1 << 20)
 s := grpc.NewServer()
 pb.RegisterRecordingServiceServer(s, recordingSvc)
-go s.Serve(lis)
-defer s.Stop()
+go func() {
+    if err := s.Serve(lis); err != nil {
+        t.Logf("bufconn serve: %v", err)
+    }
+}()
+t.Cleanup(func() {
+    s.GracefulStop()
+    _ = lis.Close()
+})
 
 conn, err := grpc.NewClient("passthrough://bufnet",
     grpc.WithContextDialer(func(_ context.Context, _ string) (net.Conn, error) { return lis.Dial() }),
     grpc.WithTransportCredentials(insecure.NewCredentials()))
 ```
+
+`t.Cleanup` (Go 1.14+) is the idiomatic test cleanup — it runs after
+all subtests, in LIFO order, and works correctly with `t.Parallel()`.
+`GracefulStop` waits for the serve goroutine to drain so we never leak
+it past the test.
 
 ## 11. Troubleshooting
 
@@ -487,7 +494,7 @@ rules to the specific linter that enforces each:
 | Vulnerability scan | `govulncheck` (CI job, nightly + on `go.mod` change) |
 | Dead code | `unused` |
 | Ineffectual assignments | `ineffassign` |
-| Inefficient string concatenation | `prealloc` |
+| Slice preallocation when length is known | `prealloc` |
 | Unused return values | `unparam` |
 | Naked returns | `nakedret` |
 | `nil != nil` interface confusion | `nilerr` |
@@ -516,7 +523,7 @@ Configuration knobs that matter:
   `t.Parallel()` unless explicitly excluded.
 - `loggercheck.zap: true`, `loggercheck.slog: true`,
   `loggercheck.require-string-key: true` — both modes; flip after
-  ADR-0016 migration.
+  ADR-0017 migration.
 - `exhaustive.default-signifies-exhaustive: true` — a `default:` in a
   switch counts as exhaustive (Go idiom).
 - `gocyclo.min-complexity: 15`, `gocognit.min-complexity: 20` —

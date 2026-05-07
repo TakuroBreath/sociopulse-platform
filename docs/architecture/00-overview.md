@@ -199,7 +199,7 @@ and chaos-test expectations.
 | Module | Postgres | Redis (Valkey) | NATS JetStream | ClickHouse | S3 | Yandex KMS | FreeSWITCH (ESL) |
 |---|---|---|---|---|---|---|---|
 | `auth` | RW (`users`, `user_sessions`) | RW (refresh-token rotation, lockout, sliding-window rate limit) | (publishes `audit.event` only) | — | — | (via tenancy) | — |
-| `tenancy` | RW (`tenants`, `tenant_settings`, `tenancy_admin` BYPASSRLS) | RW (settings cache) | pub `tenant.<id>.settings.updated`, sub `tenant.<id>.settings.updated` | — | RW (per-tenant bucket provisioning) | RW (KEK lifecycle, GenerateDataKey, Encrypt/Decrypt) | — |
+| `tenancy` | RW (`tenants`, `tenant_settings`, `tenancy_admin` BYPASSRLS) | RW (settings cache) | pub `tenant.<t>.settings.updated`, sub `tenant.<t>.settings.updated` | — | RW (per-tenant bucket provisioning) | RW (KEK lifecycle, GenerateDataKey, Encrypt/Decrypt) | — |
 | `crm` | RW (`projects`, `project_quotas`, `respondents`, `project_dnc`) | RW (quota counters, import progress) | pub `crm.project.*`, `crm.respondent.*` | — | — | (via tenancy phone hashing) | — |
 | `surveys` | RW (`surveys`, `survey_versions`) | RW (active-version cache) | pub `surveys.version.*` | — | — | — | — |
 | `telephony` | RO (`trunks`, `fs_nodes`, `tenants`) | RW (idempotency, ESL connection pool stats) | pub `tenant.<t>.telephony.event.>`; sub `tenant.<t>.telephony.cmd.>` | — | — | — | RW (ESL TLS) |
