@@ -47,10 +47,12 @@ When working in this repo and needing context that lives in a sibling repo:
 
 ## Existing artefacts
 
-Until per-repo `CONTEXT.md` files are seeded by `/grill-with-docs`, the de-facto domain documentation lives in [`/Users/user/call-center/social-pulse/docs/superpowers/`](../../../social-pulse/docs/superpowers/):
+Project documentation lives in this repo at [`docs/superpowers/`](../superpowers/):
 
 - `specs/2026-05-06-sociopulse-system-design.md` — the system design spec (157 KB, 22 sections + 13 ADRs + 2 appendices).
-- `plans/` — 21 implementation plans (00-20).
-- `reviews/` — architecture & plans review.
+- `plans/` — 22 implementation plans (00, 00a, 01-20).
+- `reviews/2026-05-06-architecture-and-plans-review.md` — architecture & plans review with Phase 1 / Phase 2 execution order.
 
-These are the source-of-truth until migrated into this repo's `docs/`.
+`CONTEXT.md` and `docs/adr/` will be seeded during execution of **Plan 00a — Architecture Foundation** (Tasks 1-3). Until then, this directory and the spec are the source of truth.
+
+Sibling repos (`sociopulse-web`, `sociopulse-infra`) consume these documents via GitHub URLs (https://github.com/TakuroBreath/sociopulse-platform/blob/main/docs/superpowers/) — they don't carry copies.

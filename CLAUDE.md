@@ -14,7 +14,7 @@ This is one of three repositories in the **СоциоПульс** project — a 
 
 This is the **`sociopulse-platform`** repo — backend Go monorepo.
 
-Implementation specification, architecture decisions, and 21 implementation plans live in [`/Users/user/call-center/social-pulse/docs/superpowers/`](../social-pulse/docs/superpowers/) until they're migrated into this repo's `docs/`. Plans relevant to this repo: 00 (foundation), 02-14, 20.
+Implementation specification, architecture decisions, and 22 implementation plans live in [`docs/superpowers/`](docs/superpowers/) — this repo is the **master location** for all project documentation. Frontend (`sociopulse-web`) and infra (`sociopulse-infra`) repos reference these documents via GitHub URLs. Plans relevant to this repo: 00 (foundation), 00a (architecture), 02-14, 20 Task 1.
 
 ## Identity
 

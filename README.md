@@ -20,7 +20,13 @@ Go 1.22+, PostgreSQL 16 (RLS + PgBouncer transaction-mode), Redis 7, ClickHouse,
 
 ## Documentation
 
-Specification, architecture decisions, and 21 implementation plans live in [`/Users/user/call-center/social-pulse/docs/superpowers/`](../social-pulse/docs/superpowers/) (will be migrated into `docs/` here when execution starts).
+Specification, architecture decisions, and 22 implementation plans live in [`docs/superpowers/`](docs/superpowers/):
+
+- `specs/` — system design spec
+- `plans/` — implementation plans (Phase 1: 00, 00a, 02-14, 20 Task 1; Phase 2: 01, 08, 20 Tasks 2-7)
+- `reviews/` — architecture & plans review with Phase 1 / Phase 2 split
+
+This repo is the **master location** for all project documentation; sibling repos reference these via GitHub URLs.
 
 ## Repos in the project
 
