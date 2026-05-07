@@ -63,6 +63,20 @@ type RBACChecker interface {
 	Check(ctx context.Context, claims Claims, action Action, resource Resource) error
 }
 
+// ClaimsValidator parses and validates an access JWT. It is the narrow
+// surface consumed by HTTP and WS authentication middleware in every
+// other module — implementations are stateless and safe to share.
+//
+// The pkg/middleware/auth gin middleware accepts a ClaimsValidator and
+// stores the resulting Claims opaquely in *gin.Context for downstream
+// handlers to read.
+type ClaimsValidator interface {
+	// Validate parses accessToken, verifies its signature and
+	// expiration, and confirms the session is not revoked. It returns
+	// the decoded Claims or one of ErrTokenInvalid / ErrTokenRevoked.
+	Validate(ctx context.Context, accessToken string) (Claims, error)
+}
+
 // JWTIssuer mints and validates JWTs. Implementations use HS256 with the
 // global signing secret rotated via tenancy.SettingsCache.
 type JWTIssuer interface {
