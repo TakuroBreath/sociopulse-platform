@@ -1,0 +1,217 @@
+# golangci-lint v1.59+ config
+# Run: make lint
+
+run:
+  timeout: 5m
+  go: "1.22"
+  tests: true
+
+output:
+  formats:
+    - format: colored-line-number
+  sort-results: true
+
+linters:
+  disable-all: true
+  enable:
+    # core correctness
+    - errcheck
+    - govet
+    - ineffassign
+    - staticcheck
+    - unused
+    - typecheck
+    # style
+    - gofmt
+    - goimports
+    - misspell
+    - revive
+    - whitespace
+    - wastedassign
+    # safety (samber/cc-skills-golang@golang-safety)
+    - forcetypeassert        # bare type assertions panic — require comma-ok
+    - gosec                  # samber/cc-skills-golang@golang-security
+    - bodyclose
+    - contextcheck           # samber/cc-skills-golang@golang-context propagation
+    - noctx                  # HTTP request without context = ungovernable
+    - errname
+    - errorlint              # %w vs %v, errors.Is/As — golang-error-handling
+    - nilerr
+    - rowserrcheck
+    - sqlclosecheck
+    - exhaustive             # switch over enum must cover all cases (golang-design-patterns enum-1)
+    # testing (samber/cc-skills-golang@golang-testing)
+    - paralleltest           # t.Parallel() encouraged
+    - thelper                # t.Helper() in test helpers
+    - testifylint            # testify idioms (require vs assert, etc.)
+    # observability (samber/cc-skills-golang@golang-error-handling structured logs)
+    - loggercheck            # slog/zap key-value pair correctness
+    # complexity
+    - gocyclo
+    - gocognit
+    # boundaries
+    - depguard
+    - importas
+    # idiom (samber/cc-skills-golang@golang-modernize)
+    - nakedret
+    - prealloc
+    - unconvert
+    - unparam
+
+linters-settings:
+  gocyclo:
+    min-complexity: 15
+  gocognit:
+    min-complexity: 20
+  goimports:
+    local-prefixes: github.com/sociopulse/platform
+  revive:
+    rules:
+      - name: var-naming
+      - name: package-comments
+      - name: indent-error-flow
+      - name: unexported-return
+      - name: receiver-naming
+      - name: errorf            # prefer fmt.Errorf over errors.New(fmt.Sprintf)
+      - name: error-naming      # ErrXxx for sentinels (golang-error-handling)
+      - name: error-return      # error MUST be last return value
+      - name: blank-imports     # blank imports require explanation
+  errorlint:
+    errorf: true                # require %w for wrapping (golang-error-handling §1.4)
+    errorf-multi: true
+    asserts: true               # require errors.As over type assertion
+    comparison: true            # require errors.Is over ==
+  forcetypeassert:
+    # Empty allow-list — every type assertion MUST use comma-ok form.
+    # See samber/cc-skills-golang@golang-safety §Type-Assertions.
+  paralleltest:
+    ignore-missing: false        # all tests SHOULD call t.Parallel() unless explicitly excluded
+    ignore-missing-subtests: false
+  testifylint:
+    enable-all: true
+    disable:
+      - require-error            # opt out of forced require — leave to author judgement
+  exhaustive:
+    default-signifies-exhaustive: true   # `default:` clause = exhaustive (Go idiom)
+  loggercheck:
+    slog: true
+    zap: true                    # we use zap until ADR-0012 migration
+    require-string-key: true     # all key-value pairs must have string keys
+
+  depguard:
+    rules:
+      # Ban predictable PRNG project-wide. Use math/rand/v2 for non-security
+      # randomness (Go 1.22+, samber/cc-skills-golang@golang-modernize §High-1.2)
+      # or crypto/rand for tokens/keys (samber/cc-skills-golang@golang-security
+      # §Quick-Reference). Direct math/rand also forbids global rand.Seed which
+      # was deprecated in Go 1.22.
+      banned-stdlib:
+        list-mode: lax
+        deny:
+          - pkg: "math/rand"
+            desc: "use math/rand/v2 for non-security randomness or crypto/rand for tokens/keys (samber/cc-skills-golang@golang-security, @golang-modernize)"
+          - pkg: "crypto/cipher.NewCBCEncrypter"
+            desc: "CBC lacks authentication — use AES-GCM (samber/cc-skills-golang@golang-security)"
+          - pkg: "crypto/cipher.NewCBCDecrypter"
+            desc: "CBC lacks authentication — use AES-GCM (samber/cc-skills-golang@golang-security)"
+          - pkg: "crypto/des"
+            desc: "DES is broken — use AES-256 (samber/cc-skills-golang@golang-security)"
+          - pkg: "crypto/md5"
+            desc: "MD5 is broken for cryptographic use — use SHA-256+ or argon2id (samber/cc-skills-golang@golang-security)"
+          - pkg: "crypto/sha1"
+            desc: "SHA-1 has known collision attacks — use SHA-256+ (samber/cc-skills-golang@golang-security)"
+
+      # ADR-0014 — gin is the project router. Forbid alternatives
+      # so a careless go-get cannot pull a competing router into go.mod.
+      banned-third-party:
+        list-mode: lax
+        deny:
+          - pkg: "github.com/go-chi/chi"
+            desc: "use github.com/gin-gonic/gin per ADR-0014"
+          - pkg: "github.com/go-chi/chi/v5"
+            desc: "use github.com/gin-gonic/gin per ADR-0014"
+          - pkg: "github.com/labstack/echo"
+            desc: "use github.com/gin-gonic/gin per ADR-0014"
+          - pkg: "github.com/gofiber/fiber"
+            desc: "use github.com/gin-gonic/gin per ADR-0014"
+
+      module-boundaries:
+        list-mode: lax
+        deny:
+          # All cross-module imports must go through the api/ subpackage.
+          - pkg: "github.com/sociopulse/platform/internal/auth/service"
+            desc: "import from internal/auth/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/auth/store"
+            desc: "import from internal/auth/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/auth/events"
+            desc: "import from internal/auth/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/crm/service"
+            desc: "import from internal/crm/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/crm/store"
+            desc: "import from internal/crm/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/crm/events"
+            desc: "import from internal/crm/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/surveys/service"
+            desc: "import from internal/surveys/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/surveys/store"
+            desc: "import from internal/surveys/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/surveys/events"
+            desc: "import from internal/surveys/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/dialer/service"
+            desc: "import from internal/dialer/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/dialer/store"
+            desc: "import from internal/dialer/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/dialer/events"
+            desc: "import from internal/dialer/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/realtime/service"
+            desc: "import from internal/realtime/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/realtime/store"
+            desc: "import from internal/realtime/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/realtime/events"
+            desc: "import from internal/realtime/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/recording/service"
+            desc: "import from internal/recording/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/recording/store"
+            desc: "import from internal/recording/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/recording/events"
+            desc: "import from internal/recording/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/analytics/service"
+            desc: "import from internal/analytics/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/analytics/store"
+            desc: "import from internal/analytics/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/analytics/events"
+            desc: "import from internal/analytics/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/reports/service"
+            desc: "import from internal/reports/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/reports/store"
+            desc: "import from internal/reports/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/reports/events"
+            desc: "import from internal/reports/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/billing/service"
+            desc: "import from internal/billing/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/billing/store"
+            desc: "import from internal/billing/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/billing/events"
+            desc: "import from internal/billing/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/audit/service"
+            desc: "import from internal/audit/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/audit/store"
+            desc: "import from internal/audit/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/tenancy/service"
+            desc: "import from internal/tenancy/api instead"
+          - pkg: "github.com/sociopulse/platform/internal/tenancy/store"
+            desc: "import from internal/tenancy/api instead"
+
+issues:
+  exclude-rules:
+    - path: _test\.go
+      linters:
+        - gosec
+        - gocognit
+        - gocyclo
+        - errcheck
+    - path: cmd/.*/main\.go
+      linters:
+        - gocyclo
+  max-issues-per-linter: 0
+  max-same-issues: 0
