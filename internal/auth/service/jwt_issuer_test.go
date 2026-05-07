@@ -1,6 +1,8 @@
 package service_test
 
 import (
+	"encoding/base64"
+	"fmt"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -205,6 +207,69 @@ func TestJWTIssuer_Validate_RejectsAlgNone(t *testing.T) {
 	require.True(t, strings.HasPrefix(noneSigned, "eyJ"))
 }
 
+// 5b. Validate rejects HS512 — same secret, different family. Without
+// WithValidMethods this would silently verify because HS512 is symmetric.
+func TestJWTIssuer_Validate_RejectsHS512(t *testing.T) {
+	t.Parallel()
+
+	clk := newFakeClock(time.Date(2026, time.May, 8, 12, 0, 0, 0, time.UTC))
+	iss := makeIssuer(t, validSecret, 30*time.Second, 15*time.Minute, time.Hour, clk.FuncClock())
+
+	now := clk.Now()
+	mc := jwt.MapClaims{
+		"iss":   "sociopulse-test",
+		"sub":   uuid.New().String(),
+		"tid":   uuid.New().String(),
+		"login": "alice",
+		"roles": []string{"operator"},
+		"sid":   "S",
+		"jti":   "J",
+		"iat":   now.Unix(),
+		"exp":   now.Add(time.Hour).Unix(),
+		"typ":   "access",
+	}
+	tok := jwt.NewWithClaims(jwt.SigningMethodHS512, mc)
+	signed, err := tok.SignedString(validSecret)
+	require.NoError(t, err)
+
+	_, err = iss.Validate(signed, "access")
+	require.Error(t, err)
+	require.ErrorIs(t, err, authapi.ErrTokenInvalid,
+		"HS512 must be rejected even with the right secret — only HS256 is in WithValidMethods")
+}
+
+// 5c. Validate rejects an RS256 token. We don't actually have an RSA
+// private key to sign one with, so we craft an unsigned RS256 header
+// and signature stub: the parser must reject the token at the alg check
+// before it ever reaches the signature verifier (key-confusion attack
+// would otherwise treat the public-key bytes as an HMAC secret).
+func TestJWTIssuer_Validate_RejectsRS256(t *testing.T) {
+	t.Parallel()
+
+	clk := newFakeClock(time.Date(2026, time.May, 8, 12, 0, 0, 0, time.UTC))
+	iss := makeIssuer(t, validSecret, 30*time.Second, 15*time.Minute, time.Hour, clk.FuncClock())
+
+	// Manually-crafted JWT: header says alg=RS256, but body is otherwise
+	// valid. Signature is bogus base64 — irrelevant because validation
+	// must reject on alg before signature verification runs.
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"RS256","typ":"JWT"}`))
+	now := clk.Now()
+	payload := fmt.Sprintf(
+		`{"iss":"sociopulse-test","sub":"%s","tid":"%s","login":"a","roles":["operator"],"sid":"S","jti":"J","iat":%d,"exp":%d,"typ":"access"}`,
+		uuid.New(), uuid.New(), now.Unix(), now.Add(time.Hour).Unix(),
+	)
+	body := base64.RawURLEncoding.EncodeToString([]byte(payload))
+	sig := base64.RawURLEncoding.EncodeToString([]byte("fake-signature"))
+	forged := header + "." + body + "." + sig
+
+	require.NotPanics(t, func() {
+		_, vErr := iss.Validate(forged, "access")
+		require.Error(t, vErr)
+		require.ErrorIs(t, vErr, authapi.ErrTokenInvalid,
+			"RS256 forgery must be rejected by WithValidMethods before signature verify")
+	})
+}
+
 //  6. Validate rejects token whose `sub` parses to uuid.Nil. We bypass IssueAccess
 //     by using jwt.NewWithClaims directly with an empty sub.
 func TestJWTIssuer_Validate_RejectsZeroSubject(t *testing.T) {
@@ -312,6 +377,20 @@ func TestNewJWTIssuer_ValidatesConfig(t *testing.T) {
 			RefreshTTL: time.Hour,
 		}, nil)
 		require.Error(t, err)
+	})
+
+	t.Run("16-byte secret rejected (RFC 7518 §3.2 mandates 32+)", func(t *testing.T) {
+		t.Parallel()
+		// 16 bytes = 128 bits. Used to be the floor; now bumped to 32
+		// per RFC 7518 §3.2 because anything shorter halves the HMAC
+		// security margin.
+		_, err := service.NewJWTIssuer(service.JWTConfig{
+			Issuer:     "x",
+			Secret:     []byte("0123456789abcdef"), // exactly 16 bytes
+			AccessTTL:  time.Minute,
+			RefreshTTL: time.Hour,
+		}, nil)
+		require.Error(t, err, "16-byte secret must be rejected")
 	})
 
 	t.Run("zero access ttl rejected", func(t *testing.T) {

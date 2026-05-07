@@ -23,10 +23,12 @@ const (
 )
 
 // minSecretBytes is the lower bound on the HS256 signing-secret length.
-// HS256 requires a 256-bit key; we round down to 16 bytes (128 bits) as
-// an absolute floor to flag obviously-misconfigured secrets, but
-// production secrets must be 32+ bytes (sourced from Lockbox/KMS).
-const minSecretBytes = 16
+// RFC 7518 §3.2 mandates 256 bits (32 bytes) of key material — anything
+// shorter halves the HMAC security margin and violates the spec. Production
+// secrets are sourced from Lockbox/KMS and audited at config-load time;
+// this constant is the last line of defense against a misconfiguration
+// slipping through (e.g. a stale dev secret pasted into a prod env).
+const minSecretBytes = 32
 
 // jtiByteLen is the entropy of a generated JTI / SessionID before hex
 // encoding. 16 bytes -> 32 hex characters, well above birthday-collision

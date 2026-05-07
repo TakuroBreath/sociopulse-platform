@@ -34,7 +34,7 @@ func TestGenerateTempPassword_NoDuplicatesAcrossManyCalls(t *testing.T) {
 
 	const iterations = 1000
 	seen := make(map[string]struct{}, iterations)
-	for i := 0; i < iterations; i++ {
+	for i := range iterations {
 		pwd, err := GenerateTempPassword()
 		require.NoError(t, err)
 		_, dup := seen[pwd]
@@ -51,10 +51,10 @@ func TestGenerateTempPassword_UsesEnoughOfTheAlphabet(t *testing.T) {
 	// We require at least 50/64 distinct chars — the chance of seeing
 	// fewer due to randomness alone is negligible (<<1e-9).
 	seen := make(map[byte]struct{}, 64)
-	for i := 0; i < 1000; i++ {
+	for range 1000 {
 		pwd, err := GenerateTempPassword()
 		require.NoError(t, err)
-		for j := 0; j < len(pwd); j++ {
+		for j := range len(pwd) {
 			seen[pwd[j]] = struct{}{}
 		}
 	}
