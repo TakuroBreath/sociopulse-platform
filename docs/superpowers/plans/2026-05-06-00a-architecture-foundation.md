@@ -65,7 +65,8 @@ sociopulse-platform/
 │   │   ├── 04-testing-strategy.md
 │   │   ├── 05-configuration.md
 │   │   ├── 06-observability.md
-│   │   └── 07-go-coding-standards.md                 # samber/cc-skills-golang distilled
+│   │   ├── 07-go-coding-standards.md                 # samber/cc-skills-golang distilled
+│   │   └── 08-tdd-discipline.md                      # Red-Green-Refactor methodology (Plan 00b)
 │   └── agents/                                      # already from setup-matt-pocock-skills
 │       ├── issue-tracker.md
 │       ├── triage-labels.md
@@ -123,6 +124,7 @@ sociopulse-platform/
 - Create: `docs/architecture/05-configuration.md`
 - Create: `docs/architecture/06-observability.md`
 - Create: `docs/architecture/07-go-coding-standards.md`
+- (Note: `08-tdd-discipline.md` is created by Plan 00b — execute Plan 00b before Plan 02)
 
 - [ ] **Step 1: `00-overview.md` — module map + dependency graph**
 
@@ -922,7 +924,17 @@ NATS-specific implementation in Plan 02.
 
 - [ ] **Step 7: `pkg/grpc/` and `pkg/httputil/`**
 
-Stub helper functions: `NewMTLSServer`, `NewMTLSClient`, `IdempotencyMiddleware`, `RateLimitMiddleware`. Plan 02 fills.
+Stub helper functions:
+- `pkg/grpc/`: `NewMTLSServer`, `NewMTLSClient` — Plan 02 fills.
+- `pkg/httputil/`: `RequestIDMiddleware`, `IdempotencyMiddleware`, `RateLimitMiddleware`,
+  `RecoveryMiddleware` — Plan 02 fills. **All return `gin.HandlerFunc` per ADR-0014.**
+- `pkg/httputil/gin_adapter.go`: `FromHTTPHandler(http.Handler) gin.HandlerFunc` — adapter
+  for stdlib middleware. Plan 02 implements; here just declare the function signature
+  with `panic("not implemented: see Plan 02")`.
+
+Why an adapter exists: some middleware (TLS termination, raw HTTP healthcheck) is
+shaped as stdlib `http.Handler`. The adapter wraps such middleware to fit gin's
+`HandlerFunc` chain so we can mix-and-match without rewriting stable middleware.
 
 - [ ] **Step 8: Add `go.uber.org/goleak` dependency**
 
@@ -1051,7 +1063,7 @@ package modules
 import (
     "context"
 
-    "github.com/go-chi/chi/v5"
+    "github.com/gin-gonic/gin"
     "go.uber.org/zap"
     "google.golang.org/grpc"
 
@@ -1069,7 +1081,7 @@ type Deps struct {
     Pool         *postgres.Pool
     EventBus     eventbus.Publisher
     Subscriber   eventbus.Subscriber
-    HTTPRouter   chi.Router
+    HTTPRouter   *gin.Engine
     GRPCServer   *grpc.Server
     Locator      ServiceLocator // for cross-module Service references
 }
