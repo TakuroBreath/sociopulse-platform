@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*.*.*"]
   pull_request:
     branches: [main]
   workflow_dispatch:
@@ -17,6 +18,9 @@ concurrency:
 env:
   GO_VERSION: "1.26"
   GOLANGCI_LINT_VERSION: v1.64.8
+  # Docker Hub repository — public, owned by maxtakuro.
+  # Image:   docker.io/maxtakuro/sociopulse-api:<tag>
+  DOCKERHUB_REPO: maxtakuro/sociopulse-api
 
 jobs:
   lint:
@@ -73,21 +77,89 @@ jobs:
         run: ls -la bin/
 
   docker:
-    name: Docker build
+    name: Docker build & push
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
     needs: [lint, test]
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-buildx-action@v3
-      - name: Build cmd/api image
-        uses: docker/build-push-action@v5
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # Push step decides itself whether to login & push based on event + secrets.
+      # PR builds: build only, no push.
+      # main / tag pushes: try to login; if DOCKERHUB_TOKEN is unset, fail-soft
+      #   with a warning (image still built and cached, just not pushed).
+      - name: Compute push flag
+        id: pushflag
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "do_push=false" >> "$GITHUB_OUTPUT"
+            echo "reason=PR build (push only on main/tags)" >> "$GITHUB_OUTPUT"
+          elif [ -z "${{ secrets.DOCKERHUB_TOKEN }}" ]; then
+            echo "do_push=false" >> "$GITHUB_OUTPUT"
+            echo "reason=DOCKERHUB_TOKEN secret not configured — skipping push" >> "$GITHUB_OUTPUT"
+          else
+            echo "do_push=true" >> "$GITHUB_OUTPUT"
+            echo "reason=main/tag push with credentials present" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Report push decision
+        run: |
+          echo "::notice::Docker push decision: ${{ steps.pushflag.outputs.do_push }} — ${{ steps.pushflag.outputs.reason }}"
+
+      - name: Login to Docker Hub
+        if: steps.pushflag.outputs.do_push == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Generate image tags
+        id: tags
+        run: |
+          SHORT_SHA="${GITHUB_SHA:0:7}"
+          REPO="${DOCKERHUB_REPO}"
+          TAGS="${REPO}:sha-${SHORT_SHA}"
+          # On main: also tag :main and :latest
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            TAGS="${TAGS},${REPO}:main,${REPO}:latest"
+          fi
+          # On vX.Y.Z tag push: also tag :vX.Y.Z
+          if [[ "${{ github.ref }}" == refs/tags/v* ]]; then
+            VTAG="${GITHUB_REF#refs/tags/}"
+            TAGS="${TAGS},${REPO}:${VTAG}"
+          fi
+          {
+            echo "tags<<EOF"
+            echo "${TAGS}"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "Computed tags: ${TAGS}"
+
+      - name: Build (and push if creds present)
+        uses: docker/build-push-action@v6
         with:
           context: .
-          push: false
-          tags: sociopulse-api:ci-${{ github.sha }}
+          push: ${{ steps.pushflag.outputs.do_push }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.created=${{ github.event.head_commit.timestamp }}
+            org.opencontainers.image.title=sociopulse-api
+            org.opencontainers.image.description=СоциоПульс backend API (cmd/api)
+          build-args: |
+            VERSION=${{ github.ref_name }}
+            COMMIT=${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+          provenance: false
 
   vuln:
     name: Vulnerability scan

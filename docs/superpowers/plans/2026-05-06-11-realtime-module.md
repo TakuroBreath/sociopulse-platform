@@ -6,7 +6,7 @@
 
 **Architecture:** Hub holds per-replica connections; each replica subscribes to NATS subjects under `tenant.>` once and dispatches frames to local subscribers matching topic+filter. Presence is centralized in Redis (`presence:<tenant>:user:<id>`, TTL 30s). Listen-in spawns a temporary SIP user via telephony-bridge, returns verto credentials to the admin browser, and triggers a `mixmonitor` ESL command so the listener leg receives mixed audio.
 
-**Tech Stack:** Go 1.22+, `nhooyr.io/websocket` v1.8+ (or `coder/websocket`), `nats-io/nats.go` v1.34+, `redis/go-redis/v9` v9.5+, `gin-gonic/gin`, `testify`, `gomock`, testcontainers-go.
+**Tech Stack:** Go 1.26+, `nhooyr.io/websocket` v1.8+ (or `coder/websocket`), `nats-io/nats.go` v1.34+, `redis/go-redis/v9` v9.5+, `gin-gonic/gin`, `testify`, `gomock`, testcontainers-go.
 
 **Spec sections covered:** §10 (real-time plane, full), §FR-F (admin monitoring), §10.4 (listen-in), §10.5 (backpressure).
 

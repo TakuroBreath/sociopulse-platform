@@ -2067,7 +2067,7 @@ Task 1) и в `CONTRIBUTING.md` (Plan 00 Task 5).
 | 4 | `golang-structs-interfaces` | small interfaces, accept interface/return struct, compile-time check `var _ api.X = (*Y)(nil)` |
 | 5 | `golang-safety` | `forcetypeassert`, comma-ok, no `defer` в loops, bounds-checked numeric conversion |
 | 6 | `golang-security` | `crypto/rand` для secrets, AES-GCM, `crypto/subtle.ConstantTimeCompare`, `gosec`, `govulncheck` в CI |
-| 7 | `golang-modernize` | Go 1.22+: `any`, `min`/`max`, `range` over int, `slices`/`maps`, `cmp.Or` |
+| 7 | `golang-modernize` | Go 1.26+: `any`, `min`/`max`, `range` over int, `slices`/`maps`, `cmp.Or` |
 | 8 | `golang-data-structures` | preallocate slices/maps, `strings.Builder`, generic constraints |
 | 9 | `golang-design-patterns` | functional options, `defer Close()` сразу после открытия, no `init()` для injectable deps |
 | 10 | `golang-grpc` | health check service, `GracefulStop`, `status.Errorf` с правильным code, mTLS |

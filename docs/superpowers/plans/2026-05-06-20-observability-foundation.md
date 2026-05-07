@@ -23,7 +23,7 @@
 - Status page: minimal in-house static page generated from a single YAML by `cmd/status-page` (5-min cron on cmd/api), shows green/yellow/red per service. No third-party SaaS (152-ФЗ).
 - Synthetic monitoring: `cmd/synthetic` — Go binary that runs canary scenarios (login, list projects, originate-test-call) every 60s and emits metrics. Deployed as separate Deployment in MKS.
 
-**Tech Stack:** Grafonnet (JSONNet 0.20+), Prometheus 2.55, Alertmanager 0.27, Loki 3.x, Tempo 2.x (all from kube-prometheus-stack helm), Helm 3.14, Go 1.22 for cmd/synthetic + cmd/status-page.
+**Tech Stack:** Grafonnet (JSONNet 0.20+), Prometheus 2.55, Alertmanager 0.27, Loki 3.x, Tempo 2.x (all from kube-prometheus-stack helm), Helm 3.14, Go 1.26 for cmd/synthetic + cmd/status-page.
 
 **Spec sections covered:** §15 (full observability), §13.7 (incident response), §NFR-2 (availability monitoring), §NFR-10 (logging/observability principles).
 

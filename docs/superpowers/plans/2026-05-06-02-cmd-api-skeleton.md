@@ -15,7 +15,7 @@
 - `internal/modules/` — `Module` interface + `Deps` struct + module registry. A stub `healthz` module demonstrates the pattern; real modules plug in via Plan 04+.
 
 **Tech Stack:**
-- Go 1.22+
+- Go 1.26+
 - `github.com/spf13/viper` v1.18+, `github.com/fsnotify/fsnotify` v1.7+
 - `go.uber.org/zap` v1.27+
 - `go.opentelemetry.io/otel` v1.27+, `go.opentelemetry.io/otel/sdk` v1.27+, `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc` v1.27+

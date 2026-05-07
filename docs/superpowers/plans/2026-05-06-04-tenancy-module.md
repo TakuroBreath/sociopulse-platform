@@ -13,7 +13,7 @@
 - A single `Module` struct is the integration point: `Module.Register(deps Deps) (api.Tenancy, error)` is called from `cmd/api/main.go` once and exposes the `api.Tenancy` aggregate interface to the rest of the monolith.
 
 **Tech stack:**
-- Go 1.22+
+- Go 1.26+
 - `github.com/jackc/pgx/v5` — Postgres driver, `tenancy_admin` connection pool.
 - `github.com/yandex-cloud/go-sdk` v0.0.50+ — Yandex KMS SDK (`kms.SymmetricKeyServiceClient`, `kms.SymmetricCryptoServiceClient`).
 - `github.com/nats-io/nats.go` — NATS client (cache invalidation).

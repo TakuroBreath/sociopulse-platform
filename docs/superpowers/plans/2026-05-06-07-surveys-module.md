@@ -6,7 +6,7 @@
 
 **Architecture:** `internal/surveys/` is a leaf module — it depends only on `internal/auth/api` (for tenant context) and `internal/audit/api` (for audit events), and exposes a façade in `internal/surveys/api/`. The package layout follows the established `{api, service, store, runtime, schemas, http}` convention. The DSL evaluator wraps `expr-lang/expr` with a strict whitelist; JSON-Schema validation uses `santhosh-tekuri/jsonschema/v5`. The runtime is implemented as a pure-function package with no I/O dependencies, which makes it trivially compilable to WebAssembly via TinyGo. The WASM artifact is built by `scripts/build-wasm.sh`, embedded into the Go binary via `embed.FS`, and served by `cmd/api` at `/static/surveys-runtime.wasm`. The browser loads it once, then calls exported functions through `wasm_exec.js` glue.
 
-**Tech Stack:** Go 1.22+, `expr-lang/expr` v1.16+, `santhosh-tekuri/jsonschema/v5` v5.3+, TinyGo 0.31+, `stretchr/testify`, embed.FS, gorilla/mux router (set up in Plan 02).
+**Tech Stack:** Go 1.26+, `expr-lang/expr` v1.16+, `santhosh-tekuri/jsonschema/v5` v5.3+, TinyGo 0.31+, `stretchr/testify`, embed.FS, gorilla/mux router (set up in Plan 02).
 
 **Spec sections covered:** §FR-C (constructor — both modes, conditional logic, versioning, validation, preview), §11.1–11.7 (universal schema, form/flow modes, DSL, validation, runtime, versioning, preview), ADR-008 (single Go runtime → WASM for browser).
 
@@ -145,7 +145,7 @@ test -f internal/surveys/api/.gitkeep && echo "ok: gitkeep present"
 
 Expected:
 - `pwd` → `/Users/user/call-center/social-pulse`
-- `go version` → `go version go1.22.x ...` or higher
+- `go version` → `go version go1.26.x ...` or higher
 - both `ok:` lines present
 
 If anything fails, do not proceed; re-run Plan 00 verification first.

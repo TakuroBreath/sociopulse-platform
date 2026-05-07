@@ -3,7 +3,7 @@
 
 run:
   timeout: 5m
-  go: "1.22"
+  go: "1.26"
   tests: true
 
 output:

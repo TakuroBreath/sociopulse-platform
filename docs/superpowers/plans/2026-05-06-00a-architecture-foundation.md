@@ -13,7 +13,7 @@
 
 Module dependency rule: **`internal/A/*` may import `internal/B/api/`** but never `internal/B/service/`, `internal/B/store/`, etc. Modules talk only through public contracts. Enforced by `depguard`.
 
-**Tech Stack:** Go 1.22+, golangci-lint with depguard, mockery v2 for interface mocks (test-only).
+**Tech Stack:** Go 1.26+, golangci-lint with depguard, mockery v2 for interface mocks (test-only).
 
 **Spec sections covered:** §5 (module decomposition), §6 (data model interfaces), §10 (real-time contracts), §12 (security boundaries), §14 (configuration registry), §15 (observability conventions). All 13 ADRs from §17 promoted to standalone files.
 
@@ -352,7 +352,7 @@ Sections (write each as 3–6 paragraphs of guidance, not just a bullet list):
    comparison via `crypto/subtle.ConstantTimeCompare`. `gosec` linter +
    `govulncheck` in CI (Plan 00 Task 11).
 
-8. **Modernize (`golang-modernize`).** Project targets Go 1.22+. Use:
+8. **Modernize (`golang-modernize`).** Project targets Go 1.26+. Use:
    - `any` over `interface{}`
    - `min`/`max`/`clear` builtins
    - `range` over int (Go 1.22)
@@ -366,7 +366,7 @@ Sections (write each as 3–6 paragraphs of guidance, not just a bullet list):
      interface-typed key/value pairs
 
    Loop variable shadow copies (`for _, x := range xs { go f(x) }`) — no
-   longer needed since Go 1.22 fixed the semantics, but explicit copy still
+   longer needed since Go 1.26 fixed the semantics, but explicit copy still
    preferred in cross-iteration goroutines for readability.
 
 9. **Testing (`golang-testing`).** Table-driven tests with named subtests
