@@ -181,7 +181,16 @@ The CodeQL workflow runs but Code Scanning isn't enabled in repo Settings → Co
 `cmd/api/postgres.go` has a startup check that confirms the pool's `current_user` is `app`, not `tenancy_admin`. This is a defence-in-depth: if someone misconfigures the DSN to use the admin role, the API refuses to boot rather than running with RLS bypassed.
 
 ### Tenancy-specific: pepper-at-rest is plaintext
-The phone-hash pepper is stored as `bytea` in `tenants.phone_hash_pepper`. Plan 04 did NOT envelope-encrypt the pepper itself (would require a migration + storage refactor). The pepper is sensitive but not catastrophic if leaked: an attacker with DB access already has `respondents.phone_hash` (which is HMAC'd with the pepper) and `respondents.phone_encrypted` (envelope-encrypted with the tenant's KEK via KMSResolver). Pepper-at-rest envelope encryption is a future hardening pass.
+The phone-hash pepper is stored as `bytea` in `tenants.phone_hash_pepper`. Plan 04 did NOT envelope-encrypt the pepper itself (would require a migration + storage refactor). Pragmatic stance — see compliance note below — this is acceptable for v1.
+
+### Compliance posture
+**Functional security, not compliance theater.** No external 152-ФЗ audit is planned in v1. We do AES-256-GCM, RLS, KMS, audit log, IVR consent because they're good engineering — not for regulators. Stop adding compliance ceremony unless an actual auditor surfaces. Rule documented in `CLAUDE.md` § Compliance posture and `docs/references/COMMON.md` § Compliance posture.
+
+### Tooling rule (added 2026-05-08)
+Subagents and the controller MUST use:
+- **`context7` MCP** for library API verification (don't guess from training data).
+- **`WebSearch`/`WebFetch`** for unknown errors and current documentation.
+Wrong-API guesses cause subagent dispatch loops. Documented in `CLAUDE.md` § Tooling for unknown territory.
 
 ---
 

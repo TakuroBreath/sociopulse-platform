@@ -4,22 +4,53 @@
 
 ---
 
-## 152-ФЗ (российский закон о персональных данных)
+## Tooling for agents (use these, don't guess)
 
-### Canonical
-- [**152-ФЗ полный текст** на pravo.gov.ru](http://pravo.gov.ru/proxy/ips/?docbody=&firstDoc=1&lastDoc=1&nd=102108261) — официальная редакция. Сложно читать, но это primary source.
-- [**Постановление Правительства РФ № 1119**](http://pravo.gov.ru/proxy/ips/?docbody=&nd=102161693) — требования к защите ПДн (Уровни защищённости УЗ-1..УЗ-4). Наш кейс — УЗ-3 (специальные категории + >100k субъектов).
-- [**Приказ ФСТЭК 21**](https://fstec.ru/dokumenty/vse-dokumenty/prikazy/prikaz-fstek-rossii-ot-18-fevralya-2013-g-n-21) — состав и содержание мер защиты для ИСПДн. Технические требования, на которые ссылается аудит.
+Before reading any spec or library doc below from training data, **verify with current sources**:
 
-### Practical
-- [**Habr тег "152-ФЗ"**](https://habr.com/ru/hubs/152-fz/articles/) — многократно перетёртые гайды, разные авторы. Качество разное; читать с критикой.
-- [**Yandex Cloud — ИБ и compliance**](https://yandex.cloud/ru/security/compliance) — с какими сертификатами Yandex закрывает требования (152-ФЗ ИСПДн УЗ-1..УЗ-4 у них есть).
-- [**Хабр статьи про "ИСПДн в облаке"**](https://habr.com/ru/search/?target_type=posts&q=%D0%98%D0%A1%D0%9F%D0%94%D0%BD&order=relevance) — практика интеграторов.
+### `context7` MCP — for library API
+When you need current API of any library (`golang-jwt/jwt/v5`, `pgx/v5`, `gin`, `pquerna/otp`, `aws-sdk-go-v2`, etc.):
+1. `mcp__plugin_context7_context7__resolve-library-id` — find the lib's ID by name.
+2. `mcp__plugin_context7_context7__query-docs` — query the actual current docs.
 
-### Gotchas
-- **Локализация ПДн в РФ** — обязательна (ст. 18 ч. 5). Yandex Cloud RU-Central-1 region удовлетворяет. AWS/GCP/Azure не ru-residency = нельзя для prod-данных российских граждан.
-- **38-ФЗ vs 152-ФЗ**: соц. опросы регулируются 152-ФЗ (ПДн), а маркетинговые звонки — 38-ФЗ "О рекламе". Эти законы разные. Соц. опросы по 152-ФЗ требуют согласия субъекта; рекламные звонки по 38-ФЗ требуют отдельного согласия + DNC-list. Мы только 152-ФЗ; см. ADR-0001/0003.
-- **Roskomnadzor уведомление** — оператор ПДн должен подать уведомление о начале обработки. Не наша забота как разработчиков; забота клиента (тенанта).
+Don't guess function signatures, option struct fields, or error types from training data — they're frequently wrong (libs evolve fast). Wrong guesses → subagent dispatch loops.
+
+### `WebSearch` — for problem-solving
+For specific errors, recent CVEs, or "how do I do X with Y" questions, search the web. Stack Overflow / Habr / GitHub issues / library blogs almost always have better answers than my (possibly stale) training data.
+
+Especially valuable for:
+- Yandex Cloud quirks (training data is thin here)
+- FreeSWITCH error messages
+- Russian-language SIP-trunk specifics
+- Recent library version migration issues
+
+### `WebFetch` — for specific URLs
+The links below in this file are **starting points**. To read them, `WebFetch` at use-time so content is current.
+
+---
+
+## Compliance posture (152-ФЗ)
+
+**Pragmatic, not theatrical.** Project does NOT pursue formal certification (УЗ-3 dossier, ФСТЭК reports, Roskomnadzor audit prep). Build with good security hygiene, ship.
+
+**What we DO** (because it's good engineering anyway):
+- AES-256-GCM envelope encryption for PII (phones, names) — per-tenant KEK via Yandex KMS.
+- PostgreSQL RLS + `SET LOCAL app.tenant_id` for tenant isolation.
+- Audit log (when fully wired in a later plan) — who-accessed-what-when in `audit_log` table.
+- IVR consent prompt before recording (Plan 12).
+- Data residency on Yandex Cloud RU-Central-1.
+
+**What we DON'T do for v1**:
+- Formal compliance dossiers / pen-test reports for regulators.
+- Encrypted-at-rest phone-hash pepper (deferred future hardening).
+- Beyond-baseline access-control audit trails.
+
+If real audit ever surfaces — these are tractable add-ons. Don't burn cycles on ceremony when there's no auditor to satisfy.
+
+For background reference (read if needed, don't internalize):
+- [**152-ФЗ on pravo.gov.ru**](http://pravo.gov.ru/proxy/ips/?docbody=&firstDoc=1&lastDoc=1&nd=102108261)
+- [**Yandex Cloud compliance page**](https://yandex.cloud/ru/security/compliance) — Yandex has УЗ-1..УЗ-4 certs, so infra-level compliance is "covered" if it ever matters.
+- **38-ФЗ vs 152-ФЗ**: соц. опросы — 152-ФЗ (ПДн); реклама — 38-ФЗ. Мы только 152-ФЗ. См. ADR-0001/0003.
 
 ---
 

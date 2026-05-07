@@ -63,5 +63,20 @@ Cross-cutting: [`COMMON.md`](COMMON.md).
 
 - **Links rot**. When you find a 404, replace with the closest current equivalent and note the original was lost.
 - **My (Claude's) curation bias**: I weight authoritative specs (RFC, OWASP) higher than blog posts. For production-realism, prioritize blog posts + ClueCon talks.
-- **Russian-language sources** are weighted heavier here than in my training data — Russian 152-ФЗ context is project-critical and English sources don't cover it.
 - **WebFetch'd at curation time**: when I curate a file, I verify URLs are live + note training-data version vs current. If a library API has changed since my training, I'll flag it.
+
+## Use the runtime tools first
+
+For **library APIs** — don't guess from training. Use `context7` MCP:
+1. `mcp__plugin_context7_context7__resolve-library-id` to find the lib.
+2. `mcp__plugin_context7_context7__query-docs` for the current doc.
+
+For **specific errors / unknown territory** — `WebSearch`. Stack Overflow / Habr / GitHub issues are usually more current than my training.
+
+For **specific URLs** — `WebFetch`.
+
+The links in per-plan files are **starting points and rationales**, not the source of truth. Source of truth = current docs, fetched at use-time.
+
+## 152-ФЗ stance
+
+**Functional security, not compliance theater.** No external audit planned in v1 scope. We do good crypto and isolation because they're good engineering, not because of regulators. See `COMMON.md` § Compliance posture.

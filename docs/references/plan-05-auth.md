@@ -126,7 +126,9 @@ Subagent dispatching Plan 05 Task N MUST:
 1. Read this file before starting.
 2. Read [`COMMON.md`](COMMON.md) for cross-cutting concerns.
 3. Read the actual plan task from `docs/superpowers/plans/2026-05-06-05-auth-module.md`.
-4. Apply skill discipline (samber/cc-skills-golang) — особенно `golang-security` (`crypto/rand`, AES-GCM, ConstantTimeCompare).
-5. TDD per `superpowers:test-driven-development`.
+4. **Use `context7` MCP** to verify current API of `golang-jwt/jwt/v5`, `pquerna/otp`, `golang.org/x/crypto/argon2` before writing code that uses them. Don't guess — query.
+5. **Use `WebSearch`** if you hit unfamiliar errors or unknown territory.
+6. Apply skill discipline (samber/cc-skills-golang) — особенно `golang-security` (`crypto/rand`, AES-GCM, ConstantTimeCompare).
+7. TDD per `superpowers:test-driven-development`.
 
-Failure to read references = high probability of repeating known mistakes (alg=none, bcrypt-not-Argon2, etc.).
+Failure to read references / use runtime tools = high probability of repeating known mistakes (alg=none, bcrypt-not-Argon2, wrong API signatures, etc.).

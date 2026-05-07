@@ -83,6 +83,7 @@ When working on Plans (00a/00b/02/03/...) on this repo:
    - Path-correction note: many older plan texts use `internal/<X>` where the real path is `pkg/<X>` (Plan 00a moved several abstractions to `pkg/`). Always check existing scaffolding before instructing the agent.
    - Quality bar: `go build ./...` + `go vet ./...` + `go test -race -count=1 ./...` + `golangci-lint run ./...` + `gofmt -l ...` + `make grep-time-after`. ALL must be green before reporting DONE.
    - Subagent MUST commit at the end (don't leave uncommitted work to be found later).
+   - **Tooling**: subagents have access to `context7` MCP for current library docs — instruct them to USE it for any library API check (instead of guessing from training data). They also have `WebSearch`/`WebFetch` — use it when stuck on specific errors / unknown territory rather than guessing.
 4. **Two-stage review** per task (per `superpowers:subagent-driven-development`):
    - Spec compliance review (verify code matches plan).
    - Code quality review (strengths/issues/severity).
@@ -103,3 +104,44 @@ When working on Plans (00a/00b/02/03/...) on this repo:
   - `pgxpool-isolation`: `pgxpool` only in `pkg/postgres` + `internal/tenancy/store/admin_*` + `cmd/migrator`.
   - `yandex-sdk-isolation`: forward-looking guard for Plan 04 KMS work.
   - `banned-stdlib`: `math/rand`, CBC/ECB, MD5, SHA1, DES.
+
+## Tooling for unknown territory (use these, don't guess)
+
+When working on this repo, **prefer real-time information sources over training-data guessing**:
+
+1. **`context7` MCP** — for current library API docs. When you (or a subagent) needs to know:
+   - "What's the current API of `golang-jwt/jwt/v5`?"
+   - "Did `pgx/v5` add a new pool option?"
+   - "How does `pquerna/otp` validate window?"
+   → use `mcp__plugin_context7_context7__resolve-library-id` (find the lib) then `query-docs` (fetch its doc). Don't guess from training data — it's stale and you'll write code against the wrong signature.
+
+2. **`WebSearch`** — for problem-solving when you hit unknown error messages, recent CVEs, "how do I do X with Y" type questions. Examples:
+   - "FreeSWITCH ESL connection refused after restart"
+   - "Yandex Cloud KMS rate limit exceeded"
+   - "PgBouncer transaction-mode prepared statements error"
+   → use `WebSearch`. The signal-to-noise on Stack Overflow / Habr / GitHub issues is much better than my fabricated guesses.
+
+3. **`WebFetch`** — for specific URLs you've decided to read. The reference files in `docs/references/` list URLs; `WebFetch` pulls them at use-time so you have current content.
+
+**Rule of thumb**: if you find yourself thinking "I think the API is X" — stop. Run context7 or WebSearch. Wrong API guesses cause subagent dispatch loops and waste real time.
+
+Subagent prompts must instruct the subagent to USE these tools — not just have access. Example phrasing in implementer prompts:
+> "Before writing code that uses `<library>`, run `context7` to verify the current API. If you hit an unfamiliar error, `WebSearch` it before guessing."
+
+## Compliance posture (152-ФЗ)
+
+**Pragmatic stance, not compliance theater.** No external audit is planned in scope of v1. The requirements that genuinely matter for v1:
+
+1. **Encryption at rest for PII** — phone numbers, names. We do this via envelope encryption (per-tenant KEK, AES-256-GCM). ✅
+2. **Tenant isolation** — RLS + SET LOCAL app.tenant_id. ✅
+3. **Audit log** — who-accessed-what-when. Write to `audit_log` table (partitioned monthly). 🟡 stubbed currently, real impl in a later plan.
+4. **Recording consent** — IVR consent prompt before recording starts. Plan 12.
+5. **Data residency** — Yandex Cloud RU-Central-1 only. Already locked.
+
+What we are **NOT** doing for v1:
+- Formal compliance documentation packages (УЗ-3 dossier, ФСТЭК certification reports).
+- Pen-testing reports for Roskomnadzor submission.
+- Encrypted-at-rest pepper (the phone-hash pepper is plaintext-bytea; future hardening).
+- Detailed access-control audit trails beyond the basic audit_log.
+
+If a real audit ever happens, those are tractable add-ons. For v1, **functional security hygiene = enough**. Don't burn cycles on compliance ceremony when there's no auditor to satisfy. Build it well and move on.
