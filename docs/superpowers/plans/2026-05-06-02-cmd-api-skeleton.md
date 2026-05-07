@@ -2,14 +2,14 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking. Every task follows TDD — write the failing test first, watch it fail, then write the implementation, watch it pass, then commit.
 
-**Goal:** Convert the hello-world `cmd/api` (from Plan 00) into a production-grade HTTP/WS/gRPC service skeleton: Viper-based config loading with hot-reload, three-pillar observability (zap/OTel/Prometheus), liveness/readiness endpoints wired to real dependencies, chi-based gateway middleware chain (request-id, recover, logging, tracing, metrics, idempotency, rate-limit, auth-stub), a `/ws` WebSocket endpoint, an mTLS gRPC server (no services registered yet), the `Module` registration pattern, and graceful shutdown with timeouts. Real domain modules (auth, crm, surveys, dialer, …) are filled in by Plans 04+.
+**Goal:** Convert the hello-world `cmd/api` (from Plan 00) into a production-grade HTTP/WS/gRPC service skeleton: Viper-based config loading with hot-reload, three-pillar observability (zap/OTel/Prometheus), liveness/readiness endpoints wired to real dependencies, gin-based gateway middleware chain (request-id, recover, logging, tracing, metrics, idempotency, rate-limit, auth-stub), a `/ws` WebSocket endpoint, an mTLS gRPC server (no services registered yet), the `Module` registration pattern, and graceful shutdown with timeouts. Real domain modules (auth, crm, surveys, dialer, …) are filled in by Plans 04+.
 
 **Architecture:**
-- `cmd/api/main.go` orchestrates: load config → init logger/tracer/metrics → open db/redis/nats clients → build `Deps` struct → run `Module.Register(deps)` for every module → mount routes on chi router → start HTTP, WS, gRPC, metrics servers → wait for SIGTERM → graceful shutdown.
+- `cmd/api/main.go` orchestrates: load config → init logger/tracer/metrics → open db/redis/nats clients → build `Deps` struct → run `Module.Register(deps)` for every module → mount routes on gin router → start HTTP, WS, gRPC, metrics servers → wait for SIGTERM → graceful shutdown.
 - `internal/config/` — Viper loader (yaml + ENV override + fsnotify hot-reload). Top-level struct matches spec §14.2.
 - `internal/observability/` — zap logger with PII redaction encoder; OTel SDK with OTLP/gRPC exporter; Prometheus registry exposing `/metrics` on a separate port.
 - `internal/healthz/` — `/healthz` (liveness) and `/readyz` (readiness against Postgres+Redis+NATS).
-- `internal/gateway/` — chi router wrapper plus middleware chain. Each middleware in its own file under `internal/gateway/middleware/`.
+- `internal/gateway/` — gin router wrapper plus middleware chain. Each middleware in its own file under `internal/gateway/middleware/`.
 - `internal/realtime/wsapi/` — `/ws` handler reading the auth handshake. Real hub/topic dispatch lands in Plan 11.
 - `internal/grpcapi/` — mTLS gRPC server with reflection on dev/staging.
 - `internal/modules/` — `Module` interface + `Deps` struct + module registry. A stub `healthz` module demonstrates the pattern; real modules plug in via Plan 04+.
@@ -20,7 +20,10 @@
 - `go.uber.org/zap` v1.27+
 - `go.opentelemetry.io/otel` v1.27+, `go.opentelemetry.io/otel/sdk` v1.27+, `go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc` v1.27+
 - `github.com/prometheus/client_golang` v1.19+
-- `github.com/go-chi/chi/v5` v5.0+, `github.com/go-chi/chi/v5/middleware`
+- `github.com/gin-gonic/gin` v1.10+ (HTTP router, ADR-0014)
+- `github.com/gin-contrib/zap` (zap-bridge for gin Logger middleware, satisfies ADR-0012)
+- `go.uber.org/zap` v1.27+ (structured logger, ADR-0012)
+- `pkg/httputil` (gin-adapter for stdlib middleware, see Plan 00a Task 5)
 - `nhooyr.io/websocket` v1.8+
 - `google.golang.org/grpc` v1.63+
 - `github.com/redis/go-redis/v9` v9.5+
@@ -47,7 +50,7 @@ cmd/api/
 ├── main_test.go                                  # MODIFIED — covers run() and shutdown
 ├── deps.go                                       # builds the Deps struct from config + clients
 ├── deps_test.go
-├── server_http.go                                # builds *http.Server with chi router
+├── server_http.go                                # builds *http.Server with gin router
 ├── server_grpc.go                                # builds *grpc.Server with mTLS
 ├── server_ws.go                                  # /ws handler wiring
 ├── server_metrics.go                             # /metrics on :9090
@@ -101,7 +104,7 @@ internal/
 │       └── nats_test.go
 │
 ├── gateway/
-│   ├── router.go                                 # chi router builder
+│   ├── router.go                                 # gin router builder
 │   ├── router_test.go
 │   ├── context.go                                # RequestContext type + ctxKey helpers
 │   ├── context_test.go
