@@ -33,11 +33,17 @@ jobs:
         with:
           go-version: ${{ env.GO_VERSION }}
           cache: true
+      # Note: install golangci-lint via `go install` rather than the
+      # pre-built binary from golangci/golangci-lint-action@v6. The action's
+      # binary is shipped with the Go version golangci-lint was built with
+      # (Go 1.24 for v1.64.8) and physically cannot typecheck files from
+      # Go 1.26+ stdlib (e.g. fips140only_go1.26.go). Building from source
+      # against the runner's Go (env.GO_VERSION = 1.26) produces a binary
+      # whose embedded parser/typechecker matches our project's Go version.
+      - name: Install golangci-lint (built against runner Go)
+        run: go install github.com/golangci/golangci-lint/cmd/golangci-lint@${{ env.GOLANGCI_LINT_VERSION }}
       - name: Run golangci-lint
-        uses: golangci/golangci-lint-action@v6
-        with:
-          version: ${{ env.GOLANGCI_LINT_VERSION }}
-          args: --timeout 5m
+        run: golangci-lint run --timeout 5m ./...
 
   test:
     name: Test
