@@ -181,11 +181,18 @@ type BucketProvisioner interface {
 }
 
 // Aggregate exposed to other modules — saves them taking four deps.
+//
+// Note: simple embedding (`type Tenancy interface { TenantService; SettingsCache; KMSResolver; PhoneHasher }`)
+// is not Go-compilable here — `TenantService.Get(ctx, id) (Tenant, error)` and
+// `SettingsCache.Get(ctx, tenantID, key) (SettingValue, error)` collide on the
+// `Get` method name. The aggregate exposes four sub-getters instead so a
+// single concrete adapter still binds all four contracts at once. Implemented
+// in internal/tenancy/api/interfaces.go.
 type Tenancy interface {
-    TenantService
-    SettingsCache
-    KMSResolver
-    PhoneHasher
+    Tenants() TenantService
+    Settings() SettingsCache
+    KMS() KMSResolver
+    Phones() PhoneHasher
 }
 ```
 
