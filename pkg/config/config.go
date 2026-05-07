@@ -37,6 +37,7 @@ type Config struct {
 	Reports       ReportsConfig       `mapstructure:"reports"`
 	Observability ObservabilityConfig `mapstructure:"observability"`
 	Shutdown      ShutdownConfig      `mapstructure:"shutdown"`
+	Outbox        OutboxConfig        `mapstructure:"outbox"`
 }
 
 // ServiceConfig holds the cross-cutting service attributes.
@@ -74,6 +75,9 @@ func (c *Config) Validate() error {
 	}
 	if err := c.Shutdown.validate(); err != nil {
 		return fmt.Errorf("shutdown: %w", err)
+	}
+	if err := c.Outbox.validate(); err != nil {
+		return fmt.Errorf("outbox: %w", err)
 	}
 
 	// Production-only invariants: explicit DSN+secrets must come from Lockbox/ENV
@@ -189,6 +193,11 @@ func DefaultDev() Config {
 		},
 		Shutdown: ShutdownConfig{
 			GracePeriod: 15 * time.Second,
+		},
+		Outbox: OutboxConfig{
+			BatchSize: 100,
+			Tick:      1 * time.Second,
+			MaxRetry:  10,
 		},
 	}
 }

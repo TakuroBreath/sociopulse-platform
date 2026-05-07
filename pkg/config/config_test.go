@@ -41,3 +41,30 @@ func TestConfigProductionRequiresLockboxSecrets(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "production")
 }
+
+func TestOutboxDefaults(t *testing.T) {
+	t.Parallel()
+	c := DefaultDev()
+	require.NoError(t, c.Validate())
+	assert.Equal(t, 100, c.Outbox.BatchSize)
+	assert.Equal(t, time.Second, c.Outbox.Tick)
+	assert.Equal(t, 10, c.Outbox.MaxRetry)
+}
+
+func TestOutboxValidationRejectsZeroBatchSize(t *testing.T) {
+	t.Parallel()
+	c := DefaultDev()
+	c.Outbox.BatchSize = 0
+	err := c.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "batch_size")
+}
+
+func TestOutboxValidationRejectsZeroTick(t *testing.T) {
+	t.Parallel()
+	c := DefaultDev()
+	c.Outbox.Tick = 0
+	err := c.Validate()
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "tick")
+}

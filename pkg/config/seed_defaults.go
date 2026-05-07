@@ -65,4 +65,8 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("observability.logging.sample_debug_logs", c.Observability.Logging.SampleDebugLogs)
 	// shutdown
 	v.SetDefault("shutdown.grace_period", c.Shutdown.GracePeriod)
+	// outbox
+	v.SetDefault("outbox.batch_size", c.Outbox.BatchSize)
+	v.SetDefault("outbox.tick", c.Outbox.Tick)
+	v.SetDefault("outbox.max_retry", c.Outbox.MaxRetry)
 }

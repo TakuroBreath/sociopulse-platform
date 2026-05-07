@@ -152,3 +152,8 @@ observability:
 
 shutdown:
   grace_period: 15s
+
+outbox:
+  batch_size: 100
+  tick: 1s
+  max_retry: 10
