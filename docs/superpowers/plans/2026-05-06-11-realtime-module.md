@@ -6,7 +6,7 @@
 
 **Architecture:** Hub holds per-replica connections; each replica subscribes to NATS subjects under `tenant.>` once and dispatches frames to local subscribers matching topic+filter. Presence is centralized in Redis (`presence:<tenant>:user:<id>`, TTL 30s). Listen-in spawns a temporary SIP user via telephony-bridge, returns verto credentials to the admin browser, and triggers a `mixmonitor` ESL command so the listener leg receives mixed audio.
 
-**Tech Stack:** Go 1.22+, `nhooyr.io/websocket` v1.8+ (or `coder/websocket`), `nats-io/nats.go` v1.34+, `redis/go-redis/v9` v9.5+, `chi/v5`, `testify`, `gomock`, testcontainers-go.
+**Tech Stack:** Go 1.22+, `nhooyr.io/websocket` v1.8+ (or `coder/websocket`), `nats-io/nats.go` v1.34+, `redis/go-redis/v9` v9.5+, `gin-gonic/gin`, `testify`, `gomock`, testcontainers-go.
 
 **Spec sections covered:** §10 (real-time plane, full), §FR-F (admin monitoring), §10.4 (listen-in), §10.5 (backpressure).
 
@@ -2058,10 +2058,9 @@ func (a *nhooyrAdapter) RemoteAddr() string { return "" }
 package http
 
 import (
-	"encoding/json"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 )
@@ -2070,40 +2069,40 @@ type ListenHandler struct {
 	svc rtapi.ListenInService
 }
 
-func NewListenInHandler(svc rtapi.ListenInService, _ any) http.Handler {
-	r := chi.NewRouter()
+func NewListenInHandler(svc rtapi.ListenInService, requireAuth gin.HandlerFunc) func(*gin.RouterGroup) {
 	h := &ListenHandler{svc: svc}
-	r.Post("/calls/{id}/listen", h.start)
-	r.Delete("/listen-sessions/{id}", h.stop)
-	return r
+	return func(r *gin.RouterGroup) {
+		r.Use(requireAuth)
+		r.POST("/calls/:id/listen", h.start)
+		r.DELETE("/listen-sessions/:id", h.stop)
+	}
 }
 
-func (h *ListenHandler) start(w http.ResponseWriter, r *http.Request) {
-	callID := chi.URLParam(r, "id")
+func (h *ListenHandler) start(c *gin.Context) {
+	callID := c.Param("id")
 	var body struct{ Mode rtapi.ListenMode `json:"mode"` }
-	_ = json.NewDecoder(r.Body).Decode(&body)
-	claims := claimsFromRequest(r) // populated by gateway middleware
-	session, err := h.svc.Start(r.Context(), rtapi.StartListenRequest{
+	_ = c.ShouldBindJSON(&body)
+	claims := claimsFromContext(c) // populated by gateway middleware
+	session, err := h.svc.Start(c.Request.Context(), rtapi.StartListenRequest{
 		Tenant:     claims.TenantID,
 		ListenerID: claims.UserID,
 		CallID:     callID,
 		Mode:       body.Mode,
 	})
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
-	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(session)
+	c.JSON(http.StatusOK, session)
 }
 
-func (h *ListenHandler) stop(w http.ResponseWriter, r *http.Request) {
-	id := chi.URLParam(r, "id")
-	if err := h.svc.Stop(r.Context(), id); err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+func (h *ListenHandler) stop(c *gin.Context) {
+	id := c.Param("id")
+	if err := h.svc.Stop(c.Request.Context(), id); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	c.Status(http.StatusNoContent)
 }
 ```
 
@@ -2117,7 +2116,7 @@ import (
 	"encoding/json"
 	"net/http"
 
-	"github.com/go-chi/chi/v5"
+	"github.com/gin-gonic/gin"
 
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	"github.com/sociopulse/platform/internal/realtime/service"
@@ -2127,32 +2126,33 @@ type ForceHandler struct {
 	hub *service.Hub
 }
 
-func NewForceHandler(hub *service.Hub, _ any) http.Handler {
-	r := chi.NewRouter()
+func NewForceHandler(hub *service.Hub, requireAuth gin.HandlerFunc) func(*gin.RouterGroup) {
 	h := &ForceHandler{hub: hub}
-	r.Post("/operators/{id}/force-pause", h.forcePause)
-	r.Post("/operators/{id}/force-end-shift", h.forceEndShift)
-	return r
+	return func(r *gin.RouterGroup) {
+		r.Use(requireAuth)
+		r.POST("/operators/:id/force-pause", h.forcePause)
+		r.POST("/operators/:id/force-end-shift", h.forceEndShift)
+	}
 }
 
-func (h *ForceHandler) forcePause(w http.ResponseWriter, r *http.Request) {
-	opID := chi.URLParam(r, "id")
-	claims := claimsFromRequest(r)
+func (h *ForceHandler) forcePause(c *gin.Context) {
+	opID := c.Param("id")
+	claims := claimsFromContext(c)
 	payload, _ := json.Marshal(map[string]any{"action": "force-pause"})
-	h.hub.Broadcast(r.Context(), rtapi.TopicForceCommands, payload, rtapi.BroadcastFilter{TenantID: claims.TenantID, UserID: opID})
-	w.WriteHeader(http.StatusAccepted)
+	h.hub.Broadcast(c.Request.Context(), rtapi.TopicForceCommands, payload, rtapi.BroadcastFilter{TenantID: claims.TenantID, UserID: opID})
+	c.Status(http.StatusAccepted)
 }
 
-func (h *ForceHandler) forceEndShift(w http.ResponseWriter, r *http.Request) {
-	opID := chi.URLParam(r, "id")
-	claims := claimsFromRequest(r)
+func (h *ForceHandler) forceEndShift(c *gin.Context) {
+	opID := c.Param("id")
+	claims := claimsFromContext(c)
 	payload, _ := json.Marshal(map[string]any{"action": "force-end-shift"})
-	h.hub.Broadcast(r.Context(), rtapi.TopicForceCommands, payload, rtapi.BroadcastFilter{TenantID: claims.TenantID, UserID: opID})
-	w.WriteHeader(http.StatusAccepted)
+	h.hub.Broadcast(c.Request.Context(), rtapi.TopicForceCommands, payload, rtapi.BroadcastFilter{TenantID: claims.TenantID, UserID: opID})
+	c.Status(http.StatusAccepted)
 }
 ```
 
-`claimsFromRequest` is a helper from gateway middleware (Plan 02).
+`claimsFromContext` is a helper from gateway middleware (Plan 02) that extracts JWT claims from `*gin.Context`.
 
 - [ ] **Step 5: Run all tests → pass**
 
