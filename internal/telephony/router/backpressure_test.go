@@ -30,7 +30,7 @@ func TestBackpressure_TryAcquireUnderCap(t *testing.T) {
 	bp := router.NewBackpressure(rdb, 3)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		ok, err := bp.TryAcquire(ctx, "node-1")
 		require.NoError(t, err)
 		require.True(t, ok, "acquire %d/3 should succeed (cap=3)", i+1)
@@ -43,7 +43,7 @@ func TestBackpressure_RejectsAtCap(t *testing.T) {
 	bp := router.NewBackpressure(rdb, 60)
 	ctx := context.Background()
 
-	for i := 0; i < 60; i++ {
+	for i := range 60 {
 		ok, err := bp.TryAcquire(ctx, "node-1")
 		require.NoError(t, err)
 		require.True(t, ok, "acquire %d/60 should succeed", i+1)
@@ -96,7 +96,7 @@ func TestBackpressure_Release_Decrements(t *testing.T) {
 	bp := router.NewBackpressure(rdb, 5)
 	ctx := context.Background()
 
-	for i := 0; i < 3; i++ {
+	for range 3 {
 		ok, err := bp.TryAcquire(ctx, "node-1")
 		require.NoError(t, err)
 		require.True(t, ok)
@@ -148,7 +148,7 @@ func TestBackpressure_SetActiveChannels_Overwrites(t *testing.T) {
 	ctx := context.Background()
 
 	// Start with 5 acquires; counter = 5.
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		ok, err := bp.TryAcquire(ctx, "node-1")
 		require.NoError(t, err)
 		require.True(t, ok)
