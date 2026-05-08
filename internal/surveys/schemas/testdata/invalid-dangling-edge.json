@@ -1,0 +1,29 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "invalid-dangling-edge",
+    "expected_error": "edge q1.next.to references non-existent node 'q_ghost'",
+    "fails_at": "graph"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "question_type": "single",
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" }
+      ],
+      "next": [{ "to": "q_ghost" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end"
+    }
+  ]
+}

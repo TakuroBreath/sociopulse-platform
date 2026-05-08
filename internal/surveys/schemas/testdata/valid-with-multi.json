@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "primary_mode": "form",
+  "metadata": {
+    "name": "with-multi",
+    "purpose": "multi-select with three options"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q_topics" }]
+    },
+    {
+      "id": "q_topics",
+      "kind": "question",
+      "title": "Which topics matter most to you?",
+      "body": "Select up to three.",
+      "question_type": "multi",
+      "required": true,
+      "options": [
+        { "id": "economy", "label": "Economy", "value": "economy" },
+        { "id": "healthcare", "label": "Healthcare", "value": "healthcare" },
+        { "id": "education", "label": "Education", "value": "education" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end",
+      "title": "Thanks!"
+    }
+  ]
+}

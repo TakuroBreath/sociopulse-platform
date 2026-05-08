@@ -1,0 +1,67 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "vciom-electoral",
+    "purpose": "ВЦИОМ-style political survey: 6 nodes with branching and a refusal exit",
+    "language": "ru"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "intro" }]
+    },
+    {
+      "id": "intro",
+      "kind": "intro",
+      "title": "Здравствуйте!",
+      "body": "Это короткий социологический опрос. Ответы анонимны. Согласны ли Вы продолжить?",
+      "next": [
+        { "to": "q_voted", "when": "true" }
+      ]
+    },
+    {
+      "id": "q_voted",
+      "kind": "question",
+      "title": "Принимали ли Вы участие в последних выборах?",
+      "question_type": "single",
+      "required": true,
+      "options": [
+        { "id": "yes", "label": "Да", "value": "yes" },
+        { "id": "no", "label": "Нет", "value": "no" },
+        { "id": "refuse", "label": "Затрудняюсь ответить", "value": "refuse" }
+      ],
+      "next": [
+        { "to": "q_party", "when": "q_voted.value == \"yes\"" },
+        { "to": "end_refuse", "when": "q_voted.value == \"refuse\"" },
+        { "to": "end_ok" }
+      ]
+    },
+    {
+      "id": "q_party",
+      "kind": "question",
+      "title": "За кандидата какой партии Вы голосовали?",
+      "question_type": "select",
+      "required": true,
+      "options": [
+        { "id": "er", "label": "Единая Россия", "value": "er" },
+        { "id": "kprf", "label": "КПРФ", "value": "kprf" },
+        { "id": "ldpr", "label": "ЛДПР", "value": "ldpr" },
+        { "id": "sr", "label": "Справедливая Россия", "value": "sr" },
+        { "id": "other", "label": "Другая", "value": "other" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end",
+      "title": "Спасибо за участие!"
+    },
+    {
+      "id": "end_refuse",
+      "kind": "refusal-end",
+      "title": "Спасибо."
+    }
+  ]
+}

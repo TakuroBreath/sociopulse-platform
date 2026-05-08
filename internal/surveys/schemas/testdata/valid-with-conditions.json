@@ -1,0 +1,47 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "with-conditions",
+    "purpose": "branching by q1.value"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "title": "Are you a registered voter?",
+      "question_type": "single",
+      "required": true,
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" },
+        { "id": "no", "label": "No", "value": "no" }
+      ],
+      "next": [
+        { "to": "q2", "when": "q1.value == \"yes\"" },
+        { "to": "end_ok" }
+      ]
+    },
+    {
+      "id": "q2",
+      "kind": "question",
+      "title": "Did you vote in the last election?",
+      "question_type": "single",
+      "required": true,
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" },
+        { "id": "no", "label": "No", "value": "no" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end",
+      "title": "Thank you for participating!"
+    }
+  ]
+}

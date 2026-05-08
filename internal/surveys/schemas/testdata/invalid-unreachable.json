@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "invalid-unreachable",
+    "expected_error": "node q_island unreachable from start",
+    "fails_at": "graph"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "question_type": "single",
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "q_island",
+      "kind": "question",
+      "title": "I'm an unreachable island",
+      "question_type": "text",
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end"
+    }
+  ]
+}

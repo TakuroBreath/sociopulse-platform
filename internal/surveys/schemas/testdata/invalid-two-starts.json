@@ -1,0 +1,34 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "invalid-two-starts",
+    "expected_error": "two nodes with kind=start",
+    "fails_at": "graph"
+  },
+  "nodes": [
+    {
+      "id": "start_a",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "start_b",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "question_type": "single",
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end"
+    }
+  ]
+}

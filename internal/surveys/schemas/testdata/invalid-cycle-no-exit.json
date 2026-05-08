@@ -1,0 +1,38 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "invalid-cycle-no-exit",
+    "expected_error": "cycle q1 -> q2 -> q1 with no edge to an end node",
+    "fails_at": "graph"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "question_type": "single",
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" }
+      ],
+      "next": [{ "to": "q2" }]
+    },
+    {
+      "id": "q2",
+      "kind": "question",
+      "question_type": "single",
+      "options": [
+        { "id": "ok", "label": "OK", "value": "ok" }
+      ],
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end"
+    }
+  ]
+}

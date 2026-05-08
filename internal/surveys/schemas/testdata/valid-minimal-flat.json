@@ -1,0 +1,32 @@
+{
+  "version": "1.0",
+  "primary_mode": "flow",
+  "metadata": {
+    "name": "minimal-flat",
+    "purpose": "smoke-test the happy path: 3-node linear graph"
+  },
+  "nodes": [
+    {
+      "id": "start",
+      "kind": "start",
+      "next": [{ "to": "q1" }]
+    },
+    {
+      "id": "q1",
+      "kind": "question",
+      "title": "Do you support the new policy?",
+      "question_type": "single",
+      "required": true,
+      "options": [
+        { "id": "yes", "label": "Yes", "value": "yes" },
+        { "id": "no", "label": "No", "value": "no" }
+      ],
+      "next": [{ "to": "end_ok" }]
+    },
+    {
+      "id": "end_ok",
+      "kind": "success-end",
+      "title": "Thank you!"
+    }
+  ]
+}
