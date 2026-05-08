@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
-	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	"github.com/sociopulse/platform/internal/modules"
 	telephonyapi "github.com/sociopulse/platform/internal/telephony/api"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
@@ -238,12 +237,6 @@ func TestStubEventConsumerSubscribeIsNoop(t *testing.T) {
 	assert.False(t, called, "stub consumer must never invoke the handler")
 }
 
-// TestNoopAuditLogger: Write returns nil for every event.
-func TestNoopAuditLogger(t *testing.T) {
-	t.Parallel()
-	require.NoError(t, noopAuditLogger{}.Write(t.Context(), auditapi.Event{}))
-}
-
 // TestLookupTenancyMissingReturnsNil verifies that a missing locator
 // entry surfaces nil (rather than panicking).
 func TestLookupTenancyMissingReturnsNil(t *testing.T) {
@@ -324,17 +317,6 @@ func TestLookupCommandPublisherNilLocator(t *testing.T) {
 	assert.False(t, ok)
 }
 
-// TestLookupAuditLoggerWrongType: registered under the right key
-// with a non-Logger value falls back to the noop logger.
-func TestLookupAuditLoggerWrongType(t *testing.T) {
-	t.Parallel()
-	loc := modules.NewMapLocator()
-	loc.Register(locatorAuditLogger, "string is not a Logger")
-	logger := lookupAuditLogger(loc, zaptest.NewLogger(t))
-	require.NotNil(t, logger)
-	require.NoError(t, logger.Write(t.Context(), auditapi.Event{}))
-}
-
 // fakeTenancy is a minimal tenancyapi.Tenancy double — used to test
 // the locator round-trip in lookupTenancy. Every method of the four
 // embedded interfaces panics; the test only verifies the type
@@ -391,22 +373,4 @@ func TestLookupCommandPublisherWrongType(t *testing.T) {
 	loc.Register(locatorCommandPublisher, "string is not a publisher")
 	_, ok := lookupCommandPublisher(loc, zaptest.NewLogger(t))
 	assert.False(t, ok)
-}
-
-// TestLookupAuditLoggerMissing returns the noop logger so the dialer
-// boots without audit.
-func TestLookupAuditLoggerMissing(t *testing.T) {
-	t.Parallel()
-	loc := modules.NewMapLocator()
-	logger := lookupAuditLogger(loc, zaptest.NewLogger(t))
-	require.NotNil(t, logger)
-	require.NoError(t, logger.Write(t.Context(), auditapi.Event{}))
-}
-
-// TestLookupAuditLoggerNilLocatorFalsBackToNoop.
-func TestLookupAuditLoggerNilLocatorFallsBackToNoop(t *testing.T) {
-	t.Parallel()
-	logger := lookupAuditLogger(nil, zaptest.NewLogger(t))
-	require.NotNil(t, logger)
-	require.NoError(t, logger.Write(t.Context(), auditapi.Event{}))
 }

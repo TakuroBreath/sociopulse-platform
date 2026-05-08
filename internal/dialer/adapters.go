@@ -9,7 +9,6 @@ import (
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
-	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	dialerapi "github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/dialer/capacity"
 	"github.com/sociopulse/platform/internal/dialer/hours"
@@ -24,7 +23,6 @@ const (
 	locatorTenancy          = "tenancy.Tenancy"
 	locatorKMSResolver      = "tenancy.KMSResolver"
 	locatorCommandPublisher = telephonyLocatorPublisher
-	locatorAuditLogger      = "audit.Logger"
 )
 
 // telephonyLocatorPublisher mirrors telephony.LocatorCommandPublisher
@@ -186,18 +184,6 @@ func (s *stubEventConsumer) Subscribe(_ context.Context, tenantID uuid.UUID, _ t
 	return func() {}, nil
 }
 
-// noopAuditLogger is the fallback audit.Logger used when the audit
-// module hasn't registered yet. It silently drops every event so the
-// dialer module bootstraps to a working state; once a future plan
-// wires the real audit Logger this fallback is never selected.
-type noopAuditLogger struct{}
-
-// Compile-time interface check.
-var _ auditapi.Logger = noopAuditLogger{}
-
-// Write satisfies auditapi.Logger.
-func (noopAuditLogger) Write(_ context.Context, _ auditapi.Event) error { return nil }
-
 // lookupTenancy pulls the aggregate tenancy.Tenancy interface from the
 // locator. Returns nil (not error) when missing — the caller swaps in
 // the noopSettingsLookup fallback.
@@ -262,27 +248,6 @@ func lookupCommandPublisher(loc modules.ServiceLocator, log *zap.Logger) (teleph
 		return nil, false
 	}
 	return p, true
-}
-
-// lookupAuditLogger pulls audit.Logger from the locator. Mirrors the
-// fallback pattern in crm/auth/surveys: missing → noop logger + warn.
-func lookupAuditLogger(loc modules.ServiceLocator, log *zap.Logger) auditapi.Logger {
-	if loc == nil {
-		log.Warn("audit.Logger not in locator (no locator present) — using noop logger")
-		return noopAuditLogger{}
-	}
-	raw, ok := loc.Lookup(locatorAuditLogger)
-	if !ok {
-		log.Warn("audit.Logger not in locator — using noop logger")
-		return noopAuditLogger{}
-	}
-	logger, ok := raw.(auditapi.Logger)
-	if !ok {
-		log.Error("audit.Logger registered with wrong type — using noop logger",
-			zap.String("got_type", fmt.Sprintf("%T", raw)))
-		return noopAuditLogger{}
-	}
-	return logger
 }
 
 // Compile-time check that dialerapi.OperatorFSM is a strict subset of

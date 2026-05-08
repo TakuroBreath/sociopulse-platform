@@ -100,7 +100,7 @@ const (
 	locatorRBACChecker     = "auth.RBACChecker"
 	locatorClaimsValidator = "auth.ClaimsValidator"
 	// Note: locatorTenancy / locatorKMSResolver / locatorCommandPublisher
-	// / locatorAuditLogger live in adapters.go.
+	// live in adapters.go.
 )
 
 // Module is the top-level registration handle for the dialer module.
@@ -302,16 +302,17 @@ func (m *Module) Register(d modules.Deps) error {
 	if err != nil {
 		return fmt.Errorf("dialer: build heartbeat: %w", err)
 	}
-	hbCtx, hbCancel := context.WithCancel(d.Ctx)
-	if d.Ctx == nil {
-		hbCtx, hbCancel = context.WithCancel(context.Background())
+	parent := d.Ctx
+	if parent == nil {
+		parent = context.Background()
 	}
+	hbCtx, hbCancel := context.WithCancel(parent)
 	m.heartbeatStop = hbCancel
-	m.heartbeatWG.Add(1)
-	go func() {
-		defer m.heartbeatWG.Done()
+	// Go 1.25 wg.Go — replaces wg.Add(1); go func(){ defer wg.Done(); ... }()
+	// per Plan 09 carry-forward checklist #11.
+	m.heartbeatWG.Go(func() {
 		_ = hb.Run(hbCtx)
-	}()
+	})
 
 	// 11. HTTP transport. Mount only when an HTTPRouter is available
 	//     (cmd/api wires it; cmd/worker does not) and the auth deps
