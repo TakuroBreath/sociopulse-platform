@@ -3,6 +3,7 @@ package esl
 import (
 	"context"
 	"fmt"
+	"maps"
 	"sort"
 	"strings"
 	"time"
@@ -275,9 +276,7 @@ func splitOKBody(s string) (bool, string) {
 // treats both as control characters within the prefix.
 func buildVariables(req OriginateRequest) string {
 	vars := make(map[string]string, len(req.Variables)+3)
-	for k, v := range req.Variables {
-		vars[k] = v
-	}
+	maps.Copy(vars, req.Variables)
 	if req.Caller != "" {
 		vars["origination_caller_id_number"] = req.Caller
 	}
