@@ -18,8 +18,8 @@ type Metrics struct {
 
 	// PublishLatency observes the wall-clock duration of synchronous
 	// PublishMsg calls (broker round-trip including ack). Buckets are
-	// the Prometheus default; production typically sees p99 under
-	// 50ms for healthy clusters.
+	// tuned for healthy-cluster p99 under 50ms; the long tail (1s+)
+	// is captured for outlier alerting.
 	PublishLatency prometheus.Histogram
 
 	// SubscribeMessageTotal counts inbound JetStream messages by ack
@@ -57,9 +57,18 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 		),
 		PublishLatency: prometheus.NewHistogram(
 			prometheus.HistogramOpts{
-				Name:    "eventbus_publish_latency_seconds",
-				Help:    "Synchronous JetStream publish latency in seconds (broker ack round-trip).",
-				Buckets: prometheus.DefBuckets,
+				Name: "eventbus_publish_latency_seconds",
+				Help: "Synchronous JetStream publish latency in seconds (broker ack round-trip).",
+				// Buckets aligned to a healthy-cluster p99 < 50ms
+				// expectation, with a tail out to 5s for outlier
+				// alerting. The default DefBuckets [.005..10] spends
+				// most of its resolution above 100ms, where almost
+				// no real publish samples land.
+				Buckets: []float64{
+					0.0005, 0.001, 0.0025, 0.005,
+					0.01, 0.025, 0.05, 0.1,
+					0.25, 0.5, 1, 2.5, 5,
+				},
 			},
 		),
 		SubscribeMessageTotal: prometheus.NewCounterVec(

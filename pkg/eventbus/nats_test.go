@@ -616,15 +616,12 @@ func TestNewNATSPublisher_AccountAuth(t *testing.T) {
 	require.NoError(t, pub.Close())
 }
 
-// TestDialNATS_DirectClosedClosesNc covers the waitForConnected
-// "CLOSED before CONNECTED" branch by running dialNATS against a
-// running embedded server and then immediately shutting the server
-// down so the client transitions to CLOSED while we're still
-// waiting.
-//
-// This branch is unlikely in production (servers don't go away in
-// the millisecond between Connect and waitForConnected) but the
-// guarded code path needs coverage.
+// TestDialNATS_AccountAuthSucceeds is a smoke test that dialNATS
+// accepts a non-empty account argument and the resulting connection
+// reaches CONNECTED against an embedded server. The embedded server
+// runs without auth, so any account string is accepted; the point is
+// to exercise the nats.UserInfo-bearing branch in dialNATS without
+// erroring at registration time.
 func TestDialNATS_AccountAuthSucceeds(t *testing.T) {
 	t.Parallel()
 	url := startEmbeddedJetStream(t)
@@ -655,15 +652,13 @@ func TestSubscribe_RaceWithClose(t *testing.T) {
 	// ErrClosed.
 	var wg sync.WaitGroup
 	for i := range 5 {
-		wg.Add(1)
-		go func(n int) {
-			defer wg.Done()
+		wg.Go(func() {
 			_ = sub.Subscribe(t.Context(),
-				fmt.Sprintf("race.event-%d", n),
-				fmt.Sprintf("race-q-%d", n),
+				fmt.Sprintf("race.event-%d", i),
+				fmt.Sprintf("race-q-%d", i),
 				func(_ string, _ []byte) error { return nil },
 			)
-		}(i)
+		})
 	}
 
 	// Race: while subscribers are still registering, close.
@@ -794,10 +789,3 @@ func TestWaitForConnected_AlreadyClosed(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "connection closed before reaching CONNECTED")
 }
-
-// silence unused if subsequent tests don't import these.
-var _ atomic.Int32
-var _ = context.Background
-var _ = errors.New
-var _ = prometheus.NewRegistry
-var _ = zaptest.NewLogger
