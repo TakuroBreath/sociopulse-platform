@@ -32,6 +32,22 @@ type Evaluator interface {
 	// Returns nil on acceptance, or an error wrapping [ErrDSLParse] on
 	// rejection so callers can errors.Is(err, ErrDSLParse).
 	ParseAndCheck(ctx context.Context, expression string, allowedIdents []string) error
+
+	// Eval compiles (with cache) and runs expression against env. The
+	// result is typed `any` because the DSL's grammar admits bool /
+	// number / string predicates; callers that want a strict bool
+	// should type-assert and treat a non-bool as an `ErrDSLEval`.
+	//
+	// Returns:
+	//   - ErrDSLParse  — expression failed to parse or violated whitelist
+	//   - ErrDSLEval   — runtime failure (undefined identifier, type
+	//                    error, division-by-zero, etc.)
+	//   - context error — caller-cancelled before compile
+	//
+	// The stub returns ErrDSLEval immediately so callers can wire
+	// against Evaluator without depending on RealEvaluator. Runtime
+	// (Plan 07 Task 5) plugs in RealEvaluator through this seam.
+	Eval(ctx context.Context, expression string, env map[string]any) (any, error)
 }
 
 // StubEvaluator is the placeholder Plan 07 Task 2 ships. It accepts any
@@ -86,4 +102,17 @@ func (StubEvaluator) ParseAndCheck(ctx context.Context, expression string, _ []s
 		return fmt.Errorf("%w: unmatched '('", ErrDSLParse)
 	}
 	return nil
+}
+
+// Eval is the stub's no-op runtime — it always reports the expression
+// as un-evaluable. Tests that only care about ParseAndCheck (the
+// schemavalidator path) wire StubEvaluator without ever calling Eval;
+// Runtime (Plan 07 Task 5) wires RealEvaluator and gets a real
+// implementation. Returning ErrDSLEval here keeps the contract clear
+// rather than silently no-opping with a default-zero value.
+func (StubEvaluator) Eval(ctx context.Context, _ string, _ map[string]any) (any, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("dsl: %w", err)
+	}
+	return nil, fmt.Errorf("%w: stub evaluator does not run expressions; wire RealEvaluator", ErrDSLEval)
 }
