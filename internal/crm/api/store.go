@@ -78,6 +78,41 @@ type ProjectStorePort interface {
 	ListMembers(ctx context.Context, tx postgres.Tx, projectID uuid.UUID) ([]ProjectMember, error)
 }
 
+// RespondentStorePort is the persistence contract crm/service consumes
+// for respondents rows. Mirrors ProjectStorePort: every method accepts
+// a postgres.Tx so the service layer co-locates the row write with
+// audit, DNC checks, and any future outbox row in the same transaction.
+//
+// Cross-module callers MUST import from internal/crm/api only —
+// depguard's module-boundaries rule rejects any direct import of
+// internal/crm/store from other modules.
+type RespondentStorePort interface {
+	// Insert writes a fresh respondents row. The supplied
+	// Respondent.ID may be uuid.Nil; the store relies on the column
+	// DEFAULT to mint a fresh id and returns the row populated with
+	// id+timestamp. Returns ErrDuplicateRespondent on the
+	// (tenant_id, project_id, phone_hash) unique-constraint violation
+	// (000006_respondents_uniq.up.sql).
+	Insert(ctx context.Context, tx postgres.Tx, r Respondent) (Respondent, error)
+
+	// GetByID returns the respondent with the supplied id. Returns
+	// ErrRespondentNotFound when the row is absent or RLS hides it.
+	GetByID(ctx context.Context, tx postgres.Tx, id uuid.UUID) (Respondent, error)
+
+	// GetByHash returns the respondent matching (tenantID, projectID,
+	// phoneHash). Returns ErrRespondentNotFound when no row matches.
+	// Used by Create to short-circuit the unique-constraint round-trip
+	// with a friendlier error path; the unique constraint remains the
+	// authoritative dup detector.
+	GetByHash(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, phoneHash []byte) (Respondent, error)
+
+	// IsBlockedDNC reports whether phoneHash appears in project_dnc for
+	// the supplied (tenantID, projectID) — counting both project-scoped
+	// entries and tenant-wide entries (project_id IS NULL). Pure read;
+	// no audit row, no event publish.
+	IsBlockedDNC(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, phoneHash []byte) (bool, error)
+}
+
 // UpdatePatch carries the partial-update fields for ProjectStorePort.Update.
 // Pointer-typed fields denote "leave unchanged when nil"; the store renders
 // each field via COALESCE($n, col) so the SQL stays one round-trip.
