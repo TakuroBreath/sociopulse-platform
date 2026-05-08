@@ -139,17 +139,16 @@ func TestIntegration_PgLeader_OnlyOneAcquires(t *testing.T) {
 	}
 	results := make(chan result, 2)
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	// Go 1.25 wg.Go — replaces wg.Add(1); go func(){ defer wg.Done(); ... }()
+	// per Plan 09 carry-forward checklist #11.
+	wg.Go(func() {
 		ok, err := a.Acquire(ctx)
 		results <- result{owner: "a", ok: ok, err: err}
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		ok, err := b.Acquire(ctx)
 		results <- result{owner: "b", ok: ok, err: err}
-	}()
+	})
 	wg.Wait()
 	close(results)
 

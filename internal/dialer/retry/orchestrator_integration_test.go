@@ -310,15 +310,14 @@ func TestIntegration_Orchestrator_TwoInstancesElectLeader(t *testing.T) {
 	doneA := make(chan error, 1)
 	doneB := make(chan error, 1)
 	var wg sync.WaitGroup
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
+	// Go 1.25 wg.Go — replaces wg.Add(1); go func(){ defer wg.Done(); ... }()
+	// per Plan 09 carry-forward checklist #11.
+	wg.Go(func() {
 		doneA <- oA.Run(ctxA)
-	}()
-	go func() {
-		defer wg.Done()
+	})
+	wg.Go(func() {
 		doneB <- oB.Run(ctxB)
-	}()
+	})
 
 	// Wait for exactly ONE instance to report leader_active=1.
 	require.Eventually(t, func() bool {
