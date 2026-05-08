@@ -50,7 +50,7 @@ Each file follows this structure:
 | Plan 07 — surveys | **shipped (v0.0.9)** | [`plan-07-surveys.md`](plan-07-surveys.md) |
 | Plan 08 — FreeSWITCH cluster | TBD (sociopulse-infra repo) | — |
 | Plan 09 — telephony-bridge | **shipped (v0.0.10)** | [`plan-09-telephony-bridge.md`](plan-09-telephony-bridge.md) |
-| Plan 10 — dialer | TBD | — |
+| Plan 10 — dialer | **shipped (v0.0.11)** | [`plan-10-dialer.md`](plan-10-dialer.md) |
 | Plan 11 — realtime | TBD | — |
 | Plan 12 — recording | TBD | — |
 | Plan 13 — analytics+reports | TBD | — |

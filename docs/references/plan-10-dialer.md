@@ -2,7 +2,7 @@
 
 > **Goal**: snap the dialer module (OperatorFSM + CallQueue + RDD + Router + Capacity + Hours + Retry + HTTP/WS + Module composition) to authoritative external sources, so subagents stop re-deriving canonical patterns. Loaded into every implementer prompt at dispatch time.
 
-**Status**: in-progress, next after Plan 09 (`v0.0.10-telephony-bridge`).
+**Status**: **shipped at `v0.0.11-dialer`** (Plan 10, commits `7429d83`..`34edd0e`).
 
 **Carry-over note**: `internal/dialer/api/` (DTOs + interfaces + sentinel errors + NATS subjects) was completed by Plan 00a — Task 1 in plan 10 is mostly verifying + adding `doc.go`/FSM-diagram. The bulk of work is Tasks 2–10.
 
@@ -100,6 +100,60 @@ When dispatching an implementer for any Plan 10 task:
 
 ---
 
-## Lessons learned (filled at close-out)
+## Lessons learned (Plan 10 close-out, v0.0.11-dialer)
 
-_TBD — populate at v0.0.11 tag time with what we actually had to work around._
+The pipeline shipped 10 tasks across 16 commits + 1 final tag. Reviewers caught 7 issues (1 critical, 4 important, 6 minor) before merge — keep the two-stage review pattern. Below are the patterns and gotchas worth carrying into Plans 11–14.
+
+1. **api/ contracts pre-existed from Plan 00a.** Task 1 was a simple wrap-up: `doc.go` with the FSM ASCII diagram + `State.Valid()/Event.Valid()` helpers. Saved a full implementer dispatch — the existing surface was already complete. Always verify what the architecture-foundation plan already shipped before re-implementing.
+
+2. **`var _ api.X = (*Impl)(nil)` compile-time check** at the top of every implementation file. Drift on the api side surfaces at compile, not 3 layers deep into a sweep.
+
+3. **Sentinel errors aliased across api↔internal boundaries.** Plan 09 caught `var ErrXxx = errors.New(...)` shadowing in router; here the FSM had to expose `api.ErrConflict` so callers could `errors.Is` for retry. Pattern: `var ErrXxx = api.ErrXxx` in implementations OR wrap `errVersionMismatch = fmt.Errorf("...: %w", api.ErrConflict)`.
+
+4. **CRM persist + queue enqueue + dedup.Mark ordering bug (Critical, Task 4).** The implementer originally wrote `Create → Enqueue → Mark`. If Create succeeded and Enqueue failed, the respondent leaked: in DB but not in queue, never marked, so next Generate run re-rolled the same phone, hit `ErrDuplicateRespondent`, and orphaned the original silently. Fixed to `Mark → Create → Enqueue` with documented contract: dedup is the source-of-truth for "already handled this phone in this round"; mark stays on Create errors so the run doesn't loop.
+
+5. **`redis.NewScript(luaContent)` only — never raw `EVAL`.** Six Lua scripts shipped across this plan (FSM transition, FSM start_shift, queue enqueue/pop_next/requeue/remove, RDD leak_bucket, RDD dedup_mark). Every one uses `redis.NewScript(...)` so go-redis caches SHA1 and uses EVALSHA on the hot path.
+
+6. **ChaCha8 seed entropy: 32 bytes, not 8 (Important, Task 4).** `crypto/rand.Read(seed[:])` with a `time.Now()+counter+PID` fallback. Two Generators booted in the same nanosecond would otherwise produce identical sequences.
+
+7. **Postgres advisory lock leader election (Task 8): `pg_try_advisory_lock` (non-blocking), NOT `pg_advisory_lock` (blocking).** The blocking variant queues a worker behind the existing leader; on session crash that variant deadlocks. The try-variant + a dedicated long-lived connection (via the new `pkg/postgres.LongLivedAcquire`) gives auto-release on session disconnect — the killer feature for crash recovery.
+
+8. **Phone re-decryption for retry path (Task 8): inject `Decryptor` port; production wires `tenancy.KMSResolver`.** Tests use a passthrough fake. Don't lift the encryption boundary into the orchestrator — keep it as a small interface seam.
+
+9. **Tenant-scoped Bloom + Redis SET, NOT project-scope (Task 4 deviation).** Plan body said project-scope Bloom. Implementer chose tenant-scope to keep Bloom + SET scopes consistent — a project-scope Bloom miss + tenant-scope SET hit produces a false-negative in the pre-filter. Documented deviation; production is correct. Plan body wording should be reconciled in a future revision.
+
+10. **Bloom not concurrent-safe (`bits-and-blooms/bloom/v3`) — wrapped in `lockedFilter` mutex.** Discovered via `-race` during integration testing. No upstream fix to track.
+
+11. **Per-package Prometheus metric injection via `RegisterMetrics(reg prometheus.Registerer)` — never `init()`-time `MustRegister`.** Repeated 9 times across this plan. Pattern: nil-tolerated `observeXxx` helpers + panic-on-nil registerer at boot.
+
+12. **`ForceReason` typed enum with `Valid()` to bound Prometheus label cardinality (Important, Task 2 fix-up).** Free-form supervisor strings would explode `dialer_fsm_force_total{reason}` cardinality. Pattern: define typed enum + Valid set; normalize unknown to `ForceReasonOther` before metric emission.
+
+13. **Two-stage review caught 7 issues across 10 tasks**: 1 critical (CRM ordering), 4 important (ChaCha seed, ErrConflict, Force reason cardinality, Requeue priority+1), 6 minor (modernize/style). The pattern works.
+
+14. **Build-tag false alarms from gopls cache** are a recurring noise source (`No packages found for open file ... build tags`). Always reality-check with direct `go test -tags=integration ...` before triggering a fix-up cycle.
+
+15. **`unusedfunc` false alarms from gopls** when a const/method is used only in a test file — gopls scopes its analysis without the test files in some cases. Always grep the production usage; if real, fix; if cache, ignore.
+
+16. **`time/tzdata` blank-import in `pkg/regions/regions.go`** so `Asia/Kamchatka`, `Asia/Vladivostok`, etc. resolve on `FROM scratch` images. Without it, `time.LoadLocation` panics in production.
+
+17. **`coder/websocket` (formerly nhooyr) over `gorilla/websocket`** for the WebSocket handler — actively maintained, ctx-aware API, cleaner Close semantics. Single dependency added: `github.com/coder/websocket v1.8.14`.
+
+18. **Heartbeat watchdog (Task 2c, folded into Task 10) is intentionally minimal for v1**: SCAN `op:*:user:*` every 30s; missing presence + non-offline state → Force(StateOffline, ForceReasonHeartbeatLost). The presence-key REFRESH from HTTP middleware is exported as `RefreshPresence` but **not yet wired** into the gin handlers — operators that go offline ungracefully still get caught; graceful exits via EndShift bypass the watchdog. Wiring presence-on-every-request is a v1.1 follow-up.
+
+19. **Module composition root pattern** (`internal/dialer/module.go`) graceful-degrades on missing locator entries. Stub fallbacks for `telephony.Pool`/`telephony.Backpressure`/`telephony.EventConsumer` log a Warn and continue — cmd/api boots even when telephony is misconfigured. Prevents fatal-on-boot for tests and dev environments.
+
+20. **Carry-overs to Plans 11/12/13/14**:
+    - Plan 11 (realtime): swap in-memory `PubSub` for NATS-backed fan-out. Wire `nats_bridge` real subjects so `Router.Subscribe` actually receives events. Wire `RefreshPresence` into HTTP middleware.
+    - Plan 12 (recording): KMSResolver flows for the recording-encrypted-DEK path.
+    - Plan 13/14 (analytics + billing): SubmitStatus path consumes `retry.Apply` → translates dispositions into `next_attempt_at` writes (currently the Apply function is shipped but no production caller wires it; the orchestrator side reads `next_attempt_at` set by SubmitStatus, but SubmitStatus today doesn't apply the retry rules — it only changes FSM state and submits the row).
+    - Plan 13 also expands `pkg/regions/configs/regions.yaml` from 21 → all 89 RU subjects.
+
+## Open carry-overs (deferred to Plans 11+)
+
+- `RefreshPresence` not wired into HTTP middleware (Plan 11).
+- SubmitStatus → status_rules.Apply not wired (Plan 13/14 retry path).
+- Real NATS-backed PubSub fan-out (Plan 11).
+- Real telephony EventConsumer (Plan 11 nats_bridge).
+- 89-region YAML expansion (Plan 13).
+- Real-Redis 100k RDD generation benchmark (Plan 13 perf gate).
+- `pgxpool.Conn` exposure: kept inside `pkg/postgres.Conn` wrapper. If a future task needs raw pgx access, gate it via build tag rather than widening the wrapper.
