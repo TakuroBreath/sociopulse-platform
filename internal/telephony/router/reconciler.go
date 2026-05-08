@@ -187,14 +187,18 @@ func (r *Reconciler) Sweep(ctx context.Context) {
 // stays linear and so test-side fault injection can target one node
 // without iterating through the whole fleet.
 //
-// Bounded ctx is created and cancelled per-node so the cancel func is
-// not deferred inside a for-loop (which would only fire when sweep
-// returned, accumulating CancelFunc closures for every node — a slow
-// drip leak under high node counts).
+// Bounded ctx scoped to this function (defer cancel) — sweepNode is
+// itself the loop body, so the defer fires on each call's return, not
+// on the outer Sweep return. This is panic-safe: if r.fs.ActiveChannels
+// panics, cancel still runs, no timer leak.
+//
+// Note: bp.Get / bp.SetActiveChannels run on the unbounded parent ctx —
+// the 3 s deadline targets the slow FS path specifically, not the
+// fast Redis ops.
 func (r *Reconciler) sweepNode(parent context.Context, node string) {
 	nctx, cancel := context.WithTimeout(parent, reconcilerSweepTimeout)
+	defer cancel()
 	truth, err := r.fs.ActiveChannels(nctx, node)
-	cancel()
 	if err != nil {
 		r.log.Warn("reconciler: fs counter fetch failed",
 			zap.String("node", node), zap.Error(err))
