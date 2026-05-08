@@ -2,9 +2,13 @@ package realtime_test
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
+	"net/netip"
 	"testing"
 
 	"github.com/alicebob/miniredis/v2"
+	"github.com/gin-gonic/gin"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
@@ -12,6 +16,7 @@ import (
 	"go.uber.org/goleak"
 	"go.uber.org/zap/zaptest"
 
+	authapi "github.com/sociopulse/platform/internal/auth/api"
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/internal/realtime"
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
@@ -301,4 +306,140 @@ func TestModule_RegisterPresenceMetricsLandOnSharedRegistry(t *testing.T) {
 
 	var arErr prometheus.AlreadyRegisteredError
 	require.ErrorAs(t, err, &arErr)
+}
+
+// stubAuthenticator satisfies authapi.Authenticator. Used by the
+// HTTP-mount tests that verify the locator-driven wiring picks up the
+// auth module's interfaces. ValidateAccessToken is the only method
+// the realtime adapter ever calls; the rest panic so a regression
+// surfaces immediately.
+type stubAuthenticator struct {
+	claims authapi.Claims
+}
+
+func (s stubAuthenticator) ValidateAccessToken(_ context.Context, _ string) (authapi.Claims, error) {
+	return s.claims, nil
+}
+
+func (stubAuthenticator) Login(context.Context, authapi.LoginInput) (authapi.AuthResult, error) {
+	panic("stubAuthenticator.Login: not used")
+}
+
+func (stubAuthenticator) LoginTOTP(context.Context, authapi.LoginTOTPInput) (authapi.AuthResult, error) {
+	panic("stubAuthenticator.LoginTOTP: not used")
+}
+
+func (stubAuthenticator) Refresh(context.Context, string, netip.Addr) (authapi.AuthResult, error) {
+	panic("stubAuthenticator.Refresh: not used")
+}
+
+func (stubAuthenticator) Logout(context.Context, string) error {
+	panic("stubAuthenticator.Logout: not used")
+}
+
+// stubClaimsValidator satisfies authapi.ClaimsValidator. Returns canned
+// Claims for any token.
+type stubClaimsValidator struct {
+	claims authapi.Claims
+}
+
+func (s stubClaimsValidator) Validate(_ context.Context, _ string) (authapi.Claims, error) {
+	return s.claims, nil
+}
+
+// withAuthLocator pre-populates the locator with the auth module's
+// interfaces so the realtime HTTP transport mount can find them.
+func withAuthLocator(loc modules.ServiceLocator) {
+	loc.Register("auth.Authenticator", authapi.Authenticator(stubAuthenticator{}))
+	loc.Register("auth.ClaimsValidator", authapi.ClaimsValidator(stubClaimsValidator{}))
+}
+
+// TestModule_RegisterMountsHTTPWhenRouterAndAuthAvailable verifies the
+// Plan 11 Task 7 wiring: when Deps.HTTPRouter is non-nil AND the auth
+// module's interfaces are present in the locator, Register mounts
+// /api/realtime/* on the router. We probe one of the listen-in stubs
+// (well-defined 503 response) to verify the mount.
+func TestModule_RegisterMountsHTTPWhenRouterAndAuthAvailable(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	mod := newModule()
+	deps := newDeps(t)
+	deps.HTTPRouter = r
+	withAuthLocator(deps.Locator)
+
+	require.NoError(t, mod.Register(deps))
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/realtime/calls/00000000-0000-0000-0000-000000000000/listen", nil)
+	req.Header.Set("Authorization", "Bearer tok")
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+
+	// Listen-in stub returns 503 — the mount succeeded.
+	assert.Equal(t, http.StatusServiceUnavailable, rr.Code,
+		"expected 503 from listen-in stub; got %d body=%s", rr.Code, rr.Body.String())
+}
+
+// TestModule_RegisterSkipsHTTPWhenAuthMissing verifies the degraded
+// path: a non-nil HTTPRouter but missing auth.Authenticator results in
+// a WARN log + no routes mounted (404 on every realtime path).
+func TestModule_RegisterSkipsHTTPWhenAuthMissing(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	mod := newModule()
+	deps := newDeps(t)
+	deps.HTTPRouter = r
+	// Do NOT register auth.Authenticator — Register must skip the mount.
+
+	require.NoError(t, mod.Register(deps))
+
+	req := httptest.NewRequest(http.MethodPost,
+		"/api/realtime/calls/x/listen", nil)
+	rr := httptest.NewRecorder()
+	r.ServeHTTP(rr, req)
+	assert.Equal(t, http.StatusNotFound, rr.Code,
+		"realtime routes must NOT mount when auth.Authenticator is missing")
+}
+
+// TestModule_RegisterSkipsHTTPWhenRouterNil verifies the no-router
+// degraded path: Register completes without panicking and the locator
+// stash still works.
+func TestModule_RegisterSkipsHTTPWhenRouterNil(t *testing.T) {
+	t.Parallel()
+
+	mod := newModule()
+	deps := newDeps(t)
+	require.Nil(t, deps.HTTPRouter)
+	withAuthLocator(deps.Locator) // would mount if router were available
+
+	require.NoError(t, mod.Register(deps))
+
+	// Hub still in locator.
+	_, ok := deps.Locator.Lookup(rtapi.LocatorHub)
+	assert.True(t, ok)
+}
+
+// TestModule_RegisterRejectsWrongAuthType verifies a contradiction at
+// the locator (someone registered auth.Authenticator with the wrong
+// type) surfaces as a Register error so cmd/api boot fails loudly.
+func TestModule_RegisterRejectsWrongAuthType(t *testing.T) {
+	t.Parallel()
+
+	gin.SetMode(gin.TestMode)
+	r := gin.New()
+
+	mod := newModule()
+	deps := newDeps(t)
+	deps.HTTPRouter = r
+	deps.Locator.Register("auth.Authenticator", "not-an-authenticator")
+
+	err := mod.Register(deps)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "wrong type")
 }

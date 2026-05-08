@@ -43,15 +43,30 @@ package realtime
 
 import (
 	"errors"
+	"fmt"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 
+	authapi "github.com/sociopulse/platform/internal/auth/api"
 	"github.com/sociopulse/platform/internal/modules"
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	"github.com/sociopulse/platform/internal/realtime/service"
+	transporthttp "github.com/sociopulse/platform/internal/realtime/transport/http"
 )
+
+// locatorAuthAuthenticator is the locator key the auth module
+// registers its Authenticator implementation under. Mirrored here
+// (rather than imported from internal/auth/module.go) to keep the
+// realtime module's compile-time deps minimal — module.go for auth
+// pulls in the entire auth/service stack.
+const locatorAuthAuthenticator = "auth.Authenticator"
+
+// locatorAuthClaimsValidator is the locator key for the auth module's
+// ClaimsValidator. Same rationale as locatorAuthAuthenticator.
+const locatorAuthClaimsValidator = "auth.ClaimsValidator"
 
 // Config groups the construction-time parameters that don't fit on
 // modules.Deps. Today only the Prometheus registerer goes through
@@ -81,6 +96,7 @@ type Module struct {
 	logger     *zap.Logger
 	hub        *service.Hub
 	presence   *service.RedisPresenceTracker
+	replicaID  string
 	registered bool
 	stopped    bool
 }
@@ -188,6 +204,22 @@ func (m *Module) Register(d modules.Deps) error {
 		logger.Info("realtime: presence tracker skipped (Redis unavailable)")
 	}
 
+	// Plan 11 Task 7: HTTP transport (WebSocket + force-action +
+	// listen-in stubs). Mounted only when both the HTTP router AND
+	// the auth module's Authenticator + ClaimsValidator have already
+	// been registered in the locator. Auth registers itself BEFORE
+	// realtime in cmd/api's Registry order, so the lookup should
+	// always succeed in production; in degraded test boots we log a
+	// warn and continue without the routes.
+	m.replicaID = uuid.NewString()
+	if err := m.mountHTTP(d, logger); err != nil {
+		// mountHTTP returns nil on missing-but-tolerated
+		// preconditions and an error only on a wiring contradiction
+		// (e.g. auth lookup returned the wrong type). Surface to
+		// cmd/api so the boot fails loudly.
+		return err
+	}
+
 	m.registered = true
 
 	logger.Info("realtime module registered (Plan 11 Task 4c+5)",
@@ -223,6 +255,76 @@ func (m *Module) Stop() error {
 	if logger != nil {
 		logger.Info("realtime module stopped")
 	}
+	return nil
+}
+
+// mountHTTP wires the HTTP transport on Deps.HTTPRouter when both the
+// router AND the auth module's interfaces are present in the locator.
+//
+// The function is intentionally lenient on missing preconditions: a
+// nil HTTPRouter, a missing Authenticator, or a missing
+// ClaimsValidator produces a single WARN log and skips the mount. Any
+// of those reflect a degraded test/boot mode, not a misconfiguration
+// worth aborting registration over.
+//
+// The function ONLY returns an error when the locator entries exist
+// but hold the wrong type — that's a contradiction (somebody
+// registered "auth.Authenticator" with a non-Authenticator value) and
+// surfacing it as a boot failure is the right behaviour.
+func (m *Module) mountHTTP(d modules.Deps, logger *zap.Logger) error {
+	if d.HTTPRouter == nil {
+		logger.Info("realtime: HTTP transport skipped (HTTPRouter unavailable)")
+		return nil
+	}
+
+	authRaw, ok := d.Locator.Lookup(locatorAuthAuthenticator)
+	if !ok {
+		logger.Warn("realtime: HTTP transport skipped — auth.Authenticator not in locator",
+			zap.String("locator_key", locatorAuthAuthenticator),
+		)
+		return nil
+	}
+	authenticator, ok := authRaw.(authapi.Authenticator)
+	if !ok {
+		return fmt.Errorf("realtime: %s registered with wrong type %T",
+			locatorAuthAuthenticator, authRaw)
+	}
+
+	cvRaw, ok := d.Locator.Lookup(locatorAuthClaimsValidator)
+	if !ok {
+		logger.Warn("realtime: HTTP transport skipped — auth.ClaimsValidator not in locator",
+			zap.String("locator_key", locatorAuthClaimsValidator),
+		)
+		return nil
+	}
+	claimsValidator, ok := cvRaw.(authapi.ClaimsValidator)
+	if !ok {
+		return fmt.Errorf("realtime: %s registered with wrong type %T",
+			locatorAuthClaimsValidator, cvRaw)
+	}
+
+	connMetricsRaw, _ := d.Locator.Lookup(rtapi.LocatorConnectionMetrics)
+	connMetrics, _ := connMetricsRaw.(*service.Metrics)
+
+	var presence rtapi.PresenceTracker
+	if m.presence != nil {
+		presence = m.presence
+	}
+
+	transporthttp.Mount(d.HTTPRouter.Group("/api/realtime"), transporthttp.Deps{
+		Hub:             m.hub,
+		AuthValidator:   transporthttp.NewAuthValidator(authenticator),
+		ClaimsValidator: claimsValidator,
+		ConnMetrics:     connMetrics,
+		Presence:        presence,
+		ReplicaID:       m.replicaID,
+		Logger:          logger,
+	})
+
+	logger.Info("realtime: HTTP transport mounted",
+		zap.String("replica_id", m.replicaID),
+		zap.Bool("presence_wired", presence != nil),
+	)
 	return nil
 }
 
