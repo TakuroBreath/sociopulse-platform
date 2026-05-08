@@ -22,12 +22,20 @@ type Metrics struct {
 
 // Result label constants — typed strings prevent typos at the call site
 // and bound the cardinality of [Metrics.Generated].
+//
+// resultEnqueueFailed marks the worst failure mode in the pipeline: the
+// respondent was successfully persisted to Postgres via CRM, but the
+// subsequent EnqueueRespondent call failed (Redis flap, ctx cancel).
+// The respondent is orphaned in DB without a queue entry — a reaper or
+// manual re-enqueue is required. Tracking it as a distinct metric so
+// alerts fire before the orphan count piles up.
 const (
-	resultOK        = "ok"
-	resultDuplicate = "duplicate"
-	resultDNC       = "dnc"
-	resultInvalid   = "invalid"
-	resultThrottled = "throttled"
+	resultOK            = "ok"
+	resultDuplicate     = "duplicate"
+	resultDNC           = "dnc"
+	resultInvalid       = "invalid"
+	resultThrottled     = "throttled"
+	resultEnqueueFailed = "enqueue_failed_post_persist"
 )
 
 // RegisterMetrics builds a fresh *Metrics and registers every collector

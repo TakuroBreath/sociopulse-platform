@@ -180,6 +180,26 @@ func TestDedup_FilterForConcurrent(t *testing.T) {
 	}
 }
 
+// TestDedup_MarkNReturnsAddCount — MarkN propagates the SADD count
+// from the Lua script. First mark of a fresh phone returns 1; second
+// mark of the same phone returns 0 (set membership is idempotent).
+// This pins the Lua-script return-value contract.
+func TestDedup_MarkNReturnsAddCount(t *testing.T) {
+	t.Parallel()
+	d, _ := newDedupFixture(t)
+	tenantID := uuid.New()
+	ctx := context.Background()
+	phone := "+79161234567"
+
+	added, err := d.MarkN(ctx, tenantID, phone)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, added, "first mark of a fresh phone must add 1 member")
+
+	added, err = d.MarkN(ctx, tenantID, phone)
+	require.NoError(t, err)
+	require.EqualValues(t, 0, added, "re-mark of an existing phone must add 0 (SADD-skip)")
+}
+
 // TestDedup_BloomBootstrapFromRedis — a fresh Generator process /
 // fresh Dedup that points at an existing Redis SET pre-loads the
 // in-memory Bloom from the SET so the Seen short-circuit honours

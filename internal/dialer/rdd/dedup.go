@@ -2,8 +2,9 @@ package rdd
 
 import (
 	"context"
-	"errors"
+	_ "embed"
 	"fmt"
+	"strconv"
 	"sync"
 	"time"
 
@@ -11,6 +12,23 @@ import (
 	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 )
+
+// dedupMarkLua is the canonical SADD+EXPIRE script for the dedup tier.
+// Atomic across the SADD-then-EXPIRE pair (one RTT instead of two via
+// MULTI/EXEC) and shares the SHA1 cache across Generator instances
+// within one process. Plan 09 lesson #1 / Plan 10 references — never
+// raw EVAL.
+//
+// KEYS[1] = "rdd:seen:<tenant_id>"
+// ARGV[1..N-1] = phone members (one or more E.164 strings)
+// ARGV[N]      = ttl seconds
+//
+// Returns the SADD count (new members added).
+//
+//go:embed lua/dedup_mark.lua
+var dedupMarkLua string
+
+var dedupMarkScript = redis.NewScript(dedupMarkLua)
 
 // Dedup is a two-tier deduplicator for RDD-generated phones. The Bloom
 // filter is the cheap pre-filter (tenant-scope, in-process, lazily
@@ -189,32 +207,52 @@ func (d *Dedup) Seen(ctx context.Context, tenantID, _ uuid.UUID, phone string) (
 
 // Mark records the phone as seen in BOTH tiers. The Bloom write is
 // strictly local (no I/O once bootstrapped); the SET write hits Redis
-// with EXPIRE applied as a refresh. The order matters: we Add to Bloom
-// first (cheap, can't fail) so even if the Redis write trips a
-// transient transport error the in-process generator still treats the
-// phone as taken for the remainder of the run.
+// via the dedup_mark Lua script — atomic SADD + EXPIRE in a single
+// round-trip. The order matters: we Add to Bloom first (cheap, can't
+// fail) so even if the Redis write trips a transient transport error
+// the in-process generator still treats the phone as taken for the
+// remainder of the run.
+//
+// Returns the number of NEW members added to the Redis SET — 1 for a
+// fresh phone, 0 for a re-mark of an already-tracked phone. Callers
+// generally ignore the count; tests use it to assert idempotency.
 //
 // projectID is accepted for API consistency; the dedup keys are
 // tenant-scoped per the type-doc rationale.
 func (d *Dedup) Mark(ctx context.Context, tenantID, _ uuid.UUID, phone string) error {
-	lf, err := d.filterFor(ctx, tenantID)
-	if err != nil {
-		// Bootstrap failed — the Bloom is partially loaded or empty.
-		// We can still proceed with the Redis write; the in-process
-		// short-circuit just won't help on subsequent calls until the
-		// bootstrap retry succeeds. Logging is the caller's job.
-		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
-			lf = nil
-		}
-	}
+	_, err := d.MarkN(ctx, tenantID, phone)
+	return err
+}
+
+// MarkN is the count-returning variant of Mark used by tests that need
+// to assert SADD propagation. Returns the number of new members
+// inserted into the durable Redis SET (0 means the phone was already
+// in the SET — idempotent re-mark).
+func (d *Dedup) MarkN(ctx context.Context, tenantID uuid.UUID, phone string) (int64, error) {
+	// filterFor's contract on error:
+	//   - ctx canceled / deadline exceeded → returns (nil, ctxErr).
+	//     Nothing to do for the Bloom tier; the Redis script call below
+	//     will surface the same ctx error.
+	//   - SSCAN bootstrap failure → stores a partial filter under
+	//     d.filters[tenantID] for the next caller to refresh, but
+	//     returns (nil, err) here so we don't risk double-adding to a
+	//     filter whose contents we can't trust.
+	//
+	// In both cases lf is nil; the nil-check below skips the Bloom Add
+	// and we let the Redis script run regardless. The script is the
+	// authoritative tier — Bloom is the fast-path cache.
+	lf, _ := d.filterFor(ctx, tenantID)
 	if lf != nil {
 		lf.Add([]byte(phone))
 	}
-	pipe := d.rdb.TxPipeline()
-	pipe.SAdd(ctx, d.setKey(tenantID), phone)
-	pipe.Expire(ctx, d.setKey(tenantID), d.ttl)
-	if _, err := pipe.Exec(ctx); err != nil {
-		return fmt.Errorf("rdd/dedup: sadd: %w", err)
+	added, err := dedupMarkScript.Run(
+		ctx, d.rdb,
+		[]string{d.setKey(tenantID)},
+		phone,
+		strconv.Itoa(int(d.ttl.Seconds())),
+	).Int64()
+	if err != nil {
+		return 0, fmt.Errorf("rdd/dedup: mark script: %w", err)
 	}
-	return nil
+	return added, nil
 }

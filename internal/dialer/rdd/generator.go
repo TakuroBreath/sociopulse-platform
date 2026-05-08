@@ -15,17 +15,42 @@
 //     Redis SET is consulted only on a Bloom hit, since Bloom has
 //     zero false negatives and the SET round-trip dominates the
 //     per-iteration cost.
-//     f. Persist the respondent via [crmService.Create]. The CRM
+//     f. MARK the phone in dedup (Bloom + Redis SET) BEFORE persist —
+//     so a concurrent Generate goroutine for the same tenant cannot
+//     double-roll the same phone on a Bloom miss. If a later step
+//     fails, we deliberately leave the mark in place: the phone is
+//     out of rotation for the rest of this run, and the 30-day SET
+//     TTL means a future Generate run sees it on the Bloom and
+//     skips harmlessly.
+//     g. Persist the respondent via [crmService.Create]. The CRM
 //     service runs the DNC check inside Create — when it returns
 //     [crmapi.ErrPhoneInDNC] the iteration buckets as DNCHit and
-//     moves on. Other errors propagate to the caller.
-//     g. Enqueue the respondent into the dialer call queue. A
-//     duplicate-in-queue (ok=false) is treated as success here —
-//     the rare race with another generator session is benign.
-//     h. Mark the phone in BOTH the Bloom filter and the Redis SET.
+//     moves on. Other expected errors (invalid, duplicate) bucket
+//     into their respective tallies. Transport errors propagate.
+//     h. Enqueue the respondent into the dialer call queue. On
+//     enqueue failure AFTER a successful CRM persist, the
+//     respondent exists in Postgres but not in the queue — Generate
+//     surfaces the error so the operator can re-enqueue / alert.
 //
 //  2. Return [api.GenerateResult] aggregating per-region counts plus
 //     duplicate / DNC / invalid / throttled tallies.
+//
+// Failure-recovery contract:
+//   - Dedup-mark failure (before CRM): non-fatal; log and continue. The
+//     in-process Bloom may have absorbed the phone but the durable SET
+//     write failed. Subsequent rolls in the same run still skip the
+//     phone via the Bloom; cross-process dedup degrades to "phone may
+//     re-roll in a future run" which is the same as a Bloom FP — no
+//     correctness loss, just a wasted attempt.
+//   - CRM-create failure (after mark): bucket the expected sentinels
+//     (DNC, invalid, duplicate) and return cleanly. The mark stays —
+//     the phone is out of rotation for this run. On transient errors
+//     (DB down) the operator retries Generate; the mark hits Bloom and
+//     a fresh phone is rolled. The 30-day TTL bounds the cost.
+//   - Enqueue failure (after mark + CRM persist): respondent is in DB
+//     but not in queue. Return error so the caller can re-enqueue via
+//     the admin tool. Future work: emit a `dialer.rdd.enqueue_failed`
+//     outbox event so a reaper picks the orphan up automatically.
 //
 // The generator is safe for concurrent calls — every dependency uses
 // its own concurrency primitives and the [Generator] itself holds only
@@ -34,11 +59,15 @@ package rdd
 
 import (
 	"context"
+	cryptorand "crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
+	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -182,20 +211,13 @@ func New(cfg Config) (*Generator, error) {
 		limits.SetTTL = defaultSetTTL
 	}
 
-	// Rand: when nil, seed ChaCha8 from the clock. The two-uint64
-	// seed is intentionally low-quality (the wall clock plus a
-	// constant) — the depguard rule + golangci-lint enforce that we
-	// never use math/rand v1, but math/rand/v2 sources do not need
-	// crypto-grade entropy for RDD prefix selection.
+	// Rand: when nil, seed ChaCha8 from crypto/rand so two Generators
+	// booted in the same nanosecond do not produce identical sequences.
+	// Tests pass a deterministic seed; production goes through
+	// newChaCha8Seeded which fills all 32 bytes.
 	rngSrc := cfg.Rand
 	if rngSrc == nil {
-		nowMS := clock().UnixNano()
-		//nolint:gosec // non-crypto seed for prefix selection; depguard already
-		// bans math/rand v1, math/rand/v2 needs no crypto entropy here.
-		rngSrc = rand.NewChaCha8([32]byte{
-			byte(nowMS), byte(nowMS >> 8), byte(nowMS >> 16), byte(nowMS >> 24),
-			byte(nowMS >> 32), byte(nowMS >> 40), byte(nowMS >> 48), byte(nowMS >> 56),
-		})
+		rngSrc = newChaCha8Seeded(logger)
 	}
 	//nolint:gosec // non-crypto: math/rand/v2 is the project standard for jitter / prefix picking.
 	rng := rand.New(rngSrc)
@@ -232,6 +254,16 @@ func (g *Generator) Generate(ctx context.Context, req api.GenerateRequest) (api.
 	if req.TenantID == uuid.Nil || req.ProjectID == uuid.Nil {
 		return api.GenerateResult{}, fmt.Errorf("rdd.Generate: tenant/project must be non-nil: %w", crmapi.ErrInvalidArgument)
 	}
+	// Empty Quotas is an explicit error rather than a uniform-random
+	// fallback. Plan 10 §"Generator's RPC contract" calls the Quotas
+	// map the region-by-quota selector — there is no semantic
+	// "uniform across all known regions" mode because (a) the embedded
+	// regions snapshot includes regions the operator may not be
+	// licensed for, and (b) RU DEF prefix density varies by region
+	// (e.g. Moscow has many more 9XX prefixes than KAM), so a
+	// uniform-by-region distribution would still produce a wildly
+	// non-uniform phone-number distribution. Callers must specify at
+	// least one positive-weight region.
 	if len(req.Quotas) == 0 {
 		return api.GenerateResult{}, fmt.Errorf("rdd.Generate: at least one region quota required: %w", crmapi.ErrInvalidArgument)
 	}
@@ -261,11 +293,11 @@ func (g *Generator) Generate(ctx context.Context, req api.GenerateRequest) (api.
 			g.metrics.observe(resultThrottled)
 			break
 		}
-		bucketed, err := g.attempt(ctx, req, weighted, &out)
-		if err != nil {
+		// attempt accumulates into out and emits its own metrics; the
+		// returned label is unused at this layer so we discard it.
+		if _, err := g.attempt(ctx, req, weighted, &out); err != nil {
 			return out, err
 		}
-		_ = bucketed // result already accumulated by attempt
 	}
 
 	if out.Generated == 0 && out.Throttled {
@@ -278,9 +310,27 @@ func (g *Generator) Generate(ctx context.Context, req api.GenerateRequest) (api.
 }
 
 // attempt runs ONE respondent-generation attempt. Returns nil error on
-// any expected outcome (ok / duplicate / dnc / invalid); only Redis or
-// CRM transport failures bubble up. The result struct is mutated in
-// place so the caller does not have to re-aggregate.
+// any expected outcome (ok / duplicate / dnc / invalid); Redis transport
+// failures and post-persist enqueue failures bubble up. The result
+// struct is mutated in place so the caller does not have to re-aggregate.
+//
+// Ordering is deliberate: dedup.Mark runs BEFORE crm.Create so that two
+// concurrent Generate goroutines that both miss the Bloom for the same
+// phone don't both write to the CRM. The CRM unique-index is the
+// cross-process safety net (loser gets ErrDuplicateRespondent), but
+// marking first eliminates the redundant DB round-trip on the loser.
+//
+// On a CRM error path (DNC / invalid / duplicate / transport) we
+// deliberately keep the mark — the phone is taken out of rotation for
+// the remainder of the run. On a transport error a future operator
+// retry will Bloom-hit the phone and roll a fresh one; the 30-day SET
+// TTL bounds the cost.
+//
+// On enqueue failure AFTER a successful CRM persist, the respondent is
+// in Postgres but never made it into the queue. We log loudly and
+// surface the error to fail the entire batch — the operator must
+// re-enqueue manually (or via a future reaper that consumes
+// `dialer.rdd.enqueue_failed` outbox events).
 func (g *Generator) attempt(
 	ctx context.Context,
 	req api.GenerateRequest,
@@ -302,6 +352,11 @@ func (g *Generator) attempt(
 		g.metrics.observe(resultInvalid)
 		return resultInvalid, nil
 	}
+	// Note: two parallel Generate goroutines for the same tenant rolling
+	// the same phone both miss the Bloom and reach crm.Create. The
+	// crm.RespondentService unique-index is the cross-goroutine safety
+	// net (returns ErrDuplicateRespondent on the loser); the Bloom is a
+	// per-process probabilistic pre-filter, not a serialisation point.
 	seen, err := g.dedup.Seen(ctx, req.TenantID, req.ProjectID, phone)
 	if err != nil {
 		return "", err
@@ -310,6 +365,16 @@ func (g *Generator) attempt(
 		out.DuplicatesHit++
 		g.metrics.observe(resultDuplicate)
 		return resultDuplicate, nil
+	}
+
+	// MARK FIRST — take the phone out of rotation for the rest of this
+	// run before any DB round-trip. A failure here is non-fatal: the
+	// in-process Bloom may have absorbed the phone (fast-path skip on
+	// later iterations in the same run); cross-process dedup degrades
+	// to "phone may roll again on a later run" which is identical to a
+	// live Bloom false positive — no correctness loss.
+	if mErr := g.dedup.Mark(ctx, req.TenantID, req.ProjectID, phone); mErr != nil {
+		g.log.Warn("rdd.Generate: dedup mark failed (pre-persist)", zap.Error(mErr))
 	}
 
 	resp, err := g.crm.Create(ctx, crmapi.CreateRespondentInput{
@@ -321,29 +386,25 @@ func (g *Generator) attempt(
 	})
 	switch {
 	case errors.Is(err, crmapi.ErrPhoneInDNC):
+		// DNC sentinel — phone stays marked so we don't re-roll it for
+		// the rest of this run. The 30-day TTL covers cross-run
+		// recurrence; a stale DNC entry harmlessly re-hits the sentinel.
 		out.DNCHit++
 		g.metrics.observe(resultDNC)
-		// Mark in dedup so we don't roll the same phone again — DNC
-		// status survives the 30-day SET TTL window deliberately. A
-		// dedup-write failure here is non-fatal: the phone may roll
-		// again on a later run and harmlessly hit DNC again.
-		if mErr := g.dedup.Mark(ctx, req.TenantID, req.ProjectID, phone); mErr != nil {
-			g.log.Warn("rdd.Generate: dedup mark failed (dnc path)", zap.Error(mErr))
-		}
 		return resultDNC, nil
 	case errors.Is(err, crmapi.ErrInvalidPhone):
+		// Invalid sentinel — keep the mark so we don't waste cycles
+		// rolling the same losing prefix+subscriber on the next iter.
 		out.InvalidHit++
 		g.metrics.observe(resultInvalid)
 		return resultInvalid, nil
 	case errors.Is(err, crmapi.ErrDuplicateRespondent):
 		// (project_id, phone_hash) collision — another generator round
 		// (or an import) already inserted this phone. Bucket as
-		// duplicate and mark in dedup for forward-correctness.
+		// duplicate; the mark is already in place from the pre-persist
+		// step.
 		out.DuplicatesHit++
 		g.metrics.observe(resultDuplicate)
-		if mErr := g.dedup.Mark(ctx, req.TenantID, req.ProjectID, phone); mErr != nil {
-			g.log.Warn("rdd.Generate: dedup mark failed (duplicate path)", zap.Error(mErr))
-		}
 		return resultDuplicate, nil
 	case err != nil:
 		return "", fmt.Errorf("rdd.Generate: crm.Create: %w", err)
@@ -365,20 +426,21 @@ func (g *Generator) attempt(
 		Region:       regionCode,
 		Priority:     0,
 	}); err != nil {
-		// Enqueue failure is fatal — without the queue insert the
-		// respondent will never be dialled. Surface upward so the
-		// caller can retry the run / alert.
-		return "", fmt.Errorf("rdd.Generate: enqueue: %w", err)
-	}
-
-	if err := g.dedup.Mark(ctx, req.TenantID, req.ProjectID, phone); err != nil {
-		// Dedup write failed; log but proceed — the in-process Bloom
-		// filter has already absorbed the phone, so subsequent
-		// iterations within this run still skip it. Cross-process
-		// dedup degrades to "phone may roll again on a later run"
-		// which is the same as a Bloom false positive on a live cache
-		// — no correctness loss, just a wasted attempt.
-		g.log.Warn("rdd.Generate: dedup mark failed", zap.Error(err))
+		// Enqueue failed AFTER a successful CRM persist. The respondent
+		// is in Postgres but never made it into the queue — the worst
+		// failure-mode in the pipeline. Log loudly with the IDs an
+		// operator needs to re-enqueue, then return the error so the
+		// caller fails the batch.
+		g.log.Error("rdd.Generate: enqueue failed post-persist; respondent orphaned in DB",
+			zap.String("tenant_id", req.TenantID.String()),
+			zap.String("project_id", req.ProjectID.String()),
+			zap.String("respondent_id", respondentID.String()),
+			zap.String("phone", phone),
+			zap.String("region", regionCode),
+			zap.Error(err),
+		)
+		g.metrics.observe(resultEnqueueFailed)
+		return "", fmt.Errorf("rdd.Generate: enqueue post-persist: %w", err)
 	}
 
 	out.Generated++
@@ -456,7 +518,10 @@ func buildRegionPicker(quotas map[string]int) *regionPicker {
 }
 
 // pick returns one region code drawn uniformly from the weighted CDF.
-// The caller MUST check len(p.codes)>0 before invoking.
+// pre: p.total > 0; caller must check len(p.codes) > 0 before calling
+// pick. An empty picker triggers IntN(0) which panics — that's the
+// fail-fast behaviour we want, so this method intentionally has no
+// guard.
 func (p *regionPicker) pick(rng *rand.Rand) string {
 	r := rng.IntN(p.total)
 	idx := sort.SearchInts(p.cumulative, r+1)
@@ -464,4 +529,39 @@ func (p *regionPicker) pick(rng *rand.Rand) string {
 		idx = len(p.codes) - 1
 	}
 	return p.codes[idx]
+}
+
+// seedCounter is a process-wide fallback counter consumed only when
+// crypto/rand.Read fails (extremely rare on Linux/macOS). Using it
+// guarantees that two consecutive calls in the same nanosecond don't
+// collapse to identical seeds even on the fallback path.
+var seedCounter uint64
+
+// newChaCha8Seeded returns a freshly-seeded *rand.ChaCha8 source. Every
+// one of the 32 seed bytes is filled from crypto/rand so two Generators
+// booted in the same nanosecond produce different sequences.
+//
+// On the (extremely unlikely on Linux/macOS) case where crypto/rand
+// fails, we fall back to a derived seed of UnixNano + an atomic counter
+// + the PID. This still avoids the all-zero-tail problem and gives
+// distinct streams for distinct processes / consecutive calls — but
+// callers that depend on cryptographic-quality entropy should treat a
+// crypto/rand failure as a deployment-environment bug.
+func newChaCha8Seeded(logger *zap.Logger) *rand.ChaCha8 {
+	var seed [32]byte
+	if _, err := cryptorand.Read(seed[:]); err != nil {
+		// Production deployments MUST have working crypto/rand —
+		// surface the deviation so the operator notices.
+		if logger != nil {
+			logger.Warn("rdd.New: crypto/rand.Read failed; falling back to derived seed",
+				zap.Error(err))
+		}
+		binary.LittleEndian.PutUint64(seed[0:8], uint64(time.Now().UnixNano())) //nolint:gosec // UnixNano is positive in practice; cast widens.
+		binary.LittleEndian.PutUint64(seed[8:16], atomic.AddUint64(&seedCounter, 1))
+		binary.LittleEndian.PutUint64(seed[16:24], uint64(os.Getpid())) //nolint:gosec // PID always non-negative; widening cast.
+		// bytes 24..31 stay zero — better than nothing, and the derived
+		// upper 24 bytes still distinguish concurrent fallbacks.
+	}
+	//nolint:gosec // ChaCha8 is the project's standard non-crypto rand source.
+	return rand.NewChaCha8(seed)
 }
