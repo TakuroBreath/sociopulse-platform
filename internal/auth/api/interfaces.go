@@ -89,18 +89,42 @@ type JWTIssuer interface {
 	Validate(token, expectedType string) (Claims, error)
 }
 
+// TOTPVerifier is the narrow projection of TOTPService.Verify consumed
+// by the Authenticator. Splitting it from TOTPService keeps the login
+// path's dependency surface tight: Login does not enrol or disable.
+type TOTPVerifier interface {
+	// Verify reports whether code matches the user's enrolled TOTP
+	// secret (or one of their unused backup codes). Returns (false,
+	// ErrTOTPNotEnrolled) when the user has no completed enrolment;
+	// (false, nil) on a well-formed but wrong code; (true, nil) on a
+	// match. Implementations are expected to consume any matched
+	// backup code so it cannot be used twice.
+	Verify(ctx context.Context, userID uuid.UUID, code string) (bool, error)
+}
+
 // TOTPService manages per-user TOTP enrolment and verification.
 type TOTPService interface {
 	// Enroll generates a TOTP secret and backup codes for the user. The
 	// returned Secret and BackupCodes are persisted hashed and may NOT be
-	// retrieved again — callers must display them immediately.
+	// retrieved again — callers must display them immediately. Returns
+	// ErrTOTPAlreadyEnabled when the user already has a confirmed
+	// enrolment; callers must Disable first.
 	Enroll(ctx context.Context, userID uuid.UUID) (TOTPEnrollment, error)
-	// Confirm finalises enrolment by verifying the first code from the user's authenticator.
+	// Confirm finalises enrolment by verifying the first code from the
+	// user's authenticator. Idempotent: a second Confirm on an
+	// already-enrolled user is a no-op. Wrong code -> ErrTOTPInvalid.
 	Confirm(ctx context.Context, userID uuid.UUID, code string) error
-	// Verify checks a TOTP code (or backup code) against the enrolled secret.
-	Verify(ctx context.Context, userID uuid.UUID, code string) error
+	// Verify checks a TOTP code (or single-use backup code) against the
+	// enrolled secret. Returns (true, nil) on a match, (false, nil) on a
+	// well-formed but wrong code, and (false, ErrTOTPNotEnrolled) when
+	// the user has no completed enrolment. The (bool, error) shape lets
+	// the Authenticator distinguish "wrong code" (false, nil) from
+	// "service down" (false, real-error) without parsing error strings.
+	Verify(ctx context.Context, userID uuid.UUID, code string) (bool, error)
 	// Disable removes the TOTP secret and backup codes for the user.
+	// Idempotent: calling on a user who never enrolled is a no-op.
 	Disable(ctx context.Context, userID uuid.UUID) error
-	// Status returns the current TOTP state for the user.
+	// Status returns the current TOTP state for the user. A user with
+	// no row is reported as Enabled=false / zero values.
 	Status(ctx context.Context, userID uuid.UUID) (TOTPStatus, error)
 }

@@ -13,7 +13,13 @@ const (
 	// AuditActionLogout is the audit Event.Action set on logout.
 	AuditActionLogout = "auth.logout"
 	// AuditActionTOTPEnrolled is the audit Event.Action set when TOTP enrolment is confirmed.
-	AuditActionTOTPEnrolled = "auth.totp_enrolled"
+	AuditActionTOTPEnrolled = "auth.totp.enrolled"
+	// AuditActionTOTPDisabled is the audit Event.Action set when a user disables TOTP.
+	AuditActionTOTPDisabled = "auth.totp.disabled"
+	// AuditActionTOTPVerified is the audit Event.Action set when a successful TOTP code is observed.
+	AuditActionTOTPVerified = "auth.totp.verified"
+	// AuditActionTOTPBackupUsed is the audit Event.Action set when a backup code is consumed.
+	AuditActionTOTPBackupUsed = "auth.totp.backup_used"
 	// AuditActionSessionRevoked is the audit Event.Action set on force-logout-all.
 	AuditActionSessionRevoked = "auth.session_revoked"
 	// AuditActionRefreshReplay is the audit Event.Action set when refresh-rotation reuse is detected.

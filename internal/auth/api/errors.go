@@ -44,4 +44,13 @@ var (
 	// ErrEmptyRoles is returned by UserService.UpdateRole when the supplied
 	// role slice is empty — every user must hold at least one role.
 	ErrEmptyRoles = errors.New("auth: roles must be non-empty")
+	// ErrTOTPAlreadyEnabled is returned by TOTPService.Enroll when the
+	// user has already completed TOTP enrolment. Callers must Disable
+	// before Enroll can re-issue.
+	ErrTOTPAlreadyEnabled = errors.New("auth: TOTP already enabled")
+	// ErrTOTPNotEnrolled is returned by TOTPService.Verify / Status when
+	// the user has no completed TOTP enrolment (no row, or row with
+	// enrolled=false). Distinct from ErrTOTPInvalid so callers can route
+	// "code is wrong" away from "you never enrolled".
+	ErrTOTPNotEnrolled = errors.New("auth: TOTP not enrolled")
 )

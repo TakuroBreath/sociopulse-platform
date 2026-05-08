@@ -132,3 +132,20 @@ type TOTPStatus struct {
 	LastVerifiedAt  *time.Time
 	BackupRemaining int
 }
+
+// TOTPState is the persistence-layer projection of an auth_totp row used
+// by TOTPService and the auth_totp store. SecretEncrypted holds the
+// AES-GCM ciphertext produced by tenancy.KMSResolver.Encrypt — the
+// service decrypts on demand. BackupCodeHashes are PHC-encoded Argon2id
+// hashes; on use the matching entry is removed from the slice and
+// BackupUsedCount is incremented atomically by the store.
+type TOTPState struct {
+	UserID           uuid.UUID
+	TenantID         uuid.UUID
+	SecretEncrypted  []byte
+	Enrolled         bool
+	EnrolledAt       *time.Time
+	LastVerifiedAt   *time.Time
+	BackupCodeHashes []string
+	BackupUsedCount  int
+}
