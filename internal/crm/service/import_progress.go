@@ -152,14 +152,22 @@ func (t *ProgressTracker) Finish(ctx context.Context, jobID string, tenantID uui
 		return nil
 	}
 	now := t.clock().UTC().Format(time.RFC3339Nano)
-	if err := t.rdb.HSet(ctx, importStatusKey(jobID), map[string]any{
+	// Refresh the TTL on terminal-state write so the operator-facing
+	// status hash lives ttl from "now" — not ttl from the original
+	// Init call. A job that sat in queue for days would otherwise have
+	// its terminal status expire prematurely.
+	key := importStatusKey(jobID)
+	pipe := t.rdb.Pipeline()
+	pipe.HSet(ctx, key, map[string]any{
 		fieldStatus:     stateSucceeded,
 		fieldTotal:      total,
 		fieldProcessed:  total,
 		fieldInserted:   inserted,
 		fieldSkipped:    skipped,
 		fieldFinishedAt: now,
-	}).Err(); err != nil {
+	})
+	pipe.Expire(ctx, key, t.ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("crm/service: progress finish: %w", err)
 	}
 	t.publish(ctx, api.SubjectImportFinishedFor(tenantID), api.ImportFinishedEvent{
@@ -179,11 +187,17 @@ func (t *ProgressTracker) Fail(ctx context.Context, jobID string, tenantID uuid.
 		return nil
 	}
 	now := t.clock().UTC().Format(time.RFC3339Nano)
-	if err := t.rdb.HSet(ctx, importStatusKey(jobID), map[string]any{
+	// Refresh TTL alongside the terminal-state write — same rationale
+	// as Finish above (queued-job-then-fail scenario).
+	key := importStatusKey(jobID)
+	pipe := t.rdb.Pipeline()
+	pipe.HSet(ctx, key, map[string]any{
 		fieldStatus:     stateFailed,
 		fieldFinishedAt: now,
 		fieldError:      errMsg,
-	}).Err(); err != nil {
+	})
+	pipe.Expire(ctx, key, t.ttl)
+	if _, err := pipe.Exec(ctx); err != nil {
 		return fmt.Errorf("crm/service: progress fail: %w", err)
 	}
 	t.publish(ctx, api.SubjectImportFailedFor(tenantID), api.ImportFailedEvent{

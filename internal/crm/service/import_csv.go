@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"strings"
-	"unicode/utf8"
 )
 
 // utf8BOM is the byte sequence Excel-derived CSVs typically start with;
@@ -198,9 +197,3 @@ func isBlankRow(rec []string) bool {
 	}
 	return true
 }
-
-// utf8RuneCount is unused at runtime; kept here as a sanity-touch on
-// the unicode/utf8 import so go-imports tooling does not eagerly drop
-// it when future edits introduce its companion (Russian header
-// validation will use it).
-var _ = utf8.RuneCountInString

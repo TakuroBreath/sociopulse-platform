@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -545,18 +546,13 @@ func buildAttributes(r ImportRow, defaults map[string]any) map[string]any {
 	return out
 }
 
-// bytesToHex is a small allocation-free hex encoder for use in
-// in-memory dedup maps. crypto/hex would work but allocates a string;
-// we just need a stable comparison key.
+// bytesToHex returns a stable string key for an in-memory dedup map.
+// We use encoding/hex directly — its allocation profile for a single
+// short hash is identical to a hand-rolled strings.Builder loop, but
+// the stdlib version is more obviously correct and one less thing for
+// future readers to second-guess.
 func bytesToHex(b []byte) string {
-	const hexchars = "0123456789abcdef"
-	var sb strings.Builder
-	sb.Grow(len(b) * 2)
-	for _, c := range b {
-		sb.WriteByte(hexchars[c>>4])
-		sb.WriteByte(hexchars[c&0x0f])
-	}
-	return sb.String()
+	return hex.EncodeToString(b)
 }
 
 // validateImportRequest enforces the synchronous-rejection invariants
