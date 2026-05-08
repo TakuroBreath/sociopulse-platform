@@ -14,10 +14,13 @@ import (
 )
 
 // importMaxBodyBytes is the upper bound on the multipart upload body
-// for the import endpoint. Matches the service-layer
-// importPayloadInlineLimit (32 MiB) so the boundary is consistent
-// across layers.
-const importMaxBodyBytes = 32 * 1024 * 1024
+// for the import endpoint. 50 MiB per Plan 06 Task 5 spec — should
+// comfortably hold a 100k-row XLSX (typical 200-500 bytes/row even
+// with attributes, well under the cap with margin for Excel's
+// formatting overhead). The service-layer importPayloadInlineLimit is
+// the authoritative cap once the body is read; this is the cheap
+// "reject before the bytes are buffered" gate.
+const importMaxBodyBytes = 50 * 1024 * 1024
 
 // defaultRespondentPageSize is the page size when ?page_size is
 // absent. Matches the service default.

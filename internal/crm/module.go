@@ -93,6 +93,7 @@ type Module struct {
 
 	asynqClient    *asynq.Client
 	asynqServer    *asynq.Server
+	asynqPurge     *asynq.Server // dedicated server for the purge handler — same lifecycle as asynqServer
 	asynqScheduler *asynq.Scheduler
 	logger         *zap.Logger
 }
@@ -214,6 +215,14 @@ func (m *Module) Stop() error {
 		m.asynqScheduler.Shutdown()
 		m.asynqScheduler = nil
 	}
+	if m.asynqPurge != nil {
+		// Drain the purge server identically to the import server.
+		// Start was non-blocking; Stop refuses new tasks then waits
+		// for in-flight handlers to drain (up to ShutdownTimeout).
+		m.asynqPurge.Stop()
+		m.asynqPurge.Shutdown()
+		m.asynqPurge = nil
+	}
 	if m.asynqServer != nil {
 		// Stop refuses new tasks and waits for in-flight handlers to
 		// drain (up to ShutdownTimeout, default 8s). Shutdown then
@@ -291,6 +300,7 @@ func (m *Module) wirePurgePath(d modules.Deps, store crmapi.RespondentStorePort,
 		return fmt.Errorf("start asynq scheduler: %w", err)
 	}
 
+	m.asynqPurge = purgeServer
 	m.asynqScheduler = scheduler
 	d.Logger.Named("crm").Info("respondent purge cron registered",
 		zap.String("schedule", purgeCronSpec),

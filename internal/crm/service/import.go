@@ -43,9 +43,11 @@ const importStatusTTL = 7 * 24 * time.Hour
 // importPayloadInlineLimit is the maximum byte size we accept on the
 // asynq task payload's `Body` field today (v1, before the S3 swap in
 // Plan 12). asynq enqueues over Redis; oversized payloads thrash the
-// command timeout. 32 MiB is plenty for 100 000 phone rows
-// (≈ 30 bytes/row average).
-const importPayloadInlineLimit = 32 * 1024 * 1024
+// command timeout. 50 MiB is plenty for 100 000 phone rows including
+// Excel's formatting overhead, and matches the HTTP-layer
+// importMaxBodyBytes so a payload that passed the gateway never
+// surprises the worker.
+const importPayloadInlineLimit = 50 * 1024 * 1024
 
 // ImportRow is the parsed-but-not-yet-validated representation of one
 // row in a CSV/XLSX import file. The parser packages emit these on a

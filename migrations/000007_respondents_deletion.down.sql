@@ -14,6 +14,16 @@
 
 begin;
 
+-- Restore the original (narrower) status CHECK before any rows can
+-- carry the 'deletion-requested' value. If any row currently has that
+-- status, the rollback will fail at constraint creation — operators
+-- must `UPDATE respondents SET status = 'pending' WHERE status = 'deletion-requested'`
+-- (and accept the loss of the deletion-requested signal) before
+-- migrating down. We do NOT silently rewrite rows here.
+alter table respondents drop constraint if exists respondents_status_check;
+alter table respondents add constraint respondents_status_check
+    check (status in ('pending','dialing','completed','dnc','exhausted','wrong'));
+
 drop index if exists idx_respondents_deleted;
 
 alter table respondents drop column if exists deletion_reason;

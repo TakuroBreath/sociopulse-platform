@@ -319,12 +319,17 @@ const maxBatchInsertRows = 100000
 // Reason is stored verbatim. The HTTP transport's bind validation caps
 // the length so the column never grows past a sensible upper bound.
 func (s *RespondentStore) SoftDelete(ctx context.Context, tx postgres.Tx, id uuid.UUID, reason string, at time.Time) error {
+	// Flip status to deletion-requested alongside the deleted_at stamp
+	// so operator-search by status surfaces these rows during the
+	// 30-day grace window. Without this, the RespDeletionRequested
+	// constant in api/dto.go is unreachable at the store layer and
+	// any Search(filter{status: deletion-requested}) returns nothing.
 	const q = `
 		UPDATE respondents
-		SET deleted_at = $2, deletion_reason = NULLIF($3, '')
+		SET deleted_at = $2, deletion_reason = NULLIF($3, ''), status = $4
 		WHERE id = $1 AND deleted_at IS NULL`
 
-	tag, err := tx.Exec(ctx, q, id, at, reason)
+	tag, err := tx.Exec(ctx, q, id, at, reason, string(api.RespDeletionRequested))
 	if err != nil {
 		return fmt.Errorf("crm/store: soft-delete respondent: %w", err)
 	}
