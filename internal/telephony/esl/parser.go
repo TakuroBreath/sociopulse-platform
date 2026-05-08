@@ -157,7 +157,7 @@ func (f Frame) AsEvent() (Event, error) {
 	}
 
 	headers := make(map[string]string, 32)
-	for _, line := range strings.Split(string(f.Body), "\n") {
+	for line := range strings.SplitSeq(string(f.Body), "\n") {
 		line = strings.TrimRight(line, "\r")
 		if line == "" {
 			continue

@@ -1,6 +1,7 @@
 package esl
 
 import (
+	"maps"
 	"strconv"
 	"testing"
 	"time"
@@ -22,9 +23,7 @@ func makeEvent(name, callUUID string, extra map[string]string) Event {
 	if callUUID != "" {
 		headers["unique-id"] = callUUID
 	}
-	for k, v := range extra {
-		headers[k] = v
-	}
+	maps.Copy(headers, extra)
 	return Event{Name: name, UUID: callUUID, headers: headers}
 }
 

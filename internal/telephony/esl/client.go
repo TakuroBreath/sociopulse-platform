@@ -350,6 +350,8 @@ func (c *Client) dispatch(frame Frame) {
 //
 // The supplied ctx bounds the wait for a reply. Cancellation surfaces as
 // ErrTimeout. Disconnection mid-wait surfaces as ErrNotConnected.
+//
+//nolint:unused // wired by Task 3 (high-level commands: Originate, Hangup, MixMonitor, Play, SofiaStatus).
 func (c *Client) sendCommand(ctx context.Context, line string) (Frame, error) {
 	if !c.Connected() {
 		return Frame{}, ErrNotConnected

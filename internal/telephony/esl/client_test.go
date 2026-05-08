@@ -39,16 +39,14 @@ func fakeESLServer(t *testing.T, handler func(net.Conn)) (string, func()) {
 	require.NoError(t, err)
 
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		conn, err := ln.Accept()
 		if err != nil {
 			return
 		}
 		defer func() { _ = conn.Close() }()
 		handler(conn)
-	}()
+	})
 
 	stop := func() {
 		_ = ln.Close()
