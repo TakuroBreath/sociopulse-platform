@@ -65,6 +65,12 @@ var _ api.CallQueue = (*RedisQueue)(nil)
 // New constructs a RedisQueue. Returns an error when a required
 // dependency is missing; nil-tolerated fields are filled with defaults
 // so callers can pass an empty Config{Redis: rdb} for the simplest case.
+//
+// TTL must be at least 1s (or zero, which falls back to defaultTTL).
+// Sub-second values are rejected because every Lua script forwards
+// int(q.ttl.Seconds()) to EXPIRE, which would silently truncate to 0
+// and turn the EXPIRE call into a no-op — leaving keys without their
+// safety-net TTL.
 func New(cfg Config) (*RedisQueue, error) {
 	if cfg.Redis == nil {
 		return nil, errors.New("queue.New: Redis is required")
@@ -78,8 +84,11 @@ func New(cfg Config) (*RedisQueue, error) {
 		clock = time.Now
 	}
 	ttl := cfg.TTL
-	if ttl <= 0 {
+	if ttl == 0 {
 		ttl = defaultTTL
+	}
+	if ttl < time.Second {
+		return nil, fmt.Errorf("queue.New: TTL must be >= 1s, got %s", ttl)
 	}
 	return &RedisQueue{
 		rdb:     cfg.Redis,
@@ -117,10 +126,7 @@ func (q *RedisQueue) now() time.Time { return q.clock().UTC() }
 // deterministic in tests; the AttemptN flows through unchanged for the
 // retry orchestrator's per-attempt backoff.
 func (q *RedisQueue) EnqueueRespondent(ctx context.Context, req api.EnqueueRequest) (bool, error) {
-	priority := req.Priority
-	if priority > maxPriority {
-		priority = maxPriority
-	}
+	priority := min(req.Priority, maxPriority)
 	enqueuedAt := q.now()
 	item := api.QueueItem{
 		TenantID:     req.TenantID,
@@ -193,24 +199,28 @@ func (q *RedisQueue) PickNext(ctx context.Context, tenantID, projectID uuid.UUID
 }
 
 // Requeue implements api.CallQueue. Re-inserts an item with the supplied
-// delay applied to the new score. The item's Priority is capped at the
-// maximum (9) so a runaway retry loop cannot escape the float-precision
-// band; AttemptN is incremented BY THE CALLER (the retry orchestrator
-// owns that semantics, not this layer). The new EnqueuedAt is the
-// current clock plus the requested delay.
+// delay applied to the new score. Requeue increments the item's Priority
+// by 1 (capped at maxPriority=9) per plan body §296: the retry
+// orchestrator (Plan 10 Task 8) calls Requeue once per retry, and the
+// queue handles the demotion automatically so callers don't have to
+// spread the increment across every retry path. AttemptN is incremented
+// BY THE CALLER (the retry orchestrator owns that semantics, not this
+// layer). The new EnqueuedAt is the current clock plus the requested
+// delay.
 func (q *RedisQueue) Requeue(ctx context.Context, item api.QueueItem, delay time.Duration) error {
 	if delay < 0 {
 		delay = 0
 	}
-	priority := item.Priority
-	if priority > maxPriority {
-		priority = maxPriority
-	}
+	// Bump priority by 1, cap at maxPriority. min() of an int expression
+	// against the uint8 max keeps the arithmetic in int space so a
+	// pre-clamped Priority of 250 still resolves cleanly to 9.
+	//nolint:gosec // result is bounded by maxPriority (9) so the uint8 conversion is safe.
+	nextPriority := uint8(min(int(item.Priority)+1, int(maxPriority)))
 	updated := item
-	updated.Priority = priority
+	updated.Priority = nextPriority
 	updated.EnqueuedAt = q.now().Add(delay)
 	blob := encodeItem(updated)
-	scoreStr := strconv.FormatFloat(score(priority, updated.EnqueuedAt), 'f', -1, 64)
+	scoreStr := strconv.FormatFloat(score(nextPriority, updated.EnqueuedAt), 'f', -1, 64)
 	if _, err := requeueScript.Run(
 		ctx, q.rdb,
 		[]string{q.zsetKey(item.TenantID, item.ProjectID), q.dedupKey(item.TenantID, item.ProjectID)},

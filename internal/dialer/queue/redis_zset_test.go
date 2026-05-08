@@ -132,6 +132,40 @@ func TestNew_DefaultsApply(t *testing.T) {
 	require.True(t, ok)
 }
 
+// TestNew_RejectsSubSecondTTL — every Lua script forwards
+// int(q.ttl.Seconds()) to EXPIRE, which silently truncates a
+// sub-second TTL to 0 and turns the EXPIRE call into a no-op. The
+// constructor rejects the misuse up-front so the failure surfaces
+// at boot instead of mysterious key-without-TTL behaviour later.
+func TestNew_RejectsSubSecondTTL(t *testing.T) {
+	t.Parallel()
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	cases := []struct {
+		name string
+		ttl  time.Duration
+	}{
+		{"500ms", 500 * time.Millisecond},
+		{"1ns", time.Nanosecond},
+		{"999ms", 999 * time.Millisecond},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := queue.New(queue.Config{Redis: rdb, TTL: c.ttl})
+			require.Error(t, err)
+			require.Contains(t, err.Error(), "TTL must be >= 1s")
+		})
+	}
+
+	// Exactly 1s is the smallest accepted value.
+	q, err := queue.New(queue.Config{Redis: rdb, TTL: time.Second})
+	require.NoError(t, err)
+	require.NotNil(t, q)
+}
+
 // TestEnqueue_HappyPath — single enqueue lands in both ZSET and dedup SET
 // with TTL refreshed on each.
 func TestEnqueue_HappyPath(t *testing.T) {
@@ -307,7 +341,9 @@ func TestPickNext_RemovesFromDedupSet(t *testing.T) {
 
 // TestRequeue_AppliesDelay — Requeue with a 5-minute delay places the
 // item at a future timestamp; the same item is NOT immediately popped
-// when the queue's current clock is the original time.
+// when the queue's current clock is the original time. Requeue also
+// auto-increments the priority by 1 per plan body §296, so the score
+// reflects the bumped priority band.
 func TestRequeue_AppliesDelay(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -331,8 +367,9 @@ func TestRequeue_AppliesDelay(t *testing.T) {
 	item, err := f.q.PickNext(ctx, tenantID, projectID)
 	require.NoError(t, err)
 
-	// Requeue with 5 minutes delay. After requeue the item is at score
-	// = priority*1e9 + (t0 + 5min).UnixMilli().
+	// Requeue with 5 minutes delay. After requeue priority is 6 (auto
+	// bumped from 5) and the item is at score = priority*1e9 + (t0 +
+	// 5min).UnixMilli().
 	require.NoError(t, f.q.Requeue(ctx, item, 5*time.Minute))
 
 	// Inspect the score directly via miniredis.
@@ -342,39 +379,63 @@ func TestRequeue_AppliesDelay(t *testing.T) {
 	require.Len(t, scores, 1)
 
 	expectedAt := t0.Add(5 * time.Minute)
-	expectedScore := float64(5)*1e9 + float64(expectedAt.UnixMilli())
+	expectedScore := float64(6)*1e9 + float64(expectedAt.UnixMilli())
 	require.InDelta(t, expectedScore, scores[0].Score, 0.5)
 
 	require.InDelta(t, 1.0, f.counterValue(t, "dialer_queue_requeue_total", nil), 0.0)
 }
 
-// TestRequeue_CapsPriorityAtMax — even if a caller smuggles a Priority
-// of 250 into the QueueItem, Requeue clamps it to maxPriority (9).
+// TestRequeue_CapsPriorityAtMax — Requeue auto-increments Priority by 1
+// (per plan body §296) and caps at maxPriority=9. Covers the three
+// cases the retry orchestrator hits in production:
+//   - Priority=5 → 6 (typical mid-band bump)
+//   - Priority=8 → 9 (boundary into the cap)
+//   - Priority=9 → 9 (idempotent at the cap)
+//
+// Also covers the defensive case where a caller smuggles a Priority
+// of 250 — the cap still resolves to 9 in one Requeue call.
 func TestRequeue_CapsPriorityAtMax(t *testing.T) {
 	t.Parallel()
-	f := newFixture(t)
-	tenantID, projectID, respID := uuid.New(), uuid.New(), uuid.New()
-	ctx := context.Background()
-
-	item := api.QueueItem{
-		TenantID:     tenantID,
-		ProjectID:    projectID,
-		RespondentID: respID,
-		Priority:     250,
-		EnqueuedAt:   time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
-		Phone:        "+79991234567",
-		Region:       "RU-MOW",
+	cases := []struct {
+		name         string
+		startPrio    uint8
+		expectedPrio uint8
+	}{
+		{name: "5 bumps to 6", startPrio: 5, expectedPrio: 6},
+		{name: "8 bumps to 9 (boundary)", startPrio: 8, expectedPrio: 9},
+		{name: "9 stays at 9 (idempotent at cap)", startPrio: 9, expectedPrio: 9},
+		{name: "250 clamps to 9 in one call", startPrio: 250, expectedPrio: 9},
 	}
-	require.NoError(t, f.q.Requeue(ctx, item, 0))
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			f := newFixture(t)
+			tenantID, projectID, respID := uuid.New(), uuid.New(), uuid.New()
+			ctx := context.Background()
 
-	out, err := f.q.PickNext(ctx, tenantID, projectID)
-	require.NoError(t, err)
-	require.Equal(t, uint8(9), out.Priority)
+			item := api.QueueItem{
+				TenantID:     tenantID,
+				ProjectID:    projectID,
+				RespondentID: respID,
+				Priority:     c.startPrio,
+				EnqueuedAt:   time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC),
+				Phone:        "+79991234567",
+				Region:       "RU-MOW",
+			}
+			require.NoError(t, f.q.Requeue(ctx, item, 0))
+
+			out, err := f.q.PickNext(ctx, tenantID, projectID)
+			require.NoError(t, err)
+			require.Equal(t, c.expectedPrio, out.Priority)
+		})
+	}
 }
 
 // TestRequeue_NegativeDelayBecomesZero — a defensive guard: a negative
 // delay (clock skew, rounding) is treated as 0 rather than placing the
-// item arbitrarily far in the past.
+// item arbitrarily far in the past. The starting Priority=5 is auto
+// bumped to 6 by Requeue per plan body §296, so the score uses the
+// bumped band.
 func TestRequeue_NegativeDelayBecomesZero(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -399,7 +460,7 @@ func TestRequeue_NegativeDelayBecomesZero(t *testing.T) {
 	scores, err := f.rdb.ZRangeWithScores(ctx, zKey, 0, -1).Result()
 	require.NoError(t, err)
 	require.Len(t, scores, 1)
-	expectedScore := float64(5)*1e9 + float64(t0.UnixMilli())
+	expectedScore := float64(6)*1e9 + float64(t0.UnixMilli())
 	require.InDelta(t, expectedScore, scores[0].Score, 0.5)
 }
 

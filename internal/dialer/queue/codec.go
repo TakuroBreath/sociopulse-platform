@@ -26,9 +26,7 @@ const maxPriority uint8 = 9
 // Priority is clamped to maxPriority before the multiplication; passing 250
 // would otherwise overflow the float arithmetic and break ordering.
 func score(priority uint8, at time.Time) float64 {
-	if priority > maxPriority {
-		priority = maxPriority
-	}
+	priority = min(priority, maxPriority)
 	return float64(priority)*1e9 + float64(at.UnixMilli())
 }
 
@@ -57,10 +55,7 @@ func score(priority uint8, at time.Time) float64 {
 // can fail to marshal (e.g. a custom struct), reintroduce the error
 // return and propagate the failure.
 func encodeItem(it api.QueueItem) []byte {
-	priority := it.Priority
-	if priority > maxPriority {
-		priority = maxPriority
-	}
+	priority := min(it.Priority, maxPriority)
 	var buf bytes.Buffer
 	buf.WriteByte('{')
 	writeJSONStringField(&buf, "tenant_id", it.TenantID.String(), false)

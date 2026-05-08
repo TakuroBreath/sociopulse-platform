@@ -3,6 +3,7 @@ package queue
 import (
 	"encoding/json"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -20,9 +21,10 @@ func TestScore_PriorityBandOrdering(t *testing.T) {
 	old := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	new := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC) // 5 months later
 
-	for p := uint8(0); p < maxPriority; p++ {
+	for i := range int(maxPriority) {
 		// Stale higher-priority (lower number) item must beat a
 		// fresh lower-priority (higher number) item.
+		p := uint8(i) //nolint:gosec // i is bounded by maxPriority (9)
 		stale := score(p, old)
 		fresh := score(p+1, new)
 		require.Lessf(t, stale, fresh,
@@ -57,7 +59,8 @@ func TestScore_FloatPrecisionInRange(t *testing.T) {
 	t.Parallel()
 	// Year 2099 timestamp — well below the 2^53 ms limit (~year 285616).
 	far := time.Date(2099, 12, 31, 23, 59, 59, 0, time.UTC)
-	for p := uint8(0); p <= maxPriority; p++ {
+	for i := range int(maxPriority) + 1 {
+		p := uint8(i) //nolint:gosec // i is bounded by maxPriority+1 (10)
 		s := score(p, far)
 		expected := float64(p)*1e9 + float64(far.UnixMilli())
 		require.InDeltaf(t, expected, s, 0.0,
@@ -93,14 +96,14 @@ func TestEncodeItem_DeterministicByteOrder(t *testing.T) {
 	// ProjectID, RespondentID, Priority, EnqueuedAt, AttemptN,
 	// Phone, Region. Assert via key positions in the byte string.
 	str := string(a)
-	tenantPos := stringIndex(str, `"tenant_id"`)
-	projectPos := stringIndex(str, `"project_id"`)
-	respPos := stringIndex(str, `"respondent_id"`)
-	priPos := stringIndex(str, `"priority"`)
-	enqPos := stringIndex(str, `"enqueued_at_ms"`)
-	attPos := stringIndex(str, `"attempt_n"`)
-	phonePos := stringIndex(str, `"phone"`)
-	regPos := stringIndex(str, `"region"`)
+	tenantPos := strings.Index(str, `"tenant_id"`)
+	projectPos := strings.Index(str, `"project_id"`)
+	respPos := strings.Index(str, `"respondent_id"`)
+	priPos := strings.Index(str, `"priority"`)
+	enqPos := strings.Index(str, `"enqueued_at_ms"`)
+	attPos := strings.Index(str, `"attempt_n"`)
+	phonePos := strings.Index(str, `"phone"`)
+	regPos := strings.Index(str, `"region"`)
 
 	require.Less(t, tenantPos, projectPos)
 	require.Less(t, projectPos, respPos)
@@ -221,10 +224,7 @@ func TestEncodeDecode_RoundTrip(t *testing.T) {
 			out, err := decodeItem(blob)
 			require.NoError(t, err)
 
-			expectedPriority := c.in.Priority
-			if expectedPriority > maxPriority {
-				expectedPriority = maxPriority
-			}
+			expectedPriority := min(c.in.Priority, maxPriority)
 			require.Equal(t, c.in.TenantID, out.TenantID)
 			require.Equal(t, c.in.ProjectID, out.ProjectID)
 			require.Equal(t, c.in.RespondentID, out.RespondentID)
@@ -276,16 +276,4 @@ func TestDecodeItem_RejectsCorruptInput(t *testing.T) {
 			require.Contains(t, err.Error(), c.wantSub)
 		})
 	}
-}
-
-// stringIndex is a thin wrapper to keep the codec_test imports focused.
-// strings.Index would do the same; the indirection here is purely to
-// match the assertion shape ("must come earlier in the bytes").
-func stringIndex(s, substr string) int {
-	for i := 0; i+len(substr) <= len(s); i++ {
-		if s[i:i+len(substr)] == substr {
-			return i
-		}
-	}
-	return -1
 }

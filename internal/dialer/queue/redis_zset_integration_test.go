@@ -25,11 +25,21 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
+	"go.uber.org/goleak"
 	"go.uber.org/zap/zaptest"
 
 	"github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/dialer/queue"
 )
+
+// TestMain runs goleak.VerifyTestMain across the integration suite so
+// any goroutine spawned by go-redis, testcontainers, or our own scripts
+// is detected at exit. Cheap insurance — testcontainers spins up a
+// Docker container per fixture and any leaked client goroutine would
+// otherwise hide behind the slow test signal.
+func TestMain(m *testing.M) {
+	goleak.VerifyTestMain(m)
+}
 
 // startRedis boots Redis 7.4 in a container and returns its host:port.
 // Cleanup is registered via t.Cleanup; Terminate runs against
@@ -246,16 +256,16 @@ func TestIntegration_PriorityBandsHoldUnderRace(t *testing.T) {
 	// Two priority bands × 50 each.
 	const perBand = 50
 	t0 := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
-	for band := uint8(0); band < 2; band++ {
+	for band := range 2 {
 		for j := range perBand {
-			f.clock.now = t0.Add(time.Duration(int(band)*perBand+j) * time.Millisecond)
+			f.clock.now = t0.Add(time.Duration(band*perBand+j) * time.Millisecond)
 			ok, err := f.q.EnqueueRespondent(ctx, api.EnqueueRequest{
 				TenantID:     tenantID,
 				ProjectID:    projectID,
 				RespondentID: uuid.New(),
 				Phone:        "+79991234567",
 				Region:       "RU-MOW",
-				Priority:     band, // band 0 then band 1
+				Priority:     uint8(band), //nolint:gosec // band is bounded by `2` // band 0 then band 1
 			})
 			require.NoError(t, err)
 			require.True(t, ok)
