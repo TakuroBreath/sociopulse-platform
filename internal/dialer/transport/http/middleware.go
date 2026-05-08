@@ -2,6 +2,7 @@ package http
 
 import (
 	"net/http"
+	"slices"
 
 	"github.com/gin-gonic/gin"
 
@@ -58,11 +59,11 @@ func requireRole(roles ...authapi.Role) gin.HandlerFunc {
 			})
 			return
 		}
-		for _, r := range roles {
-			if claims.HasRole(r) {
-				c.Next()
-				return
-			}
+		// slices.ContainsFunc per golang-modernize Go 1.21+; replaces the
+		// explicit for-range OR-membership loop. Functionally identical.
+		if slices.ContainsFunc(roles, claims.HasRole) {
+			c.Next()
+			return
 		}
 		c.AbortWithStatusJSON(http.StatusForbidden, ErrorEnvelope{
 			Code:    "auth.insufficient_role",
