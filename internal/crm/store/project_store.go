@@ -81,9 +81,19 @@ func scanRow(r rowScanner) (api.Project, error) {
 	return p, nil
 }
 
+// uniqueConstraintCode is the exact name Postgres auto-assigns to the
+// `unique (tenant_id, code)` constraint declared in 000001_init.up.sql.
+// We match on this explicit name (rather than any 23505 on the projects
+// table) so a future migration that adds a second unique index — say,
+// on (tenant_id, lower(name)) — surfaces a distinct error instead of
+// silently masquerading as ErrProjectCodeTaken.
+const uniqueConstraintCode = "projects_tenant_id_code_key"
+
 // translateErr maps pgx / pgconn errors into the crm api sentinels.
-// pgx.ErrNoRows -> ErrProjectNotFound; SQLSTATE 23505 (unique violation)
-// on the (tenant_id, code) constraint -> ErrProjectCodeTaken.
+// pgx.ErrNoRows -> ErrProjectNotFound; SQLSTATE 23505 on the
+// (tenant_id, code) unique constraint -> ErrProjectCodeTaken. Any
+// other 23505 (different unique constraint) is returned as-is so the
+// caller sees the raw pg error and can decide how to handle it.
 func translateErr(err error) error {
 	if err == nil {
 		return nil
@@ -93,10 +103,14 @@ func translateErr(err error) error {
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation {
-		// Wrap the constraint name into the sentinel via errors.Join
-		// so callers can errors.Is(err, api.ErrProjectCodeTaken)
-		// without losing the diagnostic constraint detail.
-		return errors.Join(api.ErrProjectCodeTaken, fmt.Errorf("constraint=%s", pgErr.ConstraintName))
+		if pgErr.ConstraintName == uniqueConstraintCode {
+			// Wrap the constraint name into the sentinel via errors.Join
+			// so callers can errors.Is(err, api.ErrProjectCodeTaken)
+			// without losing the diagnostic constraint detail.
+			return errors.Join(api.ErrProjectCodeTaken, fmt.Errorf("constraint=%s", pgErr.ConstraintName))
+		}
+		// Different unique constraint — don't translate, surface the
+		// raw error so the caller can see exactly what conflicted.
 	}
 	return err
 }
