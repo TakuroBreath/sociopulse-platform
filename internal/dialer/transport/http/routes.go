@@ -35,6 +35,22 @@ type Deps struct {
 	// WSConfig optionally overrides the WebSocket ping/pong / write
 	// timeouts. Zero value picks production defaults — see ws.go.
 	WSConfig WSConfig
+
+	// RefreshPresence is the optional adapter the heartbeat middleware
+	// invokes on every authenticated operator request. Composition root
+	// (internal/dialer/module.go) closes over fsm.RefreshPresence + the
+	// shared *redis.Client. Nil disables the middleware — useful for
+	// Redis-less test setups; the heartbeat watchdog still runs in
+	// production so missing this wiring degrades gracefully (operators
+	// who only ever hit HTTP without the WS keep-alive can be force-
+	// paused after one watchdog sweep, which is the pre-Plan 11.1
+	// behaviour).
+	RefreshPresence RefreshFn
+
+	// Metrics is the optional observability surface for the transport.
+	// Nil disables every observation; production wires
+	// RegisterMetrics(reg) and passes the result here.
+	Metrics *Metrics
 }
 
 // SnapshotPubSub is the tiny pub/sub seam the WS handler uses to
@@ -74,6 +90,17 @@ func Mount(group *gin.RouterGroup, deps Deps) {
 	// Every dialer route requires authentication.
 	authed := group.Group("")
 	authed.Use(authmw.JWTMiddleware(deps.Validator))
+
+	// Heartbeat presence refresh — applied AFTER JWTMiddleware so claims
+	// are populated. Mounted at the authed-group level (rather than on
+	// the operator-only sessions/calls subgroups) so any future
+	// operator-driven endpoint inherits the refresh without rewiring;
+	// supervisor / admin claims pass through cheaply since the
+	// watchdog's SCAN pattern (op:*:user:*) only matches operator
+	// hashes — refreshing a supervisor's presence:<t>:user:<sid> key
+	// is a no-op against the watchdog's evict path. nil RefreshPresence
+	// yields a no-op middleware (factory short-circuits at construction).
+	authed.Use(refreshPresenceMiddleware(deps.RefreshPresence, deps.Metrics, deps.Logger))
 
 	// Operator self-service — sessions / calls.
 	sessions := authed.Group("/sessions")

@@ -64,6 +64,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
@@ -321,7 +322,7 @@ func (m *Module) Register(d modules.Deps) error {
 	if d.HTTPRouter != nil {
 		if dialerRouter == nil {
 			logger.Warn("dialer: HTTP transport not mounted (router missing)")
-		} else if err := m.mountHTTP(d, machine, dialerRouter, q, checker, tracker); err != nil {
+		} else if err := m.mountHTTP(d, machine, dialerRouter, q, checker, tracker, rdb); err != nil {
 			logger.Warn("dialer: HTTP transport not mounted", zap.Error(err))
 		}
 	} else {
@@ -388,6 +389,7 @@ func (m *Module) mountHTTP(
 	q *queue.RedisQueue,
 	checker *hours.Checker,
 	tracker *capacity.Tracker,
+	rdb *redis.Client,
 ) error {
 	rbac, ok := lookupRBACChecker(d.Locator, m.logger)
 	if !ok {
@@ -398,16 +400,30 @@ func (m *Module) mountHTTP(
 		return errors.New("auth.ClaimsValidator missing from locator")
 	}
 
+	// Heartbeat presence-refresh adapter — fired by the transport
+	// middleware on every authenticated request. Passing ttl=0 lets
+	// fsm.RefreshPresence apply its own default (defaultHeartbeatPresenceTTL,
+	// which pairs with the watchdog's sweep cadence). Locking the TTL
+	// here would couple this composition root to a watchdog tunable that
+	// should stay owned by the fsm package.
+	var refresh transporthttp.RefreshFn
+	if rdb != nil {
+		refresh = func(ctx context.Context, tenantID, operatorID uuid.UUID) error {
+			return fsm.RefreshPresence(ctx, rdb, tenantID, operatorID, 0)
+		}
+	}
+
 	transporthttp.Mount(d.HTTPRouter.Group("/api"), transporthttp.Deps{
-		FSM:            machine,
-		Router:         router,
-		Queue:          q,
-		Hours:          checker,
-		Capacity:       tracker,
-		Validator:      validator,
-		RBAC:           rbac,
-		Logger:         m.logger.Named("http"),
-		SnapshotPubSub: m.pubsub,
+		FSM:             machine,
+		Router:          router,
+		Queue:           q,
+		Hours:           checker,
+		Capacity:        tracker,
+		Validator:       validator,
+		RBAC:            rbac,
+		Logger:          m.logger.Named("http"),
+		SnapshotPubSub:  m.pubsub,
+		RefreshPresence: refresh,
 	})
 	m.logger.Info("dialer HTTP transport mounted under /api")
 	return nil
