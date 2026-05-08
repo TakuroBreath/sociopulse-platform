@@ -288,15 +288,13 @@ func TestPresence_ConcurrentOnConnect(t *testing.T) {
 
 	const N = 32
 	var wg sync.WaitGroup
-	wg.Add(N)
-	for i := 0; i < N; i++ {
-		go func(idx int) {
-			defer wg.Done()
-			userID := "u" + string(rune('a'+idx%26)) + string(rune('0'+idx/26))
+	for i := range N {
+		wg.Go(func() {
+			userID := "u" + string(rune('a'+i%26)) + string(rune('0'+i/26))
 			if err := tracker.OnConnect(ctx, "tenant-A", userID, "replica-1"); err != nil {
 				t.Errorf("OnConnect failed: %v", err)
 			}
-		}(i)
+		})
 	}
 	wg.Wait()
 
@@ -581,7 +579,7 @@ func TestPresence_OnlineUsersScansAcrossManyKeys(t *testing.T) {
 	ctx := t.Context()
 
 	const N = 250 // > presenceScanCount(100), forces multi-batch SCAN
-	for i := 0; i < N; i++ {
+	for i := range N {
 		userID := "user-" + string(rune('a'+i%26)) + "-" + string(rune('0'+i/26%10))
 		require.NoError(t, tracker.OnConnect(ctx, "tenant-A", userID, "r1"))
 	}
