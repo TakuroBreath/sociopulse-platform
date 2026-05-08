@@ -29,4 +29,8 @@ var (
 	ErrImportPayloadTooBig = errors.New("crm: import payload exceeds limit")
 	// ErrAdvertisingRejected is returned when CreateProject sets is_advertising=true (deferred to v2).
 	ErrAdvertisingRejected = errors.New("crm: is_advertising=true is not allowed in v1")
+	// ErrInvalidArgument is returned for malformed inputs (empty operator
+	// id slice, nil-uuid id, etc.) that do not warrant a more specific
+	// sentinel. Callers can errors.Is for a 4xx-class fall-through.
+	ErrInvalidArgument = errors.New("crm: invalid argument")
 )

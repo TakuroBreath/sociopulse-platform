@@ -259,51 +259,427 @@ func validateCreateInput(in api.CreateProjectInput) error {
 	return nil
 }
 
-// Update / Pause / Resume / Archive / GetProgress / Assign / Unassign /
-// ListMembers — Plan 06 Task 2+ implements these. Stub them out so
-// *ProjectService still satisfies api.ProjectService at compile time.
+// Update implements api.ProjectService.Update.
+//
+// Resolves the project's tenant via a BypassRLS GetByID, then opens a
+// per-tenant transaction (RLS in effect) and runs the partial-update.
+// An empty patch is a true no-op: the service short-circuits before
+// even opening the transaction so the audit trail stays clean (no
+// "updated" row when nothing changed).
+//
+// Archived projects are rejected with ErrProjectArchived so callers
+// don't accidentally mutate a soft-deleted row. The Update SQL itself
+// also excludes archived rows; the up-front check exists to surface a
+// clearer sentinel than a generic "not found".
+//
+// One audit row "crm.project.updated" is emitted on success carrying
+// the diff payload (the keys that were actually patched). The
+// transaction commits the row write and the audit row together — the
+// service inherits that durability guarantee from writeAudit.
+func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, in api.UpdateProjectInput) (*api.Project, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: update project: %w", api.ErrInvalidArgument)
+	}
+	patch := api.UpdatePatch{
+		Name:        in.Name,
+		Customer:    in.Customer,
+		TargetCount: in.TargetCount,
+		PeriodFrom:  in.PeriodFrom,
+		PeriodTo:    in.PeriodTo,
+		SurveyID:    in.SurveyID,
+	}
 
-// Update implements api.ProjectService.Update — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Update(_ context.Context, _ uuid.UUID, _ api.UpdateProjectInput) (*api.Project, error) {
-	return nil, fmt.Errorf("crm/service: update: %w", errNotImplemented)
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if current.ArchivedAt != nil {
+		return nil, api.ErrProjectArchived
+	}
+	// Empty patch: short-circuit so we don't bump updated_at or audit a non-change.
+	if patch.IsEmpty() {
+		return &current, nil
+	}
+
+	var saved api.Project
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		var err error
+		saved, err = s.store.Update(ctx, tx, id, patch)
+		if err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: saved.TenantID,
+			Action:   "crm.project.updated",
+			Target:   "project:" + saved.ID.String(),
+			Payload:  buildUpdatePayload(in),
+		})
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) || errors.Is(err, api.ErrProjectArchived) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("crm/service: update project: %w", err)
+	}
+	return &saved, nil
 }
 
-// Pause implements api.ProjectService.Pause — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Pause(_ context.Context, _ uuid.UUID) error {
-	return fmt.Errorf("crm/service: pause: %w", errNotImplemented)
+// Pause implements api.ProjectService.Pause: Active → Paused.
+//
+// State machine: Active→Paused commits and audits, Paused→Paused is a
+// silent no-op (idempotent), Archived is rejected with ErrProjectArchived
+// (terminal state guard).
+func (s *ProjectService) Pause(ctx context.Context, id uuid.UUID) error {
+	return s.transitionStatus(ctx, id, api.StatusPaused, "crm.project.paused")
 }
 
-// Resume implements api.ProjectService.Resume — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Resume(_ context.Context, _ uuid.UUID) error {
-	return fmt.Errorf("crm/service: resume: %w", errNotImplemented)
+// Resume implements api.ProjectService.Resume: Paused → Active.
+//
+// Symmetrical to Pause — Paused→Active commits/audits, Active→Active is
+// a silent no-op, Archived is rejected.
+func (s *ProjectService) Resume(ctx context.Context, id uuid.UUID) error {
+	return s.transitionStatus(ctx, id, api.StatusActive, "crm.project.resumed")
 }
 
-// Archive implements api.ProjectService.Archive — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Archive(_ context.Context, _ uuid.UUID) error {
-	return fmt.Errorf("crm/service: archive: %w", errNotImplemented)
+// Archive implements api.ProjectService.Archive: terminal transition.
+//
+// Active|Paused → Archived commits/audits, Archived→Archived is a
+// silent no-op (terminal idempotency). archived_at is stamped at the
+// service clock so the timestamp matches the audit row exactly.
+func (s *ProjectService) Archive(ctx context.Context, id uuid.UUID) error {
+	return s.transitionStatus(ctx, id, api.StatusArchived, "crm.project.archived")
 }
 
-// GetProgress implements api.ProjectService.GetProgress — Plan 06 Task 2 fills it in.
-func (s *ProjectService) GetProgress(_ context.Context, _ uuid.UUID) (*api.ProjectProgress, error) {
-	return nil, fmt.Errorf("crm/service: get progress: %w", errNotImplemented)
+// transitionStatus is the shared engine for Pause/Resume/Archive. It
+// resolves the project, runs the state-machine guard against the
+// current status, and (when the transition is real, not a no-op) opens
+// a per-tenant transaction to write the new status + audit row in one
+// commit.
+//
+// Idempotency rules (locked in via the user prompt):
+//
+//	target == current         -> silent no-op (no SQL, no audit)
+//	current == archived       -> ErrProjectArchived (unless target=archived,
+//	                             which is the no-op above)
+//	target  == archived       -> stamp archived_at at the service clock
+//	any other transition path -> proceed.
+func (s *ProjectService) transitionStatus(ctx context.Context, id uuid.UUID, target api.ProjectStatus, action string) error {
+	if id == uuid.Nil {
+		return fmt.Errorf("crm/service: %s: %w", action, api.ErrInvalidArgument)
+	}
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return err
+	}
+	// Idempotent: same state → silent no-op.
+	if current.Status == target {
+		return nil
+	}
+	// Archived is terminal for non-Archive targets.
+	if current.Status == api.StatusArchived {
+		return api.ErrProjectArchived
+	}
+
+	var archivedAt *time.Time
+	if target == api.StatusArchived {
+		ts := s.clock().UTC()
+		archivedAt = &ts
+	}
+
+	from := current.Status
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		_, err := s.store.UpdateStatus(ctx, tx, id, target, archivedAt)
+		if err != nil {
+			return err
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: current.TenantID,
+			Action:   action,
+			Target:   "project:" + id.String(),
+			Payload: map[string]any{
+				"from": string(from),
+				"to":   string(target),
+			},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) {
+			return err
+		}
+		return fmt.Errorf("crm/service: %s: %w", action, err)
+	}
+	return nil
 }
 
-// Assign implements api.ProjectService.Assign — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Assign(_ context.Context, _ uuid.UUID, _ []uuid.UUID) error {
-	return fmt.Errorf("crm/service: assign: %w", errNotImplemented)
+// GetProgress implements api.ProjectService.GetProgress.
+//
+// Reads only — no audit row, no event publish. Resolves tenant via
+// BypassRLS GetByID, then runs AggregateProgress through a per-tenant
+// tx so RLS still scopes the underlying respondents/calls reads.
+//
+// Derived metrics (PercentDone, PaceLast24h, ETACompletion) are
+// computed here from the raw counters the store returns. The plan
+// source builds these in a separate helper; we inline them since the
+// math is small (3 lines) and the alternative is a one-method file.
+//
+// PaceLast24h and ETACompletion are stubbed in v1 — the calls table
+// exists per migrations/000001 but isn't yet populated by any module
+// (Plan 08+ owns the dialer). Returning 0/nil is honest — the
+// dashboard renders "—" until calls flow.
+func (s *ProjectService) GetProgress(ctx context.Context, id uuid.UUID) (*api.ProjectProgress, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get progress: %w", api.ErrInvalidArgument)
+	}
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	var prog api.ProjectProgress
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		var err error
+		prog, err = s.store.AggregateProgress(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("crm/service: get progress: %w", err)
+	}
+
+	if prog.TargetCount > 0 {
+		prog.PercentDone = float64(prog.CompletedCount) / float64(prog.TargetCount) * 100
+	}
+	return &prog, nil
 }
 
-// Unassign implements api.ProjectService.Unassign — Plan 06 Task 2 fills it in.
-func (s *ProjectService) Unassign(_ context.Context, _ uuid.UUID, _ uuid.UUID) error {
-	return fmt.Errorf("crm/service: unassign: %w", errNotImplemented)
+// Assign implements api.ProjectService.Assign with MERGE semantics.
+//
+// Empty input → ErrInvalidArgument. Duplicates in the input slice are
+// de-duplicated up front (the store would also handle them via
+// ON CONFLICT, but de-duping here saves a placeholder slot per dup).
+//
+// One audit row per *newly* added operator (RETURNING tells us which
+// were inserted) so the audit trail has a 1:1 mapping with member-
+// joined events. Operators that were already members are silently
+// skipped — no audit row, no error.
+func (s *ProjectService) Assign(ctx context.Context, id uuid.UUID, operatorIDs []uuid.UUID) error {
+	dedup, err := s.validateAssignInput(id, operatorIDs)
+	if err != nil {
+		return err
+	}
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return err
+	}
+	if current.ArchivedAt != nil {
+		return api.ErrProjectArchived
+	}
+
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		return s.applyAssign(ctx, tx, id, current.TenantID, dedup)
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) || errors.Is(err, api.ErrProjectArchived) {
+			return err
+		}
+		return fmt.Errorf("crm/service: assign: %w", err)
+	}
+	return nil
 }
 
-// ListMembers implements api.ProjectService.ListMembers — Plan 06 Task 2 fills it in.
-func (s *ProjectService) ListMembers(_ context.Context, _ uuid.UUID) ([]api.ProjectMember, error) {
-	return nil, fmt.Errorf("crm/service: list members: %w", errNotImplemented)
+// validateAssignInput pre-checks Assign inputs and returns the
+// deduplicated, non-nil operator id slice. Surfaced as a helper so the
+// public Assign method stays under gocognit's complexity ceiling — this
+// is the trio of guards that would otherwise pile branches on the
+// happy-path closure.
+func (s *ProjectService) validateAssignInput(id uuid.UUID, operatorIDs []uuid.UUID) ([]uuid.UUID, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: assign: %w", api.ErrInvalidArgument)
+	}
+	if len(operatorIDs) == 0 {
+		return nil, fmt.Errorf("crm/service: assign: operator ids required: %w", api.ErrInvalidArgument)
+	}
+	dedup := dedupNonNil(operatorIDs)
+	if len(dedup) == 0 {
+		return nil, fmt.Errorf("crm/service: assign: operator ids required: %w", api.ErrInvalidArgument)
+	}
+	return dedup, nil
 }
 
-// errNotImplemented marks the deferred lifecycle methods. Returned as
-// the wrapped sentinel so callers can errors.Is for graceful UI
-// fall-back during the multi-task rollout.
-var errNotImplemented = errors.New("not implemented in Plan 06 Task 1")
+// applyAssign is the inner-tx Assign worker. Snapshots the existing
+// members so we can audit precisely the rows the store inserted
+// (RETURNING from AssignOperators gives count, not ids), runs the
+// MERGE insert, and emits one audit row per newly-added operator.
+//
+// Extracted from Assign so the public method stays under gocognit's
+// complexity ceiling (Plan 05 lessons learned § 7).
+func (s *ProjectService) applyAssign(ctx context.Context, tx postgres.Tx, id, tenantID uuid.UUID, ops []uuid.UUID) error {
+	existing, err := s.store.ListMembers(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	existingSet := make(map[uuid.UUID]struct{}, len(existing))
+	for _, m := range existing {
+		existingSet[m.OperatorID] = struct{}{}
+	}
+
+	if _, err := s.store.AssignOperators(ctx, tx, id, ops); err != nil {
+		return err
+	}
+
+	for _, op := range ops {
+		if _, already := existingSet[op]; already {
+			continue
+		}
+		if err := s.writeAudit(ctx, auditapi.Event{
+			TenantID: tenantID,
+			Action:   "crm.project.member_assigned",
+			Target:   "user:" + op.String(),
+			Payload: map[string]any{
+				"project_id":  id,
+				"operator_id": op,
+			},
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// Unassign implements api.ProjectService.Unassign.
+//
+// One DELETE; one audit row when the row was actually present (the
+// store returns deleted=false for unknown operators, in which case we
+// silently no-op — no error, no audit). Archived projects still allow
+// Unassign to support cleanup of soft-deleted projects' rosters.
+func (s *ProjectService) Unassign(ctx context.Context, id uuid.UUID, operatorID uuid.UUID) error {
+	if id == uuid.Nil || operatorID == uuid.Nil {
+		return fmt.Errorf("crm/service: unassign: %w", api.ErrInvalidArgument)
+	}
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return err
+	}
+
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		deleted, err := s.store.UnassignOperator(ctx, tx, id, operatorID)
+		if err != nil {
+			return err
+		}
+		if !deleted {
+			return nil
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: current.TenantID,
+			Action:   "crm.project.member_unassigned",
+			Target:   "user:" + operatorID.String(),
+			Payload: map[string]any{
+				"project_id":  id,
+				"operator_id": operatorID,
+			},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) {
+			return err
+		}
+		return fmt.Errorf("crm/service: unassign: %w", err)
+	}
+	return nil
+}
+
+// ListMembers implements api.ProjectService.ListMembers.
+//
+// Pure read — no audit row, no event publish. Resolves tenant via
+// BypassRLS GetByID, then issues the join through a per-tenant tx so
+// the users-table read is RLS-scoped (a tenant cannot enumerate
+// another's users via a stale project_assignments row).
+func (s *ProjectService) ListMembers(ctx context.Context, id uuid.UUID) ([]api.ProjectMember, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: list members: %w", api.ErrInvalidArgument)
+	}
+	current, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+
+	var members []api.ProjectMember
+	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
+		var err error
+		members, err = s.store.ListMembers(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("crm/service: list members: %w", err)
+	}
+	return members, nil
+}
+
+// lookupProject reads the row by id via BypassRLS so the caller doesn't
+// have to know the tenant up front. Returns api.ErrProjectNotFound on a
+// missing row; otherwise wraps the underlying error.
+func (s *ProjectService) lookupProject(ctx context.Context, id uuid.UUID) (api.Project, error) {
+	var p api.Project
+	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+		var err error
+		p, err = s.store.GetByID(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) {
+			return api.Project{}, err
+		}
+		return api.Project{}, fmt.Errorf("crm/service: lookup project: %w", err)
+	}
+	return p, nil
+}
+
+// dedupNonNil returns a stable-ordered slice of unique non-nil UUIDs
+// from src. Stable order matters for the test suite and for any future
+// transactional ordering guarantees.
+func dedupNonNil(src []uuid.UUID) []uuid.UUID {
+	if len(src) == 0 {
+		return nil
+	}
+	seen := make(map[uuid.UUID]struct{}, len(src))
+	out := make([]uuid.UUID, 0, len(src))
+	for _, id := range src {
+		if id == uuid.Nil {
+			continue
+		}
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		seen[id] = struct{}{}
+		out = append(out, id)
+	}
+	return out
+}
+
+// buildUpdatePayload renders the audit payload for "crm.project.updated"
+// — only the keys the caller actually patched, so the trail stays
+// reviewable.
+func buildUpdatePayload(in api.UpdateProjectInput) map[string]any {
+	out := make(map[string]any, 6)
+	if in.Name != nil {
+		out["name"] = *in.Name
+	}
+	if in.Customer != nil {
+		out["customer"] = *in.Customer
+	}
+	if in.TargetCount != nil {
+		out["target_count"] = *in.TargetCount
+	}
+	if in.PeriodFrom != nil {
+		out["period_from"] = *in.PeriodFrom
+	}
+	if in.PeriodTo != nil {
+		out["period_to"] = *in.PeriodTo
+	}
+	if in.SurveyID != nil {
+		out["survey_id"] = *in.SurveyID
+	}
+	return out
+}

@@ -314,3 +314,464 @@ func TestProjectStore_List_Pagination(t *testing.T) {
 	require.Len(t, rows, 2, "limit=2 must clamp to 2 rows")
 	require.EqualValues(t, 5, total, "total reflects unfiltered count")
 }
+
+// ─── Update ────────────────────────────────────────────────────────────────
+
+func TestProjectStore_Update_PartialPatch(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-UP-1")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID:    tenantID,
+		Code:        "U-PART",
+		Name:        "Original",
+		Customer:    "Old Customer",
+		Status:      crmapi.StatusActive,
+		TargetCount: 100,
+	})
+
+	newName := "Patched"
+	var updated crmapi.Project
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		updated, err = s.Update(ctx, tx, seeded.ID, crmapi.UpdatePatch{
+			Name: &newName,
+		})
+		return err
+	}))
+	require.Equal(t, "Patched", updated.Name)
+	require.Equal(t, "Old Customer", updated.Customer, "untouched field stays")
+	require.Equal(t, 100, updated.TargetCount, "untouched field stays")
+}
+
+func TestProjectStore_Update_RejectsArchivedRow(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-UP-AR")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID,
+		Code:     "U-AR",
+		Name:     "To Be Archived",
+		Status:   crmapi.StatusActive,
+	})
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE projects SET archived_at = now() WHERE id = $1`, seeded.ID)
+		return err
+	}))
+
+	newName := "Should Fail"
+	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.Update(ctx, tx, seeded.ID, crmapi.UpdatePatch{Name: &newName})
+		return err
+	})
+	require.ErrorIs(t, err, crmapi.ErrProjectNotFound,
+		"archived row excluded by Update predicate -> ErrProjectNotFound")
+}
+
+func TestProjectStore_Update_MissingReturnsErrProjectNotFound(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-UP-MISS")
+	s := store.NewProjectStore(pool)
+
+	newName := "Ghost"
+	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.Update(ctx, tx, uuid.New(), crmapi.UpdatePatch{Name: &newName})
+		return err
+	})
+	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
+}
+
+// ─── UpdateStatus ──────────────────────────────────────────────────────────
+
+func TestProjectStore_UpdateStatus_PauseAndArchive(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-STATUS")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "S-1", Name: "Status",
+		Status: crmapi.StatusActive,
+	})
+
+	// Active -> Paused (no archived_at).
+	var paused crmapi.Project
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		paused, err = s.UpdateStatus(ctx, tx, seeded.ID, crmapi.StatusPaused, nil)
+		return err
+	}))
+	require.Equal(t, crmapi.StatusPaused, paused.Status)
+	require.Nil(t, paused.ArchivedAt, "non-archive transition leaves archived_at nil")
+
+	// Paused -> Archived (with archived_at).
+	now := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+	var archived crmapi.Project
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		archived, err = s.UpdateStatus(ctx, tx, seeded.ID, crmapi.StatusArchived, &now)
+		return err
+	}))
+	require.Equal(t, crmapi.StatusArchived, archived.Status)
+	require.NotNil(t, archived.ArchivedAt)
+}
+
+func TestProjectStore_UpdateStatus_MissingReturnsErrProjectNotFound(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-STAT-MISS")
+	s := store.NewProjectStore(pool)
+
+	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.UpdateStatus(ctx, tx, uuid.New(), crmapi.StatusPaused, nil)
+		return err
+	})
+	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
+}
+
+// ─── AggregateProgress ────────────────────────────────────────────────────
+
+func TestProjectStore_AggregateProgress_EmptyProject(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AG-1")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "AG-E", Name: "Empty",
+		Status:      crmapi.StatusActive,
+		TargetCount: 500,
+	})
+
+	var prog crmapi.ProjectProgress
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		prog, err = s.AggregateProgress(ctx, tx, seeded.ID)
+		return err
+	}))
+	require.Equal(t, seeded.ID, prog.ProjectID)
+	require.Equal(t, 500, prog.TargetCount)
+	require.Equal(t, 0, prog.CompletedCount)
+	require.Equal(t, 0, prog.InProgressCount)
+	require.Empty(t, prog.QuotaProgress)
+}
+
+func TestProjectStore_AggregateProgress_WithRespondents(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AG-R")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "AG-R", Name: "With Respondents",
+		Status:      crmapi.StatusActive,
+		TargetCount: 100,
+	})
+
+	// Seed a handful of respondents in different statuses through a per-
+	// tenant tx so RLS lets the rows land.
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		statuses := []string{
+			"completed", "completed", "completed",
+			"dialing",
+			"pending", "pending",
+			"dnc",
+			"exhausted",
+		}
+		for i, st := range statuses {
+			_, err := tx.Exec(ctx,
+				`INSERT INTO respondents (tenant_id, project_id, phone_encrypted, phone_hash, region_code, source, status)
+				 VALUES ($1, $2, $3::bytea, $4::bytea, 'RU-MOW', 'imported', $5)`,
+				tenantID, seeded.ID,
+				[]byte{byte(i)}, []byte{byte(i + 1)}, st,
+			)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	}))
+
+	var prog crmapi.ProjectProgress
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		prog, err = s.AggregateProgress(ctx, tx, seeded.ID)
+		return err
+	}))
+	require.Equal(t, 100, prog.TargetCount)
+	require.Equal(t, 3, prog.CompletedCount)
+	require.Equal(t, 1, prog.InProgressCount)
+	require.Equal(t, 2, prog.PendingCount)
+	require.Equal(t, 1, prog.DNCCount)
+	require.Equal(t, 1, prog.ExhaustedCount)
+	require.Equal(t, 0, prog.WrongCount)
+}
+
+func TestProjectStore_AggregateProgress_WithQuotaCells(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AG-Q")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "AG-Q", Name: "With Quotas",
+		Status:      crmapi.StatusActive,
+		TargetCount: 200,
+	})
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := tx.Exec(ctx,
+			`INSERT INTO project_quotas (project_id, dimension_kind, dimension_value, target, done)
+			 VALUES ($1, 'region', 'ЦФО', 100, 40),
+			        ($1, 'region', 'СЗФО', 50, 50)`,
+			seeded.ID)
+		return err
+	}))
+
+	var prog crmapi.ProjectProgress
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		prog, err = s.AggregateProgress(ctx, tx, seeded.ID)
+		return err
+	}))
+	require.Len(t, prog.QuotaProgress, 2)
+	require.Equal(t, "region", prog.QuotaProgress[0].DimensionKind)
+	require.Equal(t, "СЗФО", prog.QuotaProgress[0].DimensionValue,
+		"order is dimension_kind ASC, dimension_value ASC")
+	require.Equal(t, 50, prog.QuotaProgress[0].Target)
+	require.Equal(t, 50, prog.QuotaProgress[0].Done)
+	require.True(t, prog.QuotaProgress[0].IsFull)
+	require.InDelta(t, 100.0, prog.QuotaProgress[0].PercentDone, 0.01)
+
+	require.Equal(t, "ЦФО", prog.QuotaProgress[1].DimensionValue)
+	require.False(t, prog.QuotaProgress[1].IsFull)
+	require.InDelta(t, 40.0, prog.QuotaProgress[1].PercentDone, 0.01)
+}
+
+func TestProjectStore_AggregateProgress_MissingReturnsErrProjectNotFound(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AG-MISS")
+	s := store.NewProjectStore(pool)
+
+	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.AggregateProgress(ctx, tx, uuid.New())
+		return err
+	})
+	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
+}
+
+// ─── Assign / Unassign / ListMembers ──────────────────────────────────────
+
+func TestProjectStore_AssignOperators_HappyAndIdempotent(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AS-1")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "AS-1", Name: "Assign 1",
+		Status: crmapi.StatusActive,
+	})
+	op1 := seedUser(t, ctx, pool, tenantID, "op-as-1", "Op AS One")
+	op2 := seedUser(t, ctx, pool, tenantID, "op-as-2", "Op AS Two")
+
+	// First assign: both new -> added=2.
+	var added int
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		added, err = s.AssignOperators(ctx, tx, seeded.ID, []uuid.UUID{op1, op2})
+		return err
+	}))
+	require.Equal(t, 2, added)
+
+	// Re-run: both already members -> added=0 (idempotent).
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		added, err = s.AssignOperators(ctx, tx, seeded.ID, []uuid.UUID{op1, op2})
+		return err
+	}))
+	require.Equal(t, 0, added)
+
+	// Mixed: one new, one existing -> added=1.
+	op3 := seedUser(t, ctx, pool, tenantID, "op-as-3", "Op AS Three")
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		added, err = s.AssignOperators(ctx, tx, seeded.ID, []uuid.UUID{op1, op3})
+		return err
+	}))
+	require.Equal(t, 1, added, "ON CONFLICT DO NOTHING returns only the inserted op_id")
+}
+
+func TestProjectStore_AssignOperators_EmptyInputIsZero(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-AS-E")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "AS-E", Name: "Empty",
+		Status: crmapi.StatusActive,
+	})
+
+	var added int
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		added, err = s.AssignOperators(ctx, tx, seeded.ID, nil)
+		return err
+	}))
+	require.Equal(t, 0, added)
+}
+
+func TestProjectStore_UnassignOperator_HappyAndNoOp(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-UN-1")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "UN-1", Name: "Unassign",
+		Status: crmapi.StatusActive,
+	})
+	op := seedUser(t, ctx, pool, tenantID, "op-un-1", "Op Un One")
+
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.AssignOperators(ctx, tx, seeded.ID, []uuid.UUID{op})
+		return err
+	}))
+
+	// Happy: row present -> deleted=true.
+	var deleted bool
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		deleted, err = s.UnassignOperator(ctx, tx, seeded.ID, op)
+		return err
+	}))
+	require.True(t, deleted)
+
+	// Re-run: row already gone -> deleted=false (no-op).
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		deleted, err = s.UnassignOperator(ctx, tx, seeded.ID, op)
+		return err
+	}))
+	require.False(t, deleted)
+}
+
+func TestProjectStore_ListMembers_JoinsUsersAndSortsByAssignedAt(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-LM-1")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "LM-1", Name: "List Members",
+		Status: crmapi.StatusActive,
+	})
+	op1 := seedUser(t, ctx, pool, tenantID, "alice-lm", "Alice LM")
+	op2 := seedUser(t, ctx, pool, tenantID, "bob-lm", "Bob LM")
+
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, err := s.AssignOperators(ctx, tx, seeded.ID, []uuid.UUID{op1, op2})
+		return err
+	}))
+
+	var members []crmapi.ProjectMember
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		members, err = s.ListMembers(ctx, tx, seeded.ID)
+		return err
+	}))
+	require.Len(t, members, 2)
+	// Both inserted in the same statement -> assigned_at is identical;
+	// fall back to operator_id ASC ordering for determinism.
+	gotIDs := []uuid.UUID{members[0].OperatorID, members[1].OperatorID}
+	require.Contains(t, gotIDs, op1)
+	require.Contains(t, gotIDs, op2)
+	// At least one entry must carry the joined display fields.
+	for _, m := range members {
+		require.NotEmpty(t, m.Login, "Login should be populated by users join")
+		require.NotEmpty(t, m.FullName, "FullName should be populated by users join")
+	}
+}
+
+func TestProjectStore_ListMembers_EmptyProjectReturnsEmpty(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-PROJ-LM-E")
+	s := store.NewProjectStore(pool)
+
+	seeded := insertProject(t, ctx, pool, s, crmapi.Project{
+		TenantID: tenantID, Code: "LM-E", Name: "Empty",
+		Status: crmapi.StatusActive,
+	})
+
+	var members []crmapi.ProjectMember
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		members, err = s.ListMembers(ctx, tx, seeded.ID)
+		return err
+	}))
+	require.Empty(t, members)
+}

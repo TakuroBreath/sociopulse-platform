@@ -70,10 +70,15 @@ type UpdateProjectInput struct {
 	SurveyID    *uuid.UUID
 }
 
-// ProjectMember describes one operator assignment to a project.
+// ProjectMember describes one operator assignment to a project. Login
+// and FullName are populated by ListMembers (joined from users) for
+// display purposes; they remain zero-valued when the entry is built
+// from a write path that doesn't touch users.
 type ProjectMember struct {
 	OperatorID uuid.UUID
 	AssignedAt time.Time
+	Login      string
+	FullName   string
 }
 
 // ListProjectsFilter narrows ProjectService.List.

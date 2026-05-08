@@ -117,3 +117,26 @@ func seedTenant(t *testing.T, ctx context.Context, pool *postgres.Pool, orgCode 
 	}))
 	return id
 }
+
+// seedUser inserts a users row inside the supplied tenant via a per-
+// tenant tx (so RLS is satisfied AND the regular `app` user has the
+// standard CRUD grants — `tenancy_admin` only owns DML on tenants /
+// tenant_settings). Returns the new user id; login is used to satisfy
+// the (tenant_id, login) unique index — callers should pass
+// deterministic values to keep parallel tests isolated.
+//
+// Schema is post-000003 evolve: legacy `status` column dropped, `roles`
+// is text[] with the operator role.
+func seedUser(t *testing.T, ctx context.Context, pool *postgres.Pool, tenantID uuid.UUID, login, fullName string) uuid.UUID {
+	t.Helper()
+	const q = `
+		INSERT INTO users (tenant_id, login, password_hash, full_name, roles)
+		VALUES ($1, $2, 'placeholder', $3, ARRAY['operator'])
+		RETURNING id`
+
+	var id uuid.UUID
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		return tx.QueryRow(ctx, q, tenantID, login, fullName).Scan(&id)
+	}))
+	return id
+}
