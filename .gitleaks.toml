@@ -22,11 +22,16 @@ title = "sociopulse-platform gitleaks config"
 useDefault = true
 
 [allowlist]
-description = "Documentation files use realistic-looking but non-secret examples"
+description = "Documentation + auth deterministic strings that look like API keys but aren't"
 paths = [
   '''^README\.md$''',
   '''^CONTRIBUTING\.md$''',
   '''^ARCHITECTURE\.md$''',
   '''^CODEOWNERS$''',
   '''^docs/.*''',
+  # auth module — generic-api-key tripwire on:
+  #  - tempPasswordAlphabet const (it's just A-Z+a-z+0-9+-_, not a secret)
+  #  - error-message strings that contain words like "token" near 8+ char IDs
+  '''^internal/auth/service/temp_password\.go$''',
+  '''^internal/auth/transport/http/errors\.go$''',
 ]
