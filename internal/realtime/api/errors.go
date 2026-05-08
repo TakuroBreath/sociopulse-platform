@@ -19,4 +19,13 @@ var (
 	ErrCallNotActive = errors.New("realtime: call not active")
 	// ErrListenerLimit is returned when the per-call listener cap is hit.
 	ErrListenerLimit = errors.New("realtime: listener limit reached for call")
+	// ErrConnectionClosed is returned by Connection methods invoked after Close.
+	// Hub-side helpers and tests use errors.Is to discriminate from transient
+	// network errors that may legitimately produce a write failure.
+	ErrConnectionClosed = errors.New("realtime: connection closed")
+	// ErrSlowConsumer is the sentinel emitted (best-effort, via metrics) when a
+	// frame is dropped because the per-connection send buffer was full. Returned
+	// by Send-style helpers that surface drops back to the caller; the public
+	// Connection.Send swallows it and only increments the dropped counter.
+	ErrSlowConsumer = errors.New("realtime: slow consumer (frame dropped)")
 )
