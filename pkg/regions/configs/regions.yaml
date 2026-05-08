@@ -1,0 +1,258 @@
+# RU regions reference data — embedded at build time via //go:embed.
+#
+# This is a representative subset of the 89 RU subjects that Plan 10 (RDD
+# generator) and Plan 13 (reports) consume. Coverage strategy:
+#
+#   * High-population centres (Moscow, SPb, Moscow Oblast, Krasnodar Krai,
+#     Sverdlovsk Oblast, Tatarstan, Bashkortostan, Novosibirsk, Samara,
+#     Rostov, Chelyabinsk, Nizhny Novgorod) — together ~50 % of the
+#     national population. Sufficient for the v1 RDD weighted sampler.
+#   * Time-zone variety — entries for Asia/Yekaterinburg, Asia/Omsk,
+#     Asia/Novosibirsk, Asia/Krasnoyarsk, Asia/Vladivostok and
+#     Asia/Kamchatka so working-hours code (Plan 10 Task 7) can be
+#     exercised against multiple offsets.
+#
+# TODO: expand this list to all 89 subjects before v1 production cut-over
+# (tracked separately). The schema is stable; adding rows is a pure data
+# task. Mobile DEF prefixes are sourced from Минцифры РФ open registry
+# (https://opendata.digital.gov.ru/registry/numeric/) — refresh quarterly.
+#
+# Each row:
+#   code         ISO 3166-2:RU code (RU-MOW, RU-SPE, ...).
+#   name_ru      Russian-language display name.
+#   name_en      English-language display name (used by export reports).
+#   timezone     IANA tz database identifier — bundled into the binary
+#                via `_ "time/tzdata"` so `time.LoadLocation` works on
+#                FROM-scratch images without alpine tzdata package.
+#   abc_flag     true  — the region uses ABC (landline-style) codes
+#                false — the region uses DEF (mobile) codes; rdd uses this
+#                        for the ABC vs DEF ratio gate. v1 keeps every
+#                        entry as DEF since RDD targets cellular numbers.
+#   def_prefixes Three-digit mobile area codes (DEF) typically associated
+#                with the region. Carrier-by-carrier breakdown is
+#                deliberately omitted — RDD weights every prefix in the
+#                list equally.
+
+regions:
+  - code: RU-MOW
+    name_ru: Москва
+    name_en: Moscow
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "905"
+      - "906"
+      - "915"
+      - "916"
+      - "917"
+      - "925"
+      - "926"
+      - "999"
+
+  - code: RU-SPE
+    name_ru: Санкт-Петербург
+    name_en: Saint Petersburg
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "904"
+      - "911"
+      - "921"
+      - "931"
+      - "981"
+
+  - code: RU-MO
+    name_ru: Московская область
+    name_en: Moscow Oblast
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "915"
+      - "916"
+      - "917"
+      - "925"
+      - "926"
+
+  - code: RU-LO
+    name_ru: Ленинградская область
+    name_en: Leningrad Oblast
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "904"
+      - "911"
+      - "921"
+      - "931"
+
+  - code: RU-KDA
+    name_ru: Краснодарский край
+    name_en: Krasnodar Krai
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "918"
+      - "928"
+      - "988"
+
+  - code: RU-ROS
+    name_ru: Ростовская область
+    name_en: Rostov Oblast
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "918"
+      - "928"
+      - "938"
+
+  - code: RU-SAM
+    name_ru: Самарская область
+    name_en: Samara Oblast
+    timezone: Europe/Samara
+    abc_flag: false
+    def_prefixes:
+      - "917"
+      - "927"
+      - "937"
+
+  - code: RU-NIZ
+    name_ru: Нижегородская область
+    name_en: Nizhny Novgorod Oblast
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "910"
+      - "920"
+      - "930"
+
+  - code: RU-TA
+    name_ru: Республика Татарстан
+    name_en: Republic of Tatarstan
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "919"
+      - "927"
+      - "937"
+      - "987"
+
+  - code: RU-BA
+    name_ru: Республика Башкортостан
+    name_en: Republic of Bashkortostan
+    timezone: Asia/Yekaterinburg
+    abc_flag: false
+    def_prefixes:
+      - "917"
+      - "927"
+      - "937"
+      - "987"
+
+  - code: RU-SVE
+    name_ru: Свердловская область
+    name_en: Sverdlovsk Oblast
+    timezone: Asia/Yekaterinburg
+    abc_flag: false
+    def_prefixes:
+      - "912"
+      - "922"
+      - "932"
+      - "950"
+
+  - code: RU-CHE
+    name_ru: Челябинская область
+    name_en: Chelyabinsk Oblast
+    timezone: Asia/Yekaterinburg
+    abc_flag: false
+    def_prefixes:
+      - "912"
+      - "919"
+      - "922"
+      - "951"
+
+  - code: RU-OMS
+    name_ru: Омская область
+    name_en: Omsk Oblast
+    timezone: Asia/Omsk
+    abc_flag: false
+    def_prefixes:
+      - "913"
+      - "923"
+      - "950"
+
+  - code: RU-NVS
+    name_ru: Новосибирская область
+    name_en: Novosibirsk Oblast
+    timezone: Asia/Novosibirsk
+    abc_flag: false
+    def_prefixes:
+      - "913"
+      - "923"
+      - "953"
+
+  - code: RU-KYA
+    name_ru: Красноярский край
+    name_en: Krasnoyarsk Krai
+    timezone: Asia/Krasnoyarsk
+    abc_flag: false
+    def_prefixes:
+      - "913"
+      - "923"
+      - "933"
+
+  - code: RU-IRK
+    name_ru: Иркутская область
+    name_en: Irkutsk Oblast
+    timezone: Asia/Irkutsk
+    abc_flag: false
+    def_prefixes:
+      - "914"
+      - "924"
+      - "950"
+
+  - code: RU-PRI
+    name_ru: Приморский край
+    name_en: Primorsky Krai
+    timezone: Asia/Vladivostok
+    abc_flag: false
+    def_prefixes:
+      - "914"
+      - "924"
+      - "984"
+
+  - code: RU-KHA
+    name_ru: Хабаровский край
+    name_en: Khabarovsk Krai
+    timezone: Asia/Vladivostok
+    abc_flag: false
+    def_prefixes:
+      - "914"
+      - "924"
+      - "984"
+
+  - code: RU-KAM
+    name_ru: Камчатский край
+    name_en: Kamchatka Krai
+    timezone: Asia/Kamchatka
+    abc_flag: false
+    def_prefixes:
+      - "914"
+      - "924"
+
+  - code: RU-VOR
+    name_ru: Воронежская область
+    name_en: Voronezh Oblast
+    timezone: Europe/Moscow
+    abc_flag: false
+    def_prefixes:
+      - "910"
+      - "920"
+      - "950"
+
+  - code: RU-VLG
+    name_ru: Волгоградская область
+    name_en: Volgograd Oblast
+    timezone: Europe/Volgograd
+    abc_flag: false
+    def_prefixes:
+      - "917"
+      - "927"
+      - "937"

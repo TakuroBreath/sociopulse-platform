@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
+	github.com/bits-and-blooms/bloom/v3 v3.7.1
 	github.com/expr-lang/expr v1.17.8
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.12.0
@@ -17,6 +18,7 @@ require (
 	github.com/nyaruka/phonenumbers v1.7.2
 	github.com/pquerna/otp v1.5.0
 	github.com/prometheus/client_golang v1.23.2
+	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
 	github.com/spf13/viper v1.21.0
@@ -34,6 +36,7 @@ require (
 	golang.org/x/crypto v0.50.0
 	golang.org/x/sync v0.20.0
 	google.golang.org/grpc v1.81.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (
@@ -41,6 +44,7 @@ require (
 	github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c // indirect
 	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
+	github.com/bits-and-blooms/bitset v1.24.2 // indirect
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/bytedance/gopkg v0.1.3 // indirect
 	github.com/bytedance/sonic v1.15.0 // indirect
@@ -105,7 +109,6 @@ require (
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
-	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.66.1 // indirect
 	github.com/prometheus/procfs v0.16.1 // indirect
 	github.com/quic-go/qpack v0.6.0 // indirect
@@ -147,5 +150,4 @@ require (
 	google.golang.org/genproto/googleapis/api v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260401024825-9d38bb4040a9 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
