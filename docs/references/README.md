@@ -48,8 +48,8 @@ Each file follows this structure:
 | Plan 05 — auth | **shipped (v0.0.7)** | [`plan-05-auth.md`](plan-05-auth.md) |
 | Plan 06 — CRM | **shipped (v0.0.8)** | [`plan-06-crm.md`](plan-06-crm.md) |
 | Plan 07 — surveys | **shipped (v0.0.9)** | [`plan-07-surveys.md`](plan-07-surveys.md) |
-| Plan 08 — FreeSWITCH cluster | TBD | — |
-| Plan 09 — telephony-bridge | TBD | — |
+| Plan 08 — FreeSWITCH cluster | TBD (sociopulse-infra repo) | — |
+| Plan 09 — telephony-bridge | **shipped (v0.0.10)** | [`plan-09-telephony-bridge.md`](plan-09-telephony-bridge.md) |
 | Plan 10 — dialer | TBD | — |
 | Plan 11 — realtime | TBD | — |
 | Plan 12 — recording | TBD | — |

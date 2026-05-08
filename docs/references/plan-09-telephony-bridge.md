@@ -2,7 +2,7 @@
 
 > **Goal**: shrink the implementation surface for Plan 09 by collecting authoritative ESL/FreeSWITCH refs, prior-plan lessons, and the project-specific path corrections subagents need before writing code.
 
-**Status**: in-progress (Plan 07 shipped at v0.0.9-surveys; Plan 09 next).
+**Status**: shipped at `v0.0.10-telephony-bridge` (2026-05-08).
 
 ---
 
@@ -206,4 +206,40 @@ TBD — fill at close-out.
 
 ## Lessons learned from Plan 09 implementation
 
-> **Filled at close-out.** Append a bullet for every gotcha discovered during implementation that future agents would benefit from knowing. Format: short bold title + 1–2 lines of why + reference (file:line / commit SHA / PR).
+- **Plan-draft uses wrong module path / wrong logger / wrong observability path / wrong config loader.** Subagents must read this references doc FIRST and substitute `github.com/sociopulse/platform`, zap (not slog), `pkg/observability` (not `internal/observability`), `pkg/config` (not caarlos0/env). Captured in §"Pragmatic decisions locked" — drove every Task.
+
+- **`commandVerb` collapses bgapi/api commands to one metric label.** Naive `commandVerb(line)` returns the first whitespace token, so `bgapi originate` and `bgapi uuid_kill` both label as `bgapi`. Fix: unwrap when first token is `bgapi`/`api` and use the second. Caught by code-quality reviewer Task 3 (`f1eb679`). Future subagents wiring metrics should bake the unwrap into the labelling helper, not the call-site.
+
+- **`sendCommand` reply-stealing race.** Holding `writeMu` only for write+flush — then unlocking before reading the shared `replies` chan — silently lets two concurrent callers swap each other's replies. Fix: extend the mutex to wrap the entire send+wait window AND drain stale replies on ctx-cancel. Caught by Task 2 review (`ebc9748`). The "one in-flight command per Client" invariant has to be enforced end-to-end, not just on the write half.
+
+- **`Close()` must block on `readLoopDone` in BOTH CAS branches.** When dispatch's text/disconnect-notice path flips `closed=true` first, a later `Close()` hits the CAS-fail branch — and the naive impl returns nil immediately, leaving readLoop running. Fix: block on `<-readLoopDone` regardless of CAS outcome. Caught by Task 2 review.
+
+- **`MapEvent` must clone the headers map.** Returning `Headers: ev.headers` aliases the parser's internal map; a downstream consumer can mutate it and corrupt subsequent `MapEvent` calls on the same Event. Fix: `Headers: maps.Clone(ev.headers)`. Caught by Task 2 review.
+
+- **`time.After` is banned even in tests' for-loops.** `make grep-time-after` excludes `*_test.go` for one-shot select-arms only. A polling loop that calls `time.After` per iteration leaks timers under `-race -count=5`. Use `time.NewTimer` + `Reset` or `require.Eventually`. Project-wide gotcha rediscovered repeatedly.
+
+- **Modernize linter is aggressive with Go 1.26.** Subagents kept tripping on `for i := 0; i < N; i++` (use `for range N`), `for k, v := range src { dst[k]=v }` (use `maps.Copy`), `wg.Add(1); go func() { defer wg.Done(); … }()` (use `wg.Go`), and `fmt.Sprintf("%d", n)` (use `strconv.Itoa`). Fix-up commits hit every Task. Future agents should pre-modernize before submission.
+
+- **`prometheus.MustRegister` in `init()` panics under double-import in tests.** Always inject a `prometheus.Registerer` via the constructor (`RegisterMetrics(reg)` pattern). Panic clearly on nil reg with remediation message ("pass prometheus.NewRegistry() in tests"). Established in Task 2, repeated in Tasks 4, 5, 6.
+
+- **`math/rand` v1 vs v2 depguard rule.** Default project rule (`pkg: math/rand`) is a prefix match that ALSO blocks `math/rand/v2`. Pin with `pkg: "math/rand$"` exact-match suffix so v2 is allowed. Done in Task 2 (`fbeeb4d`).
+
+- **Sentinel errors must be aliased across api↔internal boundaries.** Plan 10 dialer composes against `api.ErrNoTrunkAvailable` via `errors.Is`. If `internal/telephony/router` declares its own `errors.New("router: no available trunk")`, the composition silently misses. Fix: `var ErrNoTrunkAvailable = api.ErrNoTrunkAvailable` aliasing. Caught by Task 5 review (`ba12b00`).
+
+- **Config-only trunk catalog vs Postgres `telephony_trunks` table.** The plan-draft proposed a Postgres table with a 30s refresh loop. Defer to Plan 13/14: cfg.Telephony.Trunks (Viper Snapshot) is sufficient for v1, no migration debt. Document the deferral inline. Decision in Task 5 (`c4af4f8`).
+
+- **`api show channels count` body shape varies.** Some FS builds emit `5 total.\n`; some emit just `\n` when no channels exist. ChannelsCount: trim, then `strings.Fields()[0]`, return 0 on empty body, wrap on non-numeric. Test all three paths. Task 6.
+
+- **`ESLPool` health-probe needs a 3s bounded ctx, not the parent.** Parent ctx may have no deadline; one stalled FS can stall the entire reconciler sweep. Per-node `WithTimeout` with `defer cancel()` (panic-safe) inside `sweepNode`. Caught by Task 6 review (`3b65932`).
+
+- **`bgapi originate` Job-UUID vs call-UUID is FS-build-dependent.** Some builds return the call UUID directly in `+OK <uuid>`; others return Job-UUID and emit the call UUID later via BACKGROUND_JOB. Plan 09 returns the +OK token verbatim and marks `// FIXME(plan-09)` in `commands.go`. Task 4 (pool) or Task 6 (reconciler) is the natural seam to wire BACKGROUND_JOB correlation when integration tests against real FS surface the issue.
+
+- **`internal/telephony/api/` shape was already non-trivial.** The plan-draft introduced fresh DTO names (`OriginateRequest`, `Trunk`, `SelectionResult` with `CallURL`/`GatewayName` fields). Existing api had `OriginateCommand`, `Trunk` (different shape via api.Router enum), `SelectionResult{FSNode, TrunkID, Reason}`. Don't modify api/ — convert at the boundary. CallURL construction lives in the dialer/originate publisher, not the Router.
+
+- **`gopls` cache lag continues to surface phantom diagnostics.** Subagents would report tests passing while gopls flagged "undefined: X" after each large commit — and even invented files (`/tmp/sortcheck.go`, `simple_test2.go`) that didn't exist on disk. Always reality-check via direct `go build && go test -race`; trust the harness, not the editor squiggles.
+
+- **`nats_bridge` left as Task 1 stub.** Plan 09 ships ESL + pool + router + reconciler — but the actual NATS subscribe/publish loop awaits Plan 11 (which owns NATS subjects + JetStream wiring). The `cmd/telephony-bridge` binary boots and runs the bridge subsystems; commands published on `telephony.cmd.*` are not yet consumed. Document the gap explicitly in PROJECT_STATUS so Plan 10 (dialer) doesn't assume a working bridge.
+
+- **Per-call SIP credentials + `/internal/freeswitch/directory` endpoint deferred.** Plan 09 drafts these as Task 5 deliverables — but they belong with NATS bridge + mTLS-protected HTTP route in `cmd/api`. Both shipping with Plan 11 is cleaner than a half-wired Plan 09. Documented as a carry-over.
+
+- **Helm chart + Prometheus alert rules live in `sociopulse-infra` repo.** Plan 09 exports the metric (`telephony_router_active_channels_drift{node}`); the alert rule (`> 10 for 5m`) is an ops concern, NOT a sociopulse-platform deliverable. Don't try to land a `helm/` directory mid-Plan-09.
