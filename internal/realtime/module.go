@@ -43,7 +43,6 @@ package realtime
 
 import (
 	"errors"
-	"fmt"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -215,7 +214,10 @@ func requireDeps(d modules.Deps) error {
 	case d.Locator == nil:
 		return errors.New("realtime: Deps.Locator is required")
 	case d.Subscriber == nil:
-		return fmt.Errorf("realtime: Deps.Subscriber is required (cmd/api wires the JetStream subscriber even when NATS is down — fall back to a noop)")
+		// cmd/api must wire the JetStream subscriber (or a noop fallback
+		// when NATS is down) before calling Module.Register; see
+		// docs/references/plan-11-realtime.md gotcha line 97.
+		return errors.New("realtime: Deps.Subscriber is required")
 	}
 	return nil
 }

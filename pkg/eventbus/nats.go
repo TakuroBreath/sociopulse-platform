@@ -353,7 +353,7 @@ func (s *NATSSubscriber) Subscribe(ctx context.Context, subject, queue string, h
 		return fmt.Errorf("pkg/eventbus: subscribe: %w", errClosed)
 	}
 	if handler == nil {
-		return fmt.Errorf("pkg/eventbus: subscribe: handler must be non-nil")
+		return errors.New("pkg/eventbus: subscribe: handler must be non-nil")
 	}
 	if err := ctx.Err(); err != nil {
 		return fmt.Errorf("pkg/eventbus: subscribe: %w", err)

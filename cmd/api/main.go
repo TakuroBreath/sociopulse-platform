@@ -327,7 +327,7 @@ func run(ctx context.Context, configDir string) error {
 		}
 	}()
 
-	// 8. Outbox relay.
+	// 10. Outbox relay.
 	//
 	//    Started only when Postgres is reachable: pingErr above tells us
 	//    whether boot-time ping succeeded. Running this on every replica
@@ -346,7 +346,7 @@ func run(ctx context.Context, configDir string) error {
 			zap.Error(pingErr))
 	}
 
-	// 9. errgroup orchestration. Each long-running goroutine returns from
+	// 11. errgroup orchestration. Each long-running goroutine returns from
 	//    its Run/ListenAndServe when the parent context is cancelled.
 	g, gctx := errgroup.WithContext(ctx)
 	g.Go(func() error {
@@ -386,7 +386,7 @@ func run(ctx context.Context, configDir string) error {
 		})
 	}
 
-	// 10. Wait for shutdown signal — either ctx.Done (SIGTERM) or one of the
+	// 12. Wait for shutdown signal — either ctx.Done (SIGTERM) or one of the
 	//     errgroup goroutines failing.
 	g.Go(func() error {
 		<-gctx.Done()

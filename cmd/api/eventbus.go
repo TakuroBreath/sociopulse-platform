@@ -95,7 +95,7 @@ func openNATS(ctx context.Context, cfg config.Config, logger *zap.Logger) (*even
 		eventbus.WithPublisherName("cmd-api-publisher"),
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("nats publisher: %w", err)
+		return nil, nil, fmt.Errorf("cmd/api: nats publisher: %w", err)
 	}
 
 	sub, err := eventbus.NewNATSSubscriber(dialCtx, cfg.NATS.URLs, cfg.NATS.Account,
@@ -106,7 +106,7 @@ func openNATS(ctx context.Context, cfg config.Config, logger *zap.Logger) (*even
 		// Drain the half-open publisher so we don't leak the
 		// connection across the fallback path.
 		_ = pub.Close()
-		return nil, nil, fmt.Errorf("nats subscriber: %w", err)
+		return nil, nil, fmt.Errorf("cmd/api: nats subscriber: %w", err)
 	}
 
 	return pub, sub, nil
