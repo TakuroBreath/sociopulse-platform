@@ -1,0 +1,124 @@
+# Plan 11 — realtime references
+
+> **Goal**: snap the realtime module (WebSocket Hub + NATS dispatcher + Redis presence + listen-in v1) to authoritative external sources. Loaded into every Plan 11 implementer prompt.
+
+**Status**: in-progress, next after Plan 10 (`v0.0.11-dialer`).
+
+**Module path**: `github.com/sociopulse/platform` (NOT `social-pulse`).
+
+---
+
+## Carry-overs from prior plans (handled by Plan 11)
+
+These open carry-overs from Plans 06/09/10 land here:
+
+1. **`internal/telephony/nats_bridge`** (Plan 09 stub) — subscribe to `tenant.<t>.telephony.cmd.>`, publish `tenant.<t>.telephony.event.>`, idempotency via Redis SETNX (TTL 24h).
+2. **Per-call SIP credentials manager** — `mod_xml_curl` callback to `cmd/api`'s `/internal/freeswitch/directory` endpoint (per-call SIP user provisioning for listen-in legs).
+3. **`pkg/eventbus.NATSPublisher` / `NATSSubscriber`** — currently `panic("not implemented: see Plan 03 Task 7")`. Real JetStream-backed impl lands here.
+4. **`cmd/api` outbox publisher** — currently `noopPublisher`. Replace with real NATS publisher backed by `pkg/eventbus.NATSPublisher`.
+5. **Dialer `RefreshPresence` wiring** — `internal/dialer/fsm.RefreshPresence` was exported by Plan 10 but not yet called from `internal/dialer/transport/http`. Wire as gin middleware on operator routes so the Heartbeat watchdog only triggers on ungraceful disconnect.
+6. **Dialer `SnapshotPubSub` upgrade** — Plan 10 ships an in-memory PubSub. Plan 11 swaps for NATS-backed fan-out so cross-replica subscribers see transitions. Adapter pattern: keep the `dialer.PubSub` Subscribe API but back `Publish` with NATS publish to `tenant.<t>.dialer.op.<op_id>.state`; subscribers translate NATS events back into `api.Snapshot`.
+
+## Canonical specs (must-read)
+
+- [RFC 6455 — The WebSocket Protocol](https://datatracker.ietf.org/doc/html/rfc6455) — authoritative wire format. Read §5 (Data Framing), §7 (Closing the Connection — close codes), §10 (Security Considerations). Plan 11 uses close codes 4401 (unauthorized), 4403 (forbidden), 4503 (slow consumer), 1000 (normal close).
+- [WHATWG WebSocket living standard](https://websockets.spec.whatwg.org/) — modern reference; clarifies subprotocols and origin checking.
+- [NATS JetStream concepts](https://docs.nats.io/nats-concepts/jetstream) — durable consumer model; `nats.JetStream.Subscribe(subject, ...)` semantics; ack/nack/redelivery.
+- [NATS subject hierarchy + wildcards](https://docs.nats.io/nats-concepts/subjects) — `tenant.<t>.>` matches every dialer/telephony/notify subject for that tenant. Use `>` (multi-token) NOT `*` (single-token).
+- [Redis SCAN + EXISTS + TTL](https://redis.io/commands/scan/) — presence sweeper iterates keys without blocking.
+- [Redis SETNX with PX](https://redis.io/commands/set/) — `SET key value PX 86400000 NX` for nats_bridge idempotency.
+- [Server-side ping/pong cadence (Cloudflare blog, generic best practice)](https://developers.cloudflare.com/workers/learning/using-websockets/) — 30s ping period, 60s pong-grace, drop on miss. Plan 10 dialer transport/http already follows this; Plan 11 reuses.
+
+## Reference implementations
+
+- [`coder/websocket`](https://github.com/coder/websocket) (formerly `nhooyr.io/websocket`) — modern ctx-aware Go WS lib. Already in `go.mod` v1.8.14 (Plan 10 dialer transport/http uses it). Plan 11 stays on the same version.
+  Files of interest: `accept.go` (Accept options + subprotocols), `read.go` (Read with ctx), `write.go` (Write with ctx + close-on-error semantics), `examples/echo/`.
+- [`nats-io/nats.go`](https://github.com/nats-io/nats.go) v1.34+. JetStream client. Already in `go.mod`.
+  Files of interest: `js/jetstream.go`, `pull_consumer.go`, `push_consumer.go`. **Use push consumer** for subjects with low message rates (notifications, force-commands); **pull consumer** for high-throughput (call lifecycle).
+- [`redis/go-redis/v9`](https://github.com/redis/go-redis) v9.5+. Already in `go.mod`. Used for presence + SETNX idempotency.
+- [`coder/websocket/wsjson`](https://pkg.go.dev/github.com/coder/websocket/wsjson) — typed JSON read/write helpers. Use for the auth handshake; raw `Reader/Writer` for the high-throughput event stream.
+
+## Production lessons (blog posts, talks)
+
+- **[Coder.com blog: Designing a websocket server](https://coder.com/blog/websocket-design)** — author of `coder/websocket` describing read/write goroutine separation, slow-consumer handling, and the "bounded buffer + drop-oldest" pattern. Plan 11 Task 2's drop-oldest impl is straight from this article.
+- **[NATS JetStream production checklist](https://docs.nats.io/running-a-nats-service/configuration/clustering/jetstream_clustering)** — message redelivery, consumer pull/push tradeoffs, max_deliver settings.
+- **[Plan 10 lessons (from `docs/references/plan-10-dialer.md`)](plan-10-dialer.md)** — read all 20 bullets. The reviewer pattern caught 7 issues in Plan 10; same patterns apply here. Especially:
+  1. `redis.NewScript` not raw EVAL.
+  2. `time.NewTicker` not `time.After` in loops.
+  3. `var _ api.X = (*Impl)(nil)` compile-time check.
+  4. Sentinel errors aliased via `var ErrFoo = api.ErrFoo` for `errors.Is` across module boundaries.
+  5. Per-package `RegisterMetrics(reg)` injection — NEVER `init()`-time `MustRegister`.
+  6. `wg.Go(...)` (Go 1.25+) not `wg.Add(1)/wg.Done`.
+  7. `goleak.VerifyTestMain` in every package with goroutines (the realtime hub has many — apply rigorously).
+  8. `*zap.Logger` typed fields, no PII (no auth tokens, no SIP creds, no full phone numbers in logs — last 4 digits only at debug level).
+  9. `goleak`-clean exit paths for every goroutine on ctx.Done / channel close / parent close.
+  10. Build-tag false alarms from gopls — always reality-check via direct `go test -tags=integration ...`.
+
+## Russian-specific (152-ФЗ, listen-in compliance)
+
+- **Listen-in audit requirement**: every listen-in start MUST emit an `audit_log` row with actor=admin/supervisor user_id + target=operator user_id + call_id + start/stop timestamps. 152-ФЗ doesn't require explicit consent for listen-in (operator under employment contract acknowledges monitoring), but the audit trail is the legal-defence layer.
+- **Recording retention** vs listen-in: listen-in is silent/whisper/barge LIVE only — it does NOT create a recording. The recording subsystem (Plan 12) handles retention separately.
+
+## Architecture decisions (locked in this references doc)
+
+### Decision 1: Hub is per-replica, NATS is the cross-replica fabric
+
+Each `cmd/api` pod runs its own `*service.Hub` holding LOCAL connections. Cross-replica fan-out happens entirely through NATS subjects. The Hub subscribes once per tenant prefix `tenant.<t>.>` and dispatches to local subscribers matching topic+filter.
+
+Rationale: avoiding shared-state Redis pubsub (extra hop, extra failure mode). NATS is already the durable backbone. Connections never need to know about other replicas.
+
+### Decision 2: Hub is NOT in the api/ surface
+
+The `Hub` interface IS in `internal/realtime/api/interfaces.go` (already in Plan 00a). But other modules NEVER call `Hub.Broadcast` directly — they publish to NATS with the canonical subject and the dialer/telephony module's NATS subscriber handles fan-out via the Hub.
+
+### Decision 3: Listen-in v1 = silent only
+
+Whisper / barge / 3-way require deeper FreeSWITCH conferencing (mod_conference). v1 ships silent listen-in (`mixmonitor` outputs to a dedicated SIP user the admin's browser dials in via verto). Whisper/barge are stub interfaces that return `ErrListenModeNotSupported` until v1.1.
+
+### Decision 4: Defer Task 8 (Helm) to sociopulse-infra
+
+Task 8 of Plan 11 is Helm + ingress timeouts. That repo is separate (Plan 01 territory). Plan 11 ships the application code; the infra repo ships the values.yaml.
+
+### Decision 5: Defer Task 6 (Listen-in v1) until Plan 08 lands
+
+Listen-in depends on real FreeSWITCH being reachable. Until Plan 08 (FreeSWITCH cluster) lands, the listen-in service is wired with a stub telephony.api.CommandPublisher that returns `ErrTelephonyBridgeOffline`. Tests use a fake. Real-FS integration test moves to Plan 08.
+
+## Gotchas (do-not-do list)
+
+- **DO NOT** broadcast to ALL connections without RBAC + tenant filter. Every Hub.Dispatch call MUST consult the `topics.go` RBAC matrix and reject with `ErrSubscriptionForbidden` for unauthorized topics.
+- **DO NOT** trust the JWT subject claim for cross-tenant ops. Every WS message handler MUST re-verify `claims.TenantID == req.TenantID` for the subject the message refers to.
+- **DO NOT** block the writer goroutine on a slow client. Always non-blocking send via select+default; on full buffer, drop oldest frame and increment `dropped_frames_total{conn}`.
+- **DO NOT** spawn unbounded goroutines per connection. The lifecycle is: 1 reader goroutine + 1 writer goroutine + 1 ping goroutine. Any extra goroutine must have an explicit lifecycle bound to the connection.
+- **DO NOT** write directly to the WS conn from random goroutines. ONLY the writer goroutine writes; everything else sends via `Connection.Send(frame)` which is the only public mutator.
+- **DO NOT** use `time.After` in select loops (Plan 09/10 carry-forward).
+- **DO NOT** bypass the Hub's RBAC check for the `op.commands` topic — server→client force-commands MUST authenticate the publisher (only force_handler.go publishes to op.commands).
+- **DO NOT** publish PII to NATS subjects. Use opaque IDs; resolve PII server-side at delivery via the auth/crm services with proper RBAC.
+- **DO NOT** reply to a WebSocket close frame with another close frame — coder/websocket handles this. Just `conn.Close(code, reason)` and let the lib finish the handshake.
+- **DO NOT** spawn the JetStream subscriber from `Module.Register` — Plan 11 Task 4 spec requires the subscriber to be `errgroup`-driven from the cmd/api composition root so graceful shutdown is centralised.
+
+## Open questions
+
+- **Q1**: Should the Hub maintain a per-tenant connection map, or one flat map keyed by conn-id? **Resolution**: per-tenant map for fast multi-cast; flat map for admin debug. Both, with the per-tenant map as primary.
+- **Q2**: Should we use NATS push consumer or pull consumer for `tenant.<t>.dialer.op.<op>.state`? **Resolution**: push consumer with `MaxAckPending=1024`. Per-replica subscriber, queue group `realtime-replica-<podname>` so each replica gets its own copy of every event (each replica needs to dispatch to its local connections; NATS queue group on a per-replica name = effectively no queue group, every replica consumes).
+- **Q3**: Idempotency for telephony NATS bridge — what window? **Resolution**: 24h SETNX TTL on `idempotency:<command_id>` so a re-published command (after a publisher crash + replay) is dropped.
+- **Q4**: How long does a WS conn live without traffic? **Resolution**: 30s ping period, 60s pong-grace = drop after 90s. Token refresh window every 4 minutes (JWT typically 5-min TTL; client refreshes 1m before expiry).
+- **Q5**: How does the Hub handle JWT token rotation mid-WS-session? **Resolution**: client sends `FrameRefresh` with new token; server validates + responds with `FrameRefreshOK` (or close 4401 on bad). Existing subscriptions stay; new claims apply to subsequent RBAC checks.
+
+## Subagent dispatch checklist (carry-over from Plan 10)
+
+When dispatching an implementer for any Plan 11 task:
+
+1. Include the file path `docs/references/plan-11-realtime.md` in the prompt.
+2. Include `docs/references/COMMON.md` for cross-cutting (zap, gin, golangci-lint, RLS).
+3. Include `docs/references/plan-10-dialer.md` because **the dialer's PubSub is the test seam Plan 11 swaps**.
+4. Include `docs/references/plan-09-telephony-bridge.md` because **the telephony nats_bridge is finally implemented here**.
+5. Specify Go 1.26 modernize idioms explicitly (maps.Copy, range over int, min/max, slices.ContainsFunc, wg.Go, etc.) — golangci-lint enforces these.
+6. Logger: `*zap.Logger`. HTTP: `gin.RouterGroup`. WS: `coder/websocket` v1.8.14. Postgres: `pkg/postgres`. Redis: `redis.Client` from go-redis/v9. NATS: `nats.go` v1.34+ via `pkg/eventbus`.
+7. Tests: `testcontainers-go` for real Redis 7.4 + NATS 2.10; `miniredis/v2` for fast unit tests; `goleak.VerifyTestMain` in every package with goroutines (Hub spawns MANY).
+8. Two-stage review after EVERY implementer return: spec compliance reviewer first, then code quality reviewer.
+
+---
+
+## Lessons learned (filled at close-out)
+
+_TBD — populate at v0.0.12 tag time._
