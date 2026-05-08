@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	"github.com/sociopulse/platform/internal/crm/api"
+	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/postgres"
 )
 
@@ -63,7 +65,15 @@ type ProjectService struct {
 	tx    projectTxRunner
 	store api.ProjectStorePort
 	audit auditapi.Logger
-	clock func() time.Time
+	// events is the optional NATS publisher. Plan 06 declares the
+	// `crm.project.{created,updated,status_changed}` subjects in
+	// internal/crm/api/events.go but Plan 11 owns the real NATS wire-
+	// up; until then the composition root passes nil and we skip
+	// publishing silently. Once Plan 11 lands, modulo wiring, every
+	// state-changing ProjectService method will emit a typed event
+	// without further code changes.
+	events eventbus.Publisher
+	clock  func() time.Time
 }
 
 // Compile-time assertion: *ProjectService must satisfy api.ProjectService.
@@ -80,10 +90,14 @@ var _ api.ProjectService = (*ProjectService)(nil)
 // would silently drop those rows. Tests that genuinely don't care
 // about the audit trail must inject a no-op fake logger explicitly
 // (see Plan 05 lessons learned § 10).
+// publisher may be nil — when nil, all calls to publishEvent are no-ops
+// (see Plan 11 deferral note on the events field). Tests that don't
+// care about events pass nil; tests that DO care pass a fake.
 func NewProjectService(
 	pool projectTxRunner,
 	store api.ProjectStorePort,
 	auditLogger auditapi.Logger,
+	publisher eventbus.Publisher,
 	clock func() time.Time,
 ) *ProjectService {
 	if pool == nil {
@@ -99,10 +113,38 @@ func NewProjectService(
 		clock = time.Now
 	}
 	return &ProjectService{
-		tx:    pool,
-		store: store,
-		audit: auditLogger,
-		clock: clock,
+		tx:     pool,
+		store:  store,
+		audit:  auditLogger,
+		events: publisher, // nil-tolerant; see field doc
+		clock:  clock,
+	}
+}
+
+// publishEvent fan-outs a typed event payload to the configured NATS
+// publisher. nil events field (Plan 11 not yet wired) → no-op. Marshal
+// failures are logged via the audit context but NOT returned, because
+// the parent call already committed the DB row + audit; an event-side
+// failure must not surface as user-visible "save failed". This matches
+// the at-least-once + outbox-retry posture established by pkg/outbox.
+func (s *ProjectService) publishEvent(ctx context.Context, subject string, payload any) {
+	if s.events == nil {
+		return
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		// Best-effort observability — the row write already succeeded.
+		_ = s.writeAudit(ctx, auditapi.Event{
+			Action:  "crm.event.publish_marshal_error",
+			Payload: map[string]any{"subject": subject, "error": err.Error()},
+		})
+		return
+	}
+	if err := s.events.Publish(ctx, subject, body); err != nil {
+		_ = s.writeAudit(ctx, auditapi.Event{
+			Action:  "crm.event.publish_error",
+			Payload: map[string]any{"subject": subject, "error": err.Error()},
+		})
 	}
 }
 
@@ -161,6 +203,15 @@ func (s *ProjectService) Create(ctx context.Context, in api.CreateProjectInput) 
 		}
 		return nil, fmt.Errorf("crm/service: create project: %w", err)
 	}
+	s.publishEvent(ctx, api.SubjectProjectCreatedFor(saved.TenantID), api.ProjectCreatedEvent{
+		ProjectID:   saved.ID,
+		TenantID:    saved.TenantID,
+		Code:        saved.Code,
+		Name:        saved.Name,
+		Customer:    saved.Customer,
+		TargetCount: saved.TargetCount,
+		CreatedAt:   saved.CreatedAt,
+	})
 	return &saved, nil
 }
 
@@ -321,7 +372,38 @@ func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, in api.Update
 		}
 		return nil, fmt.Errorf("crm/service: update project: %w", err)
 	}
+	s.publishEvent(ctx, api.SubjectProjectUpdatedFor(saved.TenantID), api.ProjectUpdatedEvent{
+		ProjectID: saved.ID,
+		TenantID:  saved.TenantID,
+		Changed:   changedFieldNames(in),
+		UpdatedAt: saved.UpdatedAt,
+	})
 	return &saved, nil
+}
+
+// changedFieldNames returns the json-tag names of fields whose pointer
+// is non-nil in the patch. Stable order so consumers can rely on it.
+func changedFieldNames(in api.UpdateProjectInput) []string {
+	out := make([]string, 0, 5)
+	if in.Name != nil {
+		out = append(out, "name")
+	}
+	if in.Customer != nil {
+		out = append(out, "customer")
+	}
+	if in.TargetCount != nil {
+		out = append(out, "target_count")
+	}
+	if in.PeriodFrom != nil {
+		out = append(out, "period_from")
+	}
+	if in.PeriodTo != nil {
+		out = append(out, "period_to")
+	}
+	if in.SurveyID != nil {
+		out = append(out, "survey_id")
+	}
+	return out
 }
 
 // Pause implements api.ProjectService.Pause: Active → Paused.
@@ -408,6 +490,14 @@ func (s *ProjectService) transitionStatus(ctx context.Context, id uuid.UUID, tar
 		}
 		return fmt.Errorf("crm/service: %s: %w", action, err)
 	}
+	s.publishEvent(ctx, api.SubjectProjectStatusFor(current.TenantID), api.ProjectStatusChangedEvent{
+		ProjectID:  id,
+		TenantID:   current.TenantID,
+		OldStatus:  from,
+		NewStatus:  target,
+		ChangedAt:  s.clock().UTC(),
+		ArchivedAt: archivedAt,
+	})
 	return nil
 }
 

@@ -68,7 +68,10 @@ func (Module) Register(d modules.Deps) error {
 	auditLogger := lookupAuditLogger(d.Locator, logger)
 
 	store := crmstore.NewProjectStore(d.Pool)
-	svc := crmservice.NewProjectService(d.Pool, store, auditLogger, nil)
+	// events publisher is nil until Plan 11 wires NATS — the service
+	// silently no-ops in that path; declared subjects in api/events.go
+	// are forward-compatible.
+	svc := crmservice.NewProjectService(d.Pool, store, auditLogger, nil, nil)
 
 	d.Locator.Register(LocatorProjectService, crmapi.ProjectService(svc))
 

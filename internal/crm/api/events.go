@@ -2,6 +2,7 @@ package api
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 )
@@ -108,10 +109,37 @@ const (
 	TaskDNCImport = "crm:dnc.import"
 )
 
+// ProjectCreatedEvent is the payload for SubjectProjectCreated.
+// Mirrors the row inserted, minus columns the frontend doesn't need
+// at notification-time (timestamps the consumer can lazily fetch).
+type ProjectCreatedEvent struct {
+	ProjectID   uuid.UUID `json:"project_id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	Code        string    `json:"code"`
+	Name        string    `json:"name"`
+	Customer    string    `json:"customer,omitempty"`
+	TargetCount int       `json:"target_count"`
+	CreatedAt   time.Time `json:"created_at"`
+}
+
+// ProjectUpdatedEvent is the payload for SubjectProjectUpdated. Only
+// the field-names that changed are included — consumers re-fetch the
+// row if they need full state. This keeps the bus traffic small.
+type ProjectUpdatedEvent struct {
+	ProjectID uuid.UUID `json:"project_id"`
+	TenantID  uuid.UUID `json:"tenant_id"`
+	Changed   []string  `json:"changed"` // e.g. ["name", "target_count"]
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
 // ProjectStatusChangedEvent is the payload for SubjectProjectStatus.
 type ProjectStatusChangedEvent struct {
-	ProjectID uuid.UUID     `json:"project_id"`
-	Status    ProjectStatus `json:"status"`
+	ProjectID  uuid.UUID     `json:"project_id"`
+	TenantID   uuid.UUID     `json:"tenant_id"`
+	OldStatus  ProjectStatus `json:"old_status"`
+	NewStatus  ProjectStatus `json:"new_status"`
+	ChangedAt  time.Time     `json:"changed_at"`
+	ArchivedAt *time.Time    `json:"archived_at,omitempty"`
 }
 
 // ImportProgressEvent is the payload for SubjectImportProgress.

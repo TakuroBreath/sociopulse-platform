@@ -363,7 +363,7 @@ func newSvc(t *testing.T) (*ProjectService, *fakeProjectStore, *fakeAudit) {
 	store := newFakeProjectStore()
 	audit := &fakeAudit{}
 	clock := func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) }
-	svc := NewProjectService(tx, store, audit, clock)
+	svc := NewProjectService(tx, store, audit, nil /* events: Plan 11 owns */, clock)
 	return svc, store, audit
 }
 
@@ -719,9 +719,9 @@ func TestNewProjectService_PanicsOnNilDeps(t *testing.T) {
 		name string
 		fn   func()
 	}{
-		{"nil pool", func() { _ = NewProjectService(nil, store, audit, nil) }},
-		{"nil store", func() { _ = NewProjectService(pool, nil, audit, nil) }},
-		{"nil audit logger", func() { _ = NewProjectService(pool, store, nil, nil) }},
+		{"nil pool", func() { _ = NewProjectService(nil, store, audit, nil, nil) }},
+		{"nil store", func() { _ = NewProjectService(pool, nil, audit, nil, nil) }},
+		{"nil audit logger", func() { _ = NewProjectService(pool, store, nil, nil, nil) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -737,7 +737,7 @@ func TestNewProjectService_NilClockDefaultsToTimeNow(t *testing.T) {
 	tx := &fakeTxRunner{}
 	store := newFakeProjectStore()
 	audit := &fakeAudit{}
-	svc := NewProjectService(tx, store, audit, nil)
+	svc := NewProjectService(tx, store, audit, nil, nil)
 	require.NotNil(t, svc.clock)
 
 	// Ask the service to emit an audit row and verify the timestamp was set.
@@ -758,7 +758,7 @@ func TestProjectService_TxRunnerSelection(t *testing.T) {
 	tx := &fakeTxRunner{}
 	store := newFakeProjectStore()
 	audit := &fakeAudit{}
-	svc := NewProjectService(tx, store, audit, nil)
+	svc := NewProjectService(tx, store, audit, nil, nil)
 
 	tenantID := uuid.New()
 	_, err := svc.Create(context.Background(), crmapi.CreateProjectInput{
