@@ -26,4 +26,19 @@ var (
 	ErrAlreadyActive = errors.New("surveys: version already active")
 	// ErrNoActiveVersion is returned when an action requires an active version but none exists.
 	ErrNoActiveVersion = errors.New("surveys: no active version")
+	// ErrVersionNotFound is returned when a version lookup misses inside the
+	// scope of a surveyID. Distinct from ErrNotFound so callers can tell
+	// "the survey is missing" from "the survey exists but has no such
+	// version".
+	ErrVersionNotFound = errors.New("surveys: version not found")
+	// ErrSurveyArchived is returned when a state-changing action targets a
+	// survey whose status is archived. Pure-read paths still succeed.
+	ErrSurveyArchived = errors.New("surveys: survey archived")
+	// ErrNameTaken is returned when a Create/Update would result in two
+	// non-archived surveys having the same name within one tenant. The
+	// service layer surfaces this as a 409 Conflict.
+	ErrNameTaken = errors.New("surveys: name already taken")
+	// ErrInvalidArgument is returned when the caller passed a structurally
+	// invalid input (zero UUIDs, empty names, negative target counts, ...).
+	ErrInvalidArgument = errors.New("surveys: invalid argument")
 )
