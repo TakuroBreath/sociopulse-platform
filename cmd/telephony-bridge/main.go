@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -341,11 +342,7 @@ func joinURLs(urls []string) string {
 	if len(urls) == 0 {
 		return nats.DefaultURL
 	}
-	out := urls[0]
-	for _, u := range urls[1:] {
-		out += "," + u
-	}
-	return out
+	return strings.Join(urls, ",")
 }
 
 // nodeAddrs flattens config.FSNode -> ESLEndpoint slice.
