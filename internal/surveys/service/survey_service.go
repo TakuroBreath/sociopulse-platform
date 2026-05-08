@@ -223,9 +223,10 @@ func (s *SurveyService) Create(ctx context.Context, in api.CreateSurveyInput) (u
 		})
 	})
 	if err != nil {
-		if errors.Is(err, api.ErrNameTaken) {
-			return uuid.Nil, err
-		}
+		// surveys.name is intentionally NOT unique in the schema
+		// (multiple surveys can share a label across product lines).
+		// If a future migration adds the constraint, restore the
+		// errors.Is(err, api.ErrNameTaken) bypass here.
 		return uuid.Nil, fmt.Errorf("surveys/service: create: %w", err)
 	}
 	return saved.ID, nil

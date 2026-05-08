@@ -1372,17 +1372,20 @@ func firstVersionID(v *fakeVersionStore) uuid.UUID {
 	return uuid.Nil
 }
 
-// TestSurveyService_Create_NameTakenSurfacesSentinel verifies the
-// service surfaces the api.ErrNameTaken sentinel when the store
-// returns it.
-func TestSurveyService_Create_NameTakenSurfacesSentinel(t *testing.T) {
+// TestSurveyService_Create_StoreErrorWrapped verifies the service
+// wraps a generic store-level failure with surveys/service: create
+// context. surveys.name is intentionally non-unique in the schema, so
+// there is no specific name-taken sentinel to assert; this guards the
+// generic error-wrapping path instead.
+func TestSurveyService_Create_StoreErrorWrapped(t *testing.T) {
 	t.Parallel()
 
 	svc, store, _, _, _ := newSvc(t)
-	store.insertErr = api.ErrNameTaken
+	store.insertErr = errors.New("disk full")
 
 	_, err := svc.Create(WithTenantID(context.Background(), uuid.New()), api.CreateSurveyInput{Name: "X"})
-	require.ErrorIs(t, err, api.ErrNameTaken)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "surveys/service: create")
 }
 
 // TestSurveyService_AuditFailureBubbles verifies an audit-write
