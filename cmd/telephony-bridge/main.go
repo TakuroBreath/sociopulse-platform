@@ -246,13 +246,23 @@ func run(ctx context.Context, opts runOptions) error {
 	}
 	defer func() { _ = eslPool.Close() }()
 
-	rt := router.New(router.Config{
+	// Router (Plan 09 Task 5). Trunk catalog comes from cfg.Telephony.Trunks
+	// — Plan 09 Task 5 deferred the Postgres telephony_trunks catalog to
+	// Plan 13/14 hardening. Backpressure cap = cfg.Telephony.Bridge.
+	// MaxConcurrentPerNode (zero falls back to NewBackpressure's 60).
+	routerMetrics := router.RegisterMetrics(metrics.Registry)
+	rt, err := router.New(router.Config{
 		Pool:            eslPool,
 		Redis:           rdb,
 		BackpressureCap: cfg.Telephony.Bridge.MaxConcurrentPerNode,
-		PostgresDSN:     cfg.Database.Postgres.DSN,
+		Trunks:          cfg.Telephony.Trunks,
+		DefaultStrategy: cfg.Telephony.Routing.DefaultStrategy,
 		Logger:          logger.Named("router"),
+		Metrics:         routerMetrics,
 	})
+	if err != nil {
+		return fmt.Errorf("init router: %w", err)
+	}
 	if err := rt.Start(ctx); err != nil {
 		return fmt.Errorf("start router: %w", err)
 	}
