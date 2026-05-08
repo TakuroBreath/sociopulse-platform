@@ -1,15 +1,5 @@
-// Package api defines public contracts for the dialer module.
-// Other modules import only from this package — never from dialer/service or dialer/store.
-//
-// dialer is the heart of the auto-dialler. It owns:
-//   - OperatorFSM: offline → ready → dialing → call → status → verify → ready
-//     (plus pause from any).
-//   - CallQueue: Redis ZSET with priority+epoch score.
-//   - RDDGenerator: Random Digit Dialing for DEF/АВС-codes against undeposited quotas.
-//   - Router: NATS abstraction in front of telephony commands.
-//   - LineCapacityTracker: per-FS-node 60-channel cap.
-//   - WorkingHoursChecker: per-tenant + per-region timezone enforcement.
-//   - RetryOrchestrator: scheduled re-enqueue of mature pending retries.
+// dto.go declares the data-transfer types shared between the dialer module
+// and its consumers. The package-level documentation lives in doc.go.
 package api
 
 import (
@@ -31,6 +21,24 @@ const (
 	StatePause   State = "pause"
 )
 
+// Valid reports whether s is one of the recognized State enum values.
+//
+// Used by:
+//   - the FSM's Force() escape hatch to reject garbage target states from
+//     supervisor / watchdog inputs before touching Redis;
+//   - the store's hash-deserialiser to detect a corrupt row.
+//
+// Adding a new State constant requires extending this switch — that
+// requirement is enforced by the exhaustive test in state_test.go.
+func (s State) Valid() bool {
+	switch s {
+	case StateOffline, StateReady, StateDialing, StateCall,
+		StateStatus, StateVerify, StatePause:
+		return true
+	}
+	return false
+}
+
 // Event is one operator FSM transition trigger.
 type Event string
 
@@ -48,6 +56,23 @@ const (
 	EventVerifyDone      Event = "verify_done"
 	EventForceOffline    Event = "force_offline"
 )
+
+// Valid reports whether e is one of the recognized Event enum values.
+//
+// Used at the HTTP boundary so an unknown JSON Event string is rejected
+// with a 400 before the request reaches the FSM. Adding a new Event
+// constant requires extending this switch — exhaustively tested in
+// state_test.go.
+func (e Event) Valid() bool {
+	switch e {
+	case EventStartShift, EventEndShift, EventGoReady, EventGoPause,
+		EventResume, EventCallStarted, EventCallEnded, EventCallFailed,
+		EventStatusSubmitted, EventGoVerify, EventVerifyDone,
+		EventForceOffline:
+		return true
+	}
+	return false
+}
 
 // Snapshot is the immutable view of one operator's FSM state.
 type Snapshot struct {
