@@ -2,7 +2,7 @@
 
 > **Living document.** Updated at the end of every plan. Future agents read this first to know what exists and what's next.
 
-**Last updated**: 2026-05-08 — Plan 04 (`v0.0.6-tenancy`) complete.
+**Last updated**: 2026-05-08 — Plan 05 (`v0.0.7-auth`) complete.
 
 ---
 
@@ -15,7 +15,8 @@
 | `v0.0.3-architecture-foundation` | Plan 00a | 2026-05-07 | 8 architecture docs, 15 ADRs in `docs/adr/`, CONTEXT.md domain glossary, 12-module `internal/<X>/api/` contracts, 9 `pkg/` shared abstractions, internal/modules registry, 7 cmd/ binary scaffolds. |
 | `v0.0.4-cmd-api-skeleton` | Plan 02 | 2026-05-07 | pkg/config (Viper + hot-reload), pkg/observability (zap+OTel+Prometheus + PII redaction), internal/healthz (live/ready), cmd/api full composition root, docker-compose.dev.yml. |
 | `v0.0.5-database` | Plan 03 | 2026-05-07 | cmd/migrator (golang-migrate CLI), initial schema (19 tables + RLS), pkg/postgres (`WithTenant` SET LOCAL), pkg/encryption (AES-256-GCM + HMAC-SHA256 PhoneHasher), pkg/outbox (writer + relay + goleak guard). |
-| **`v0.0.6-tenancy`** | **Plan 04** | **2026-05-08** | **internal/tenancy fully wired: TenantService CRUD via BypassRLS + outbox + audit; KMSResolver with LRU+TTL DEK cache; PhoneHasher per-tenant pepper resolver; BucketProvisioner (Yandex stub + Local in-memory); Go pinned to 1.26.3 (clears stdlib CVEs).** |
+| `v0.0.6-tenancy` | Plan 04 | 2026-05-08 | internal/tenancy fully wired: TenantService CRUD via BypassRLS + outbox + audit; KMSResolver with LRU+TTL DEK cache; PhoneHasher per-tenant pepper resolver; BucketProvisioner (Yandex stub + Local in-memory); Go pinned to 1.26.3 (clears stdlib CVEs). |
+| **`v0.0.7-auth`** | **Plan 05** | **2026-05-08** | **Full auth module across 9 sub-tasks: Argon2id (OWASP-min params + BoundedHasher OOM cap); HS256 JWT issuer/validator (refresh-rotation reuse detection, RFC 7518 32-byte secret floor); UserService CRUD (timing-safe ChangePassword, multi-role[]); Authenticator (login/refresh/logout, partial-token TOTP flow, dummy-verify on every failure path); Redis sliding-window rate-limit + lockout; TOTP enroll/verify/disable with KMS-encrypted secret + 10 single-use backup codes (cheap Argon2 params via `BackupCodeParams()`); static RBAC matrix (operator/supervisor/admin × 20 actions, multi-role union); gin handlers + JWTMiddleware replacing Plan 02 stub; full DI wired in `internal/auth/Module.Register`. Migration 000003 (users schema evolve) + 000004 (auth_totp).** |
 
 ---
 
@@ -45,7 +46,8 @@
 - **`pkg/eventbus/`** 🟡 interfaces only (Plan 11 wires real NATS).
 - **`pkg/grpc/`** 🟡 stubs only (mTLS NewMTLSServer/Client — Plan 09/12).
 - **`pkg/httputil/`** 🟡 stubs (RequestID/Recovery/Idempotency/RateLimit/ErrorEnvelope — Plan 02 wired the gin middleware path; httputil helpers still partially stubs).
-- **`pkg/middleware/auth/`** 🟡 stub (JWT middleware — Plan 05).
+- **`pkg/middleware/auth/`** ✅ Plan 05 — Real `JWTMiddleware`: extracts `Bearer <token>` (case-insensitive), calls `ClaimsValidator.Validate`, surfaces 401 `auth.token_invalid`/`auth.token_revoked`, stores Claims under `ClaimsContextKey`, exposes `ClaimsFromContext` helper. 97% coverage.
+- **`pkg/passwords/`** ✅ Plan 05 — Argon2id PHC (`Hash`/`Verify`), `Hasher` interface (ctx-aware), `Default()` + `NewHasher(p)`, `BoundedHasher` (golang.org/x/sync/semaphore — caps in-flight Argon2 derivations to NumCPU so a login-burst can't OOM the pod). Two production param profiles: `DefaultParams()` (m=19 MiB, t=2, p=1 — OWASP min) and `BackupCodeParams()` (m=1 MiB, t=1, p=1 — for TOTP backup codes). 95%+ coverage.
 
 ### `internal/`
 - **`internal/<module>/api/`** ✅ Contracts defined for 12 modules (auth, tenancy, crm, surveys, telephony, dialer, realtime, recording, analytics, reports, billing, audit).
@@ -55,7 +57,13 @@
   - `service/` — `TenantService` (Insert+Suspend+Resume+Archive via `BypassRLS` tx + outbox.Append + audit stub), `KMSResolverImpl` (LRU+TTL cache, `(tenant_id, kek_version)` keying, ctx-aware lifecycle, plaintext zeroing best-effort), `PhoneHasher` (strict E.164 RU normalizer + HMAC-SHA256 + lazy LRU+TTL pepper cache), `eventbusPublisher` (NATS publisher adapter — currently no-op via cmd/api wiring), `Module.Register/Stop`. Wired into `modules.Locator` under `tenancy.TenantService`, `tenancy.KMSResolver`, `tenancy.PhoneHasher`.
   - `module.go` — composition root for tenancy: builds store, picks KMS provider (yandex|local) from config, picks bucket provisioner, registers all in Locator.
   - **120+ tenancy tests**, 30+ integration tests via testcontainers PG.
-- **`internal/<module>/api/` for the other 11 modules** ✅ Contracts only — no `service/`, `store/`, `http/`, `grpc/`, `events/` implementations.
+- **`internal/auth/` ✅✅✅ Plan 05 — FULLY WIRED**:
+  - `api/` — `Authenticator`, `UserService`, `RBACChecker`, `SessionRevoker`, `TOTPService`, `TOTPVerifier`, `ClaimsValidator`, `JWTIssuer`, `UserStorePort`. DTOs: `Claims`, `AuthResult`, `User`, `LoginInput`, `LoginTOTPInput`, `CreateUserInput`, `ListUsersInput`, `TOTPEnrollment{Secret,OTPAuthURL,BackupCodes}`, `TOTPStatus`, `TOTPState`, `Action`, `Resource`. Sentinels covering credentials/lockout/archive/totp/token/refresh-replay/rate-limit/insufficient-role/login-taken/user-not-found/empty-roles/totp-already-enabled/totp-not-enrolled.
+  - `service/` — `JWTIssuer` (HS256, RFC 7518 32-byte secret floor, leeway, alg-confusion guard, distinct JTI per token), `UserService` (CRUD with timing-safe ChangePassword via pre-baked dummy hash; constructor panics on nil deps), `Authenticator` (login/refresh/logout, dummy-verify on every failure path including per-account rate-limit, refresh-rotation reuse detection wires to `auth.refresh_replay` audit), `SessionRevoker` (per-sid kill keys + per-user cutoff with iat≤cutoff boundary), `RateLimiterRedis` (sliding window via ZADD/ZCARD pipeline, 30/IP/h + 10/user/h), `LockoutRedis` (5-fail threshold, 15min lock auto-unlock), `TOTPService` (KMS-encrypted secret, period=30, digits=6, skew=±1, 10 backup codes hashed with cheap Argon2), `RBACMatrix` (operator/supervisor/admin × 20 actions, multi-role union, 100% test coverage), `TenantResolverAdapter` (org_code → tenant_id via existing `tenancy.TenantService.GetByOrgCode`), `Metrics` (4 Prometheus collectors: login_success, login_failure{reason}, locked, refresh_replay).
+  - `store/` — `UserStore` (pgx-based, unique-violation→ErrLoginTaken, supports ALL 9 UserService ops), `RefreshStore` (Redis whitelist + Lua atomic `Rotate` returning 3-way: not-found / already-rotated / success), `TOTPStore` (Postgres with RLS, `MarkBackupUsed` via array_remove for race-safety).
+  - `transport/http/` — gin handlers for 17 endpoints: 4 public (login/login_totp/refresh/logout), 7 user-scoped (me / change_password / 4× totp), 6 admin (CRUD users / archive / restore / reset_password). `Mount(group, deps)` wiring; `requireRole(...)` middleware; thin handlers (bind→service→render); structured `mapAuthError` covering every sentinel; 87% coverage.
+  - `module.go` — REAL composition root: BoundedHasher around Default; BackupCodeParams hasher; JWT issuer; three stores; four Redis services (refresh + revoker + ratelimit + lockout); UserService; TOTPService; Authenticator; RBACMatrix; TenantResolverAdapter; HTTP mount; six locator registrations; graceful audit-logger fallback to noop while internal/audit is still a stub.
+- **`internal/<module>/api/` for the other 10 modules** ✅ Contracts only — no `service/`, `store/`, `http/`, `grpc/`, `events/` implementations yet (auth + tenancy are the two with real wiring as of v0.0.7).
 - **`internal/healthz/`** ✅ `Liveness`/`Readiness` handlers + `Checker` interface + `PostgresCheck`/`RedisCheck`/`NATSCheck`.
 - **`internal/modules/`** ✅ `Module` interface + `Deps` struct + `MapLocator` + `Registry`.
 - Per-module `internal/<X>/module.go` ✅ stubs with `Register(d modules.Deps) error { return nil }` — all 12 modules (tenancy is the one with real wiring).
@@ -63,6 +71,8 @@
 ### `migrations/`
 - `000001_init.up.sql` / `.down.sql` — 19 tables, 19 RLS policies, `tenancy_admin BYPASSRLS` role, `app` user. Plan 04 Task 2 added DML grants for `tenancy_admin` on `tenants` and `tenant_settings`.
 - `000002_outbox.up.sql` / `.down.sql` — `event_outbox` table, indexes, owner=tenancy_admin.
+- `000003_users_auth_evolve.up.sql` / `.down.sql` — Plan 05: ALTER `users` to add email/must_change_pwd/updated_at/created_by/archived_at/totp_enabled, replace `role text` → `roles text[]` (data-preserving), drop `status` (→ archived_at as soft-delete signal), drop `totp_secret_encrypted` (Plan 05 Task 6 owns auth_totp), idempotent RLS policy, three indexes (tenant+active, lower(login), email). Down migration includes a `RAISE EXCEPTION` guard against silent multi-role data loss on rollback.
+- `000004_auth_totp.up.sql` / `.down.sql` — Plan 05 Task 6: `auth_totp` table (PK on user_id, FK to users + tenants ON DELETE CASCADE, RLS policy, partial index `WHERE enrolled`). Stores `secret_enc bytea` (KMS-wrapped per-tenant DEK) + `backup_codes_hash text[]` (Argon2id PHC strings, single-use via array_remove).
 
 ### `docs/`
 - `architecture/00-overview.md` through `08-tdd-discipline.md` (8 design docs). Updated by Plan 04 Task 1 for SettingsCache rename.
@@ -75,15 +85,10 @@
 
 ## Next plans (in dependency order)
 
-### Plan 05 — Auth Module 🎯 **NEXT**
-Argon2id password hashing, JWT (HS256, 15min access, 30day refresh, refresh-rotation reuse detection), TOTP enroll/verify, RBAC matrix.
+### Plan 06 — CRM Module 🎯 **NEXT**
+Projects, respondents (PII envelope-encrypted via pkg/encryption + per-tenant DEK from KMSResolver), DNC list, quotas, batch import. **Depends on Plan 04 + 05** ✅ both ready.
 
-**Depends on Plan 04** ✅ ready: `TenantService.Get` for tenant resolution; `PhoneHasher` for any phone-based identifiers.
-
-**Plan**: `docs/superpowers/plans/2026-05-06-05-auth-module.md`.
-
-### Plan 06 — CRM Module
-Projects, respondents (PII envelope-encrypted via pkg/encryption + per-tenant DEK from KMSResolver), DNC list, quotas, batch import. **Depends on Plan 04 + 05**.
+**Plan**: `docs/superpowers/plans/2026-05-06-06-crm-module.md`.
 
 ### Plan 07 — Surveys Module
 Survey schema + DSL evaluator + WASM runtime (TinyGo per ADR-0008). **Depends on Plan 04**.

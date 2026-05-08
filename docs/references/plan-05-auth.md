@@ -97,6 +97,36 @@ Status: **ready, plan not yet started**.
 
 ---
 
+## Lessons learned from Plan 05 implementation (2026-05-08)
+
+After 9 sub-tasks and ~15 commits the auth module is shipped. These are the things subagents repeatedly tripped on — capture them so future plans (Plan 06 CRM, Plan 07 surveys) avoid the same cycles.
+
+1. **Timing-safety is _everywhere_, not just on password verify.** Three rounds of code review caught timing oracles on (a) `ChangePassword` missing-user branch, (b) `Authenticator.Login` per-account rate-limit branch, (c) `Authenticator.Login` archived/locked/missing-tenant branches. Pattern: any path that returns BEFORE `hasher.Verify` runs is a latency oracle. Fix: pre-bake a dummy hash in the constructor and always run Verify against it on the early-exit branches. Document this prominently in any service that takes a password.
+
+2. **OWASP-min Argon2id beats max-security for our threat model.** Default 64 MiB / t=3 / p=4 burns 64 MiB per concurrent login — a flood OOM-kills small pods before the rate-limiter trips. m=19 MiB / t=2 / p=1 + `BoundedHasher` (semaphore = NumCPU) caps worst-case at ~76 MiB. Code path documented in `pkg/passwords/doc.go`.
+
+3. **JWT JTI MUST be unique per token, not per session.** First implementation reused `claims.JTI = jti` for both `IssueAccess` and `IssueRefresh` calls — the issuer happily produced two tokens with the same JTI (a passive RFC 7519 §4.1.7 violation, plus a real collision risk in any future jti-keyed store). Fix: pre-mint two distinct JTIs in the caller. Eliminated a wasted re-Validate round-trip as a side effect.
+
+4. **Down migrations need data-loss guards.** `users.role text` → `roles text[]` was a one-way move: any user with 2+ roles loses everything except `roles[1]` on rollback. Fix: PL/pgSQL `RAISE EXCEPTION` guard in down.sql when multi-role data exists. Future migrations should check for irreversibility BEFORE the actual destructive ALTER.
+
+5. **Redis whitelist + Lua atomic Rotate is the canonical refresh-rotation pattern.** Reads-modify-writes in one EVAL with 3-way return ({not-found, already-rotated, success}) — strictly better than the spec's Lookup-then-Rotate pattern. The 3-way return prevented a race-window where a valid token could be marked rotated for a transient lookup miss.
+
+6. **`gopls` cache is THE single biggest noise source.** After every subagent dispatch, IDE shows phantom errors (undefined symbols, GOPROXY=off, "method unused"). Reality: `go build && go test -race` are clean. CLAUDE.md's "verify directly" rule saves real time — never trust IDE diagnostics fresh off a subagent.
+
+7. **`gocognit` linter trips when a single function has both happy + timing-safe + transactional branches.** Refactor pattern: extract the inner-tx closure into a helper (`applyPasswordChange`). Keeps the public method readable and the linter quiet.
+
+8. **`forcetypeassert` + `errorlint` (project-enforced) ban two patterns the plan source uses casually**: bare `mc["x"].(string)` and `fmt.Errorf("%w: %v", sentinel, err)`. Use comma-ok and `errors.Join` (or `%w: %w` on Go 1.20+) respectively. Sabagents need this in their prompts to avoid bouncing through fix-up loops.
+
+9. **`miniredis` + `t.Cleanup(release)` + idempotent `Release()`**: the gateHasher pattern in `pkg/passwords/bounded_test.go` had to be made idempotent (`sync.Once`) so explicit Release() inside the test and `t.Cleanup(Release)` for safety could coexist without panic. Reusable pattern for any test that gates goroutines.
+
+10. **Composition root needs explicit nil-checks**, not just lazy ones. `NewUserService` originally accepted nil deps; in production a misconfigured root would silently swallow audit rows forever. Fix: panic-on-nil at construction with a clear message. Same fix applied to TOTP and Authenticator.
+
+11. **Audit module is still a stub** (`internal/audit/Module.Register` is a no-op as of v0.0.7). The auth module's composition root falls back to a `noopAuditLogger{}` with `logger.Warn` to surface this loudly. When Plan 03 / a future plan wires real audit, the fallback silently bypasses. **Future plans depending on audit should follow this same fallback pattern.**
+
+12. **Redis client missing from `cmd/api/main.go`**. `internal/modules.Deps.Redis` is plumbed (UniversalClient), but `cmd/api` doesn't yet construct one. `auth.Module.Register` returns a structured error if called without it. The `registry.Modules` map in cmd/api is still empty per the existing Plan 02 comment, so this is a forward-compatible slot — first module to actually register will need cmd/api wiring.
+
+---
+
 ## Gotchas (do-not-do list)
 
 1. **НЕ использовать `bcrypt`** — устарел (нет protect-against-side-channel, нет memory-hardness). Argon2id — современный стандарт. (Note Aug 2024: bcrypt всё ещё OK для совсем low-stakes deployments; мы выбрали Argon2id с OWASP-минимум params + BoundedHasher.)
@@ -114,12 +144,12 @@ Status: **ready, plan not yet started**.
 
 ## Open questions (что узнаем в реализации)
 
-1. **Argon2id parameters**: какие m/t/p оптимальны на нашем target hardware? Plan 05 Task 0 должен быть бенчмарк (1 секунда per hash на 10 RPS — потолок), от него подобрать конкретные m/t/p.
-2. **Rate-limiting strategy**: per-IP, per-account, или both? Token-bucket в Redis? Plan 05 Task ~5 должен это решить.
-3. **Session storage**: full session table в Postgres или active sessions в Redis с lazy persistence?
-4. **MFA for service_owner**: обязательно или опционально? Спека §13 говорит "обязательно для admin", но не специфицирует TOTP vs WebAuthn.
-5. **Backup codes UX**: показать один раз при enroll? Или пользователь может перегенерировать? Какой confirmation flow?
-6. **Logout-all-devices**: revoke ALL sessions for a user → инвалидируется access token (через session_id check)?
+1. **Argon2id parameters**: ~~какие m/t/p оптимальны?~~ ✅ **RESOLVED**: m=19 MiB, t=2, p=1 (OWASP min). Защита от DoS-OOM важнее offline-резистентности для нашей модели угроз. Worst-case резидентка с `BoundedHasher` (NumCPU concurrency) ≈ 76 MiB. См. `pkg/passwords/doc.go` и `params.go`.
+2. **Rate-limiting strategy**: ✅ **RESOLVED**: и per-IP (30/h), и per-account (10/h). Sliding window через Redis ZADD/ZCARD pipeline (count-before-add). См. `internal/auth/service/ratelimit.go`. Известный edge case: pipeline-interleaving может пропустить ±1 запрос; для нашего масштаба приемлемо.
+3. **Session storage**: ✅ **RESOLVED**: refresh tokens — Redis whitelist (`auth:refresh:<jti>`); revocation — Redis kill keys (`auth:revoke:sid:<sid>`) + per-user cutoff (`auth:revoke:user:<uid>:cutoff`). Postgres не используется для сессий — TTL Redis достаточно.
+4. **MFA for service_owner**: остаётся открытым — `service-owner` роль ещё не добавлена в код. Появится в Plan 06+ (cross-tenant ops).
+5. **Backup codes UX**: ✅ **RESOLVED**: 10 кодов по 10 hex chars, returned ONCE at Enroll, hashed via cheap Argon2 (`passwords.BackupCodeParams()` — m=1 MiB, t=1, p=1). Single-use enforced через atomic `array_remove` в SQL (race-safe). Re-generate доступно через `Disable` + `Enroll`.
+6. **Logout-all-devices**: ✅ **RESOLVED**: `SessionRevoker.RevokeAllForUser` пишет cutoff timestamp; `IsRevokedClaims` инвалидирует любой access token, выпущенный до этого момента (`iat <= cutoff`). 30-дневный TTL cutoff-ключа.
 
 ---
 

@@ -24,6 +24,8 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("http.write_timeout", c.HTTP.WriteTimeout)
 	v.SetDefault("http.idle_timeout", c.HTTP.IdleTimeout)
 	v.SetDefault("http.max_body_size", c.HTTP.MaxBodySize)
+	// http.trusted_proxies left unseeded — empty = trust nothing,
+	// strictest secure default. Production override via yaml/env.
 	// ws
 	v.SetDefault("ws.bind", c.WS.Bind)
 	v.SetDefault("ws.ping_interval", c.WS.PingInterval)

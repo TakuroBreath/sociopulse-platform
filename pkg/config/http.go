@@ -14,6 +14,18 @@ type HTTPConfig struct {
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
 	IdleTimeout  time.Duration `mapstructure:"idle_timeout"`
 	MaxBodySize  int64         `mapstructure:"max_body_size"`
+
+	// TrustedProxies lists the CIDR ranges of upstream load balancers
+	// whose X-Forwarded-For headers gin should honour when computing
+	// c.ClientIP(). MUST be set in production: gin's default trusts
+	// every proxy (0.0.0.0/0), which lets any client spoof their
+	// origin IP and bypass the auth module's per-IP rate limiter.
+	//
+	// Empty list = trust NO proxy (c.ClientIP returns the direct
+	// peer). For production behind a Yandex Cloud Application Load
+	// Balancer use the LB's documented CIDR (e.g. "10.0.0.0/8") or
+	// the specific subnet of the ingress nodes.
+	TrustedProxies []string `mapstructure:"trusted_proxies"`
 }
 
 func (h *HTTPConfig) validate() error {

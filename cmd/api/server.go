@@ -51,6 +51,21 @@ func buildHTTPServer(
 	}
 
 	r := gin.New()
+
+	// SECURITY: gin's default trusts every proxy (0.0.0.0/0), which lets
+	// any client spoof their X-Forwarded-For and bypass per-IP rate
+	// limiting / lockout. Pin the trusted-proxy list to whatever the
+	// load balancer's CIDR is. An empty config list locks gin down to
+	// "trust no proxy" — strictest possible default. Errors here are
+	// fatal: a misconfigured TrustedProxies entry is a security
+	// regression we must not silently tolerate.
+	if err := r.SetTrustedProxies(cfg.HTTP.TrustedProxies); err != nil {
+		logger.Fatal("HTTP: SetTrustedProxies",
+			zap.Strings("trusted_proxies", cfg.HTTP.TrustedProxies),
+			zap.Error(err),
+		)
+	}
+
 	r.Use(
 		gin.Recovery(),
 		observability.RequestIDMiddleware(),
