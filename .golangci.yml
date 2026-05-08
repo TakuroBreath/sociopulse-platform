@@ -114,7 +114,10 @@ linters-settings:
       banned-stdlib:
         list-mode: lax
         deny:
-          - pkg: "math/rand"
+          # `$` suffix forces exact-match — math/rand v1 is denied while
+          # math/rand/v2 (the modern API) stays importable. depguard treats
+          # bare `math/rand` as a prefix that also matches `math/rand/v2`.
+          - pkg: "math/rand$"
             desc: "use math/rand/v2 for non-security randomness or crypto/rand for tokens/keys (samber/cc-skills-golang@golang-security, @golang-modernize)"
           - pkg: "crypto/cipher.NewCBCEncrypter"
             desc: "CBC lacks authentication — use AES-GCM (samber/cc-skills-golang@golang-security)"
