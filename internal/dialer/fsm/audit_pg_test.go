@@ -314,7 +314,7 @@ func TestIntegration_PG_ForceClosesSession(t *testing.T) {
 	require.NoError(t, err)
 
 	// Force offline with a reason — heartbeat watchdog scenario.
-	snap, err := mach.Force(ctx, tenantID, userID, api.StateOffline, "heartbeat_lost")
+	snap, err := mach.Force(ctx, tenantID, userID, api.StateOffline, api.ForceReasonHeartbeatLost)
 	require.NoError(t, err)
 	require.Equal(t, api.StateOffline, snap.State)
 

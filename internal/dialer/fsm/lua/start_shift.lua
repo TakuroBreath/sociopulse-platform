@@ -11,9 +11,6 @@
 --   -1 if the hash exists in any non-offline / non-ready state — the caller
 --      should refetch and surface ErrInvalidTransition (operator already
 --      mid-shift in another state).
---   -2 if the hash exists but session_id differs from the requested one —
---      indicates a duplicate StartShift created a second session row in PG;
---      caller treats as concurrent-call conflict.
 --
 -- The script accepts both "missing key" and "key with state=offline" as
 -- valid starting points so a Force-offline operator can be re-started

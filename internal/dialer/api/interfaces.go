@@ -37,7 +37,10 @@ type OperatorFSM interface {
 	// GetState returns the current Snapshot without performing a transition.
 	GetState(ctx context.Context, tenantID, operatorID uuid.UUID) (Snapshot, error)
 	// Force is the supervisor escape hatch — sets State to target with a reason.
-	Force(ctx context.Context, tenantID, operatorID uuid.UUID, target State, reason string) (Snapshot, error)
+	// reason is a typed enum so the Prometheus dialer_fsm_force_total{reason}
+	// label cardinality stays bounded; unrecognised values are bucketed under
+	// ForceReasonOther by the implementation.
+	Force(ctx context.Context, tenantID, operatorID uuid.UUID, target State, reason ForceReason) (Snapshot, error)
 }
 
 // CallQueue is the Redis ZSET surface used by the dialer worker loop.

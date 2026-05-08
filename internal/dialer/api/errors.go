@@ -21,4 +21,11 @@ var (
 	ErrThrottled = errors.New("dialer: rate-limit throttled")
 	// ErrTenantMismatch is returned when an operation crosses tenants (defence in depth).
 	ErrTenantMismatch = errors.New("dialer: tenant mismatch")
+	// ErrConflict is returned when a concurrent transition committed first
+	// (optimistic-concurrency CAS lost). The caller MAY retry: load the
+	// current snapshot and re-apply the event if it's still meaningful in
+	// the new state. Implementations: dialer/fsm Machine surfaces this on
+	// any state-changing call (StartShift / EndShift / GoPause / ... /
+	// Force) when the hash version has advanced between load and CAS.
+	ErrConflict = errors.New("dialer: optimistic-concurrency conflict")
 )

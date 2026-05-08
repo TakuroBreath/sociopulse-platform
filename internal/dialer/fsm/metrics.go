@@ -94,9 +94,13 @@ func (m *Metrics) observeInvalid(from api.State, evt api.Event) {
 }
 
 // observeForce increments the Force counter. nil-tolerated.
-func (m *Metrics) observeForce(target api.State, reason string) {
+//
+// reason is the typed enum so the {reason} label stays bounded; callers
+// must normalize unrecognised free-form input to api.ForceReasonOther
+// before invoking this. Force enforces that contract.
+func (m *Metrics) observeForce(target api.State, reason api.ForceReason) {
 	if m == nil || m.Force == nil {
 		return
 	}
-	m.Force.WithLabelValues(string(target), reason).Inc()
+	m.Force.WithLabelValues(string(target), string(reason)).Inc()
 }

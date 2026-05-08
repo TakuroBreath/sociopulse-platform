@@ -59,12 +59,11 @@ func opKey(tenantID, operatorID uuid.UUID) string {
 	return "op:" + tenantID.String() + ":user:" + operatorID.String()
 }
 
-// errVersionMismatch is the package-internal sentinel returned by casStore
-// when the Lua script reports an optimistic-concurrency conflict. Callers
-// can errors.Is() against it to decide whether to retry. It does NOT
-// escape the FSM — public methods return api.ErrInvalidTransition or
-// wrap it for diagnostics.
-var errVersionMismatch = errors.New("fsm: optimistic concurrency mismatch")
+// errVersionMismatch is the package-private CAS-failed signal. It wraps
+// api.ErrConflict so callers across module boundaries can detect the
+// conflict via errors.Is(err, api.ErrConflict) and retry by re-loading
+// the current snapshot.
+var errVersionMismatch = fmt.Errorf("fsm/store: %w", api.ErrConflict)
 
 // errStartShiftBusy is the package-internal sentinel returned by
 // startShiftCAS when the operator's hash exists in a non-offline state
@@ -122,8 +121,8 @@ func parseHash(h map[string]string) (Snapshot, error) {
 		return Snapshot{}, err
 	}
 	if v := h["pause_reason"]; v != "" {
-		copy := v
-		s.PauseReason = &copy
+		reason := v
+		s.PauseReason = &reason
 	}
 	if v := h["version"]; v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)

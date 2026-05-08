@@ -150,9 +150,46 @@ func (m *Machine) applyEvent(
 	evt api.Event,
 	mutate func(s *Snapshot),
 ) (api.Snapshot, error) {
+	return m.applyEventWith(ctx, tenantID, operatorID, evt, nil, mutate, nil)
+}
+
+// applyEventWith is the extended form of applyEvent. It exposes two extra
+// hooks for callers that need to consult the loaded snapshot before the
+// transition lookup:
+//
+//   - preCheck runs immediately after load. A non-nil error short-circuits
+//     the whole call; the err is returned verbatim and the invalid-transition
+//     metric is incremented under (cur.State, evt).
+//   - replayShortCircuit runs after preCheck. When it returns true, the
+//     function returns the current snapshot as an idempotent no-op even if
+//     the (state, event) edge is not in the transitions table. Used by
+//     RecordCallStarted to absorb a "replay with same call_id from call"
+//     without surfacing ErrInvalidTransition on the missing edge.
+//
+// Both hooks are nil-tolerant; when both are nil this is the canonical
+// applyEvent. The point of folding the call_id mismatch check inside the
+// already-loaded snapshot is to avoid a second HGETALL per
+// RecordCallStarted invocation (see Plan 10 Task 2 code-quality fix-up).
+func (m *Machine) applyEventWith(
+	ctx context.Context,
+	tenantID, operatorID uuid.UUID,
+	evt api.Event,
+	preCheck func(cur Snapshot) error,
+	mutate func(s *Snapshot),
+	replayShortCircuit func(cur Snapshot) bool,
+) (api.Snapshot, error) {
 	cur, err := m.load(ctx, tenantID, operatorID)
 	if err != nil {
 		return api.Snapshot{}, err
+	}
+	if preCheck != nil {
+		if err := preCheck(cur); err != nil {
+			m.metrics.observeInvalid(cur.State, evt)
+			return api.Snapshot{}, err
+		}
+	}
+	if replayShortCircuit != nil && replayShortCircuit(cur) {
+		return cur.toAPI(tenantID, operatorID), nil
 	}
 	next, ok := transitions[edge{from: cur.State, event: evt}]
 	if !ok {
@@ -396,37 +433,39 @@ func (m *Machine) Resume(ctx context.Context, tenantID, operatorID uuid.UUID) (a
 //
 //   - A replay with the same call_id from call (or any state) is a
 //     no-op — both call_id and operator state are already where the
-//     caller wants them.
+//     caller wants them. Handled inside applyEvent's idempotency check
+//     once we land in call; the call_id is already pinned on the hash.
 //   - A replay with a DIFFERENT call_id while one is in flight returns
 //     api.ErrInvalidTransition wrapped with both call IDs — see Plan 10
-//     ref doc open-Q resolution.
+//     ref doc open-Q resolution. The check fires inside applyEventWith's
+//     pre-mutate hook so we don't pay a second HGETALL.
 func (m *Machine) RecordCallStarted(ctx context.Context, req api.CallStartedRequest) (api.Snapshot, error) {
-	// Pre-check the call_id collision before applyEvent touches the
-	// state machine, because a transition with a NEW call_id from
-	// dialing → call would otherwise silently overwrite the in-flight
-	// CurrentCallID — and the replay rule does not catch this.
-	cur, err := m.load(ctx, req.TenantID, req.OperatorID)
-	if err != nil {
-		return api.Snapshot{}, err
-	}
-	if cur.CurrentCallID != nil && *cur.CurrentCallID != req.CallID {
-		m.metrics.observeInvalid(cur.State, api.EventCallStarted)
-		return api.Snapshot{},
-			fmt.Errorf("%w: in-flight call_id=%s, new call_id=%s",
-				api.ErrInvalidTransition, *cur.CurrentCallID, req.CallID)
-	}
-	// Replay with the same call_id from call — the operator is already
-	// past dialing and on a live call. Return the existing snapshot
-	// rather than erroring on the missing (call, call_started) edge.
-	if cur.State == api.StateCall && cur.CurrentCallID != nil && *cur.CurrentCallID == req.CallID {
-		return cur.toAPI(req.TenantID, req.OperatorID), nil
-	}
-	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventCallStarted, func(s *Snapshot) {
-		callID := req.CallID
-		respID := req.RespondentID
-		s.CurrentCallID = &callID
-		s.RespondentID = &respID
-	})
+	return m.applyEventWith(ctx, req.TenantID, req.OperatorID, api.EventCallStarted,
+		func(cur Snapshot) error {
+			// Detect a NEW call_id while another is in flight: applyEvent's
+			// (state, event) lookup would silently let the transition through
+			// and overwrite CurrentCallID. Reject explicitly.
+			if cur.CurrentCallID != nil && *cur.CurrentCallID != req.CallID {
+				return fmt.Errorf("%w: in-flight call_id=%s, new call_id=%s",
+					api.ErrInvalidTransition, *cur.CurrentCallID, req.CallID)
+			}
+			return nil
+		},
+		func(s *Snapshot) {
+			callID := req.CallID
+			respID := req.RespondentID
+			s.CurrentCallID = &callID
+			s.RespondentID = &respID
+		},
+		// Replay-from-call short-circuit: if the operator is already in
+		// `call` with the SAME call_id, treat as idempotent no-op rather
+		// than rejecting on the missing (call, call_started) edge.
+		func(cur Snapshot) bool {
+			return cur.State == api.StateCall &&
+				cur.CurrentCallID != nil &&
+				*cur.CurrentCallID == req.CallID
+		},
+	)
 }
 
 // RecordCallEnded implements api.OperatorFSM. Both dialing→status
@@ -475,18 +514,26 @@ func (m *Machine) GetState(ctx context.Context, tenantID, operatorID uuid.UUID) 
 // Force performs the same Redis CAS write + audit as a transition, but:
 //   - It writes target regardless of the source state.
 //   - It clears CurrentCallID / RespondentID / PauseReason.
-//   - The audit row carries the supplied reason.
+//   - The audit row carries the supplied (normalized) reason.
 //   - When forcing to offline, the bound operator_sessions row is closed
 //     (ended_at = now()).
+//
+// reason is normalized to ForceReasonOther when it doesn't match the
+// recognized enum so the dialer_fsm_force_total{reason} Prometheus label
+// stays low-cardinality. The same normalized value is written to the
+// operator_state_log audit row.
 func (m *Machine) Force(
 	ctx context.Context,
 	tenantID, operatorID uuid.UUID,
 	target api.State,
-	reason string,
+	reason api.ForceReason,
 ) (api.Snapshot, error) {
 	if !target.Valid() {
 		return api.Snapshot{}, fmt.Errorf("fsm/force: invalid target state %q: %w",
 			target, api.ErrUnknownState)
+	}
+	if !reason.Valid() {
+		reason = api.ForceReasonOther
 	}
 	cur, err := m.load(ctx, tenantID, operatorID)
 	if err != nil {
@@ -516,14 +563,15 @@ func (m *Machine) Force(
 	updated.Version = cur.Version + 1
 
 	// Audit + session closure (offline only).
+	reasonStr := string(reason)
 	switch {
 	case target == api.StateOffline && cur.SessionID != nil:
-		if err := m.closeSessionAndAudit(ctx, tenantID, operatorID, *cur.SessionID, reason, now); err != nil {
+		if err := m.closeSessionAndAudit(ctx, tenantID, operatorID, *cur.SessionID, reasonStr, now); err != nil {
 			m.log.Error("fsm/force: close-session audit failed; live state already forced",
 				zap.Stringer("tenant_id", tenantID),
 				zap.Stringer("operator_id", operatorID),
 				zap.Stringer("session_id", *cur.SessionID),
-				zap.String("reason", reason),
+				zap.String("reason", reasonStr),
 				zap.Error(err))
 		}
 	case cur.SessionID != nil:
@@ -532,7 +580,7 @@ func (m *Machine) Force(
 			OperatorID:  operatorID,
 			SessionID:   *cur.SessionID,
 			NewState:    target,
-			Reason:      reason,
+			Reason:      reasonStr,
 			OccurredAt:  now,
 			ProjectID:   updated.ProjectID,
 			CallID:      updated.CurrentCallID,
@@ -543,7 +591,7 @@ func (m *Machine) Force(
 				zap.Stringer("tenant_id", tenantID),
 				zap.Stringer("operator_id", operatorID),
 				zap.String("target", string(target)),
-				zap.String("reason", reason),
+				zap.String("reason", reasonStr),
 				zap.Error(err))
 		}
 	default:
@@ -554,7 +602,7 @@ func (m *Machine) Force(
 			zap.Stringer("tenant_id", tenantID),
 			zap.Stringer("operator_id", operatorID),
 			zap.String("target", string(target)),
-			zap.String("reason", reason))
+			zap.String("reason", reasonStr))
 	}
 
 	m.metrics.observeForce(target, reason)

@@ -60,4 +60,13 @@
 // that the loaded hash's stored tenant_id matches the requested tenant_id
 // and returns ErrTenantMismatch on mismatch as a defence-in-depth layer
 // above RLS.
+//
+// # Known limitations (Task 2 v1)
+//
+//   - StartShift INSERTs an operator_sessions row before the Redis CAS. On
+//     concurrent StartShift the loser's session row is orphaned with
+//     ended_at = NULL. This inflates "active operators" queries by the rate
+//     of concurrent StartShift rejections (low — 1 per operator per shift).
+//     A periodic reaper (Plan 10 Task 2c follow-up) is intended to UPDATE
+//     ended_at on rows older than 24h with no matching Redis hash.
 package fsm

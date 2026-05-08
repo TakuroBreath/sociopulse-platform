@@ -14,7 +14,9 @@ package fsm_test
 
 import (
 	"context"
+	"errors"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -266,6 +268,80 @@ func TestIntegration_ConcurrentCAS(t *testing.T) {
 
 	t.Logf("concurrent CAS: state-changing CAS writes=%d final_version=%d state=%s",
 		totalTransitions, finalVersion, stateStr)
+}
+
+// TestIntegration_CASConflict_SurfacesErrConflict races N parallel CAS
+// writes on the SAME hash version against real Redis and asserts that
+// at least one of the losers surfaces api.ErrConflict via errors.Is.
+// Public callers across module boundaries (cmd/api retry middleware,
+// cmd/worker dispatch loop) rely on this chain to distinguish a
+// retryable optimistic-concurrency conflict from a genuinely invalid
+// transition.
+//
+// We drive the race directly through the public Force surface, which
+// always issues a CAS regardless of source state. Force(target=ready)
+// from ready is a no-op (idempotent), so we race Force(target=pause)
+// against an already-paused operator: the winner of the CAS lands the
+// transition, every other racer's expected_version is now stale and
+// the script returns -1 → errVersionMismatch wrapping api.ErrConflict.
+//
+// To eliminate the trailing-racer "saw the post-winner state and
+// idempotent-shortcut" path, we toggle the target across racers using
+// odd/even indexing — each racer attempts to flip the operator state.
+// Real Redis serialises Lua scripts per-key, so the first winner of any
+// version=v→v+1 advance wins; concurrent attempts at the same version
+// all observe the bump and surface ErrConflict.
+func TestIntegration_CASConflict_SurfacesErrConflict(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	t.Parallel()
+	f := newRedisFixture(t)
+	tenantID, operatorID, projectID := uuid.New(), uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	_, err := f.machine.StartShift(ctx, newReq(tenantID, operatorID, projectID))
+	require.NoError(t, err)
+
+	// Race N parallel pause/resume cycles. Force is the cleanest
+	// driver because it bypasses the transitions table — every call
+	// issues a CAS — but surfaces the same errVersionMismatch chain.
+	// The mix of pause/resume targets keeps every iteration "useful":
+	// after a winner moves the state, racers at the OLD version still
+	// see ErrConflict via errors.Is (their expected version is stale).
+	const racers = 64
+	var conflictCount, otherErrCount, successCount int64
+	var wg sync.WaitGroup
+	startBarrier := make(chan struct{})
+	for i := range racers {
+		wg.Go(func() {
+			<-startBarrier
+			target := api.StatePause
+			if i%2 == 0 {
+				target = api.StateReady
+			}
+			_, err := f.machine.Force(ctx, tenantID, operatorID, target, api.ForceReasonAdminOverride)
+			switch {
+			case err == nil:
+				atomic.AddInt64(&successCount, 1)
+			case errors.Is(err, api.ErrConflict):
+				atomic.AddInt64(&conflictCount, 1)
+			default:
+				atomic.AddInt64(&otherErrCount, 1)
+				t.Logf("unexpected error: %v", err)
+			}
+		})
+	}
+	close(startBarrier)
+	wg.Wait()
+
+	require.Zero(t, atomic.LoadInt64(&otherErrCount),
+		"all errors from a same-version Force race must be api.ErrConflict; got non-conflict errors")
+	require.GreaterOrEqual(t, atomic.LoadInt64(&conflictCount), int64(1),
+		"at least one parallel Force must lose the CAS and surface api.ErrConflict on real Redis (success=%d)",
+		atomic.LoadInt64(&successCount))
+	t.Logf("CAS conflict race: %d racers, %d successes, %d conflicts surfaced",
+		racers, atomic.LoadInt64(&successCount), atomic.LoadInt64(&conflictCount))
 }
 
 // parseInt64 parses a decimal int64. Inlined helper to keep the

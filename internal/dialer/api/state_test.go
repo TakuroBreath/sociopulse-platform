@@ -105,3 +105,48 @@ func TestEventValid_RejectsUnknown(t *testing.T) {
 		})
 	}
 }
+
+// ForceReason mirrors the State / Event exhaustive coverage. The label
+// feeds Prometheus dialer_fsm_force_total{reason}; an undeclared value
+// would silently bloat cardinality, so the FSM normalises any unknown
+// input to ForceReasonOther — that contract is enforced by Force +
+// observeForce, with this test gating the enum surface.
+func TestForceReasonValid_KnownValues(t *testing.T) {
+	t.Parallel()
+	cases := []api.ForceReason{
+		api.ForceReasonHeartbeatLost,
+		api.ForceReasonSupervisorKick,
+		api.ForceReasonShutdown,
+		api.ForceReasonAdminOverride,
+		api.ForceReasonOther,
+	}
+	for _, r := range cases {
+		t.Run(string(r), func(t *testing.T) {
+			t.Parallel()
+			if !r.Valid() {
+				t.Fatalf("%q: want Valid() true, got false", r)
+			}
+		})
+	}
+}
+
+func TestForceReasonValid_RejectsUnknown(t *testing.T) {
+	t.Parallel()
+	cases := []string{
+		"",                  // zero value — undeclared reason
+		"HEARTBEAT_LOST",    // wrong case
+		"heartbeat-lost",    // wrong separator
+		"supervisor kick",   // space instead of underscore
+		"audit",             // garbage
+		"shutdown ",         // trailing space
+		"random_admin_text", // free-form supervisor input
+	}
+	for _, raw := range cases {
+		t.Run(raw, func(t *testing.T) {
+			t.Parallel()
+			if api.ForceReason(raw).Valid() {
+				t.Fatalf("%q: want Valid() false, got true", raw)
+			}
+		})
+	}
+}

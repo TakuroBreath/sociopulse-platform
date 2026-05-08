@@ -74,6 +74,34 @@ func (e Event) Valid() bool {
 	return false
 }
 
+// ForceReason enumerates the supervisor- / watchdog-driven reasons for
+// Machine.Force. The label is fed into Prometheus
+// dialer_fsm_force_total{reason} and MUST stay low-cardinality.
+//
+// Adding a new constant requires extending Valid() and is enforced by the
+// exhaustive test in state_test.go.
+type ForceReason string
+
+const (
+	ForceReasonHeartbeatLost  ForceReason = "heartbeat_lost"  // watchdog: presence TTL expired
+	ForceReasonSupervisorKick ForceReason = "supervisor_kick" // operator kicked by supervisor UI
+	ForceReasonShutdown       ForceReason = "shutdown"        // graceful drain
+	ForceReasonAdminOverride  ForceReason = "admin_override"  // catch-all for admin tooling
+	ForceReasonOther          ForceReason = "other"           // unrecognised free-form input bucket
+)
+
+// Valid reports whether r is a recognized ForceReason. Used by Force to
+// gate Prometheus labels — unknown reasons are bucketed under "other"
+// rather than blown up into per-instance label values.
+func (r ForceReason) Valid() bool {
+	switch r {
+	case ForceReasonHeartbeatLost, ForceReasonSupervisorKick,
+		ForceReasonShutdown, ForceReasonAdminOverride, ForceReasonOther:
+		return true
+	}
+	return false
+}
+
 // Snapshot is the immutable view of one operator's FSM state.
 type Snapshot struct {
 	TenantID       uuid.UUID

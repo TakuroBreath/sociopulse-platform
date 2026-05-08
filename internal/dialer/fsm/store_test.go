@@ -349,7 +349,7 @@ func TestForce_FromMissingHash(t *testing.T) {
 
 	// Operator never started a shift. Force them to ready (a strange
 	// but supported scenario — supervisor manually moves them).
-	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateReady, "supervisor_manual_set")
+	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateReady, api.ForceReasonAdminOverride)
 	require.NoError(t, err)
 	require.Equal(t, api.StateReady, snap.State)
 

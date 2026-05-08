@@ -583,7 +583,7 @@ func TestForce_FromAnyStateToOffline(t *testing.T) {
 	require.NoError(t, err)
 
 	// Force offline from call state — bypasses transition table.
-	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, "heartbeat_lost")
+	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, api.ForceReasonHeartbeatLost)
 	require.NoError(t, err)
 	require.Equal(t, api.StateOffline, snap.State)
 	require.Nil(t, snap.CurrentCallID)
@@ -598,7 +598,7 @@ func TestForce_RejectsInvalidTarget(t *testing.T) {
 	tenantID, operatorID := uuid.New(), uuid.New()
 	ctx := context.Background()
 
-	_, err := f.machine.Force(ctx, tenantID, operatorID, api.State("garbage"), "test")
+	_, err := f.machine.Force(ctx, tenantID, operatorID, api.State("garbage"), api.ForceReasonAdminOverride)
 	require.ErrorIs(t, err, api.ErrUnknownState)
 }
 
@@ -611,7 +611,7 @@ func TestForce_IdempotentOnSameTarget(t *testing.T) {
 	ctx := context.Background()
 
 	// Operator starts implicitly offline. Force-offline is a no-op.
-	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, "heartbeat_lost")
+	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, api.ForceReasonHeartbeatLost)
 	require.NoError(t, err)
 	require.Equal(t, api.StateOffline, snap.State)
 
@@ -940,7 +940,7 @@ func TestForce_FromCallToOffline_AuditFailure(t *testing.T) {
 
 	// Poison audit and Force.
 	f.pg.errOnTx = errors.New("audit-tx-fail")
-	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, "supervisor_kick")
+	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, api.ForceReasonSupervisorKick)
 	require.NoError(t, err)
 	require.Equal(t, api.StateOffline, snap.State)
 }
@@ -957,7 +957,7 @@ func TestForce_NonOfflineTarget_AuditFailure(t *testing.T) {
 	require.NoError(t, err)
 
 	f.pg.errOnTx = errors.New("audit-tx-fail")
-	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StatePause, "supervisor_kick_to_pause")
+	snap, err := f.machine.Force(ctx, tenantID, operatorID, api.StatePause, api.ForceReasonSupervisorKick)
 	require.NoError(t, err)
 	require.Equal(t, api.StatePause, snap.State)
 }
@@ -1037,7 +1037,7 @@ func TestNilMetricsTolerated(t *testing.T) {
 	_, err = mach.VerifyDone(ctx, tenantID, operatorID)
 	require.ErrorIs(t, err, api.ErrInvalidTransition)
 	// Force, also nil-metrics path.
-	_, err = mach.Force(ctx, tenantID, operatorID, api.StateOffline, "test")
+	_, err = mach.Force(ctx, tenantID, operatorID, api.StateOffline, api.ForceReasonAdminOverride)
 	require.NoError(t, err)
 }
 
@@ -1058,7 +1058,7 @@ func TestMetricsCounters(t *testing.T) {
 	require.ErrorIs(t, err, api.ErrInvalidTransition)
 
 	// Trigger a force.
-	_, err = f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, "supervisor_kick")
+	_, err = f.machine.Force(ctx, tenantID, operatorID, api.StateOffline, api.ForceReasonSupervisorKick)
 	require.NoError(t, err)
 
 	// Metrics counters: at least one transition, one invalid, one force.
