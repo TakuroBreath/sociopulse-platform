@@ -2,7 +2,7 @@
 
 > **Goal**: snap the realtime module (WebSocket Hub + NATS dispatcher + Redis presence + listen-in v1) to authoritative external sources. Loaded into every Plan 11 implementer prompt.
 
-**Status**: in-progress, next after Plan 10 (`v0.0.11-dialer`).
+**Status**: shipped at `v0.0.12-realtime` (2026-05-09).
 
 **Module path**: `github.com/sociopulse/platform` (NOT `social-pulse`).
 
@@ -119,6 +119,66 @@ When dispatching an implementer for any Plan 11 task:
 
 ---
 
-## Lessons learned (filled at close-out)
+## Lessons learned (Plan 11 close-out)
 
-_TBD — populate at v0.0.12 tag time._
+These bullets were populated when `v0.0.12-realtime` shipped. Future plans inherit them.
+
+### Architecture & API discipline
+
+1. **api/ surface stayed UNCHANGED throughout Plan 11.** Plan 00a's `Hub` / `Connection` / `WSConn` / `PresenceTracker` interfaces survived 7 implementation tasks without a single signature change. The only api/ additions were the supplementary `topics.go` (`AllTopics` + `TopicAction`) and `locator.go` (3 string constants). Lock the api/ as early as possible — by the time Plan 11 ran, the api/ was stable for ~3 days.
+
+2. **Locator-key constants live in `api/`, not the consumer's package.** `rtapi.LocatorHub` etc. let Plan 11 Task 7 (HTTP handler) and any future consumer resolve the Hub through the locator without taking a transitive dependency on `internal/realtime/service`. This was caught by code-quality reviewers and is now a permanent pattern.
+
+3. **`Hub.AttachForTest` is misnamed but correct.** The production HTTP handler reuses it because the alternative (a Hub method that bypasses the wire-side AuthHandshake) would duplicate logic. The "ForTest" suffix should be renamed to `Attach` in a follow-up; documented inline in the WS handler.
+
+4. **DO NOT spawn the JetStream subscriber from `Module.Register`.** This single gotcha (line 97) drove the whole Task 4c shape: `realtime.Module.Register` builds the Hub but the dispatcher's lifecycle lives in `cmd/api` so its Start/Stop is errgroup-driven from the composition root. Centralised graceful shutdown is more important than module-internal symmetry.
+
+### NATS / JetStream
+
+5. **Embedded `nats-server/v2` is the better test infra over `testcontainers-nats`.** No Docker dependency, ~200ms boot per test, fully in-process. Per-test random port + temp `StoreDir` keeps tests hermetic. The implementer chose this for Task 4a after weighing both options; matched and reused for the integration test in Task 9.
+
+6. **JetStream push consumer with MaxAckPending=1024 + per-replica queue group.** Plan 11 Q2 resolution: each replica registers a UNIQUE queue group (`realtime-replica-<podname>` or `<uuid>`) so each replica receives every event. Same-queue subscribers load-balance; different-queue subscribers fan out. Tested explicitly in `pkg/eventbus/nats_test.go:TestNATSPublisherSubscriber_FanOut`.
+
+7. **Sync publish is non-negotiable for outbox-relay drainage.** `js.PublishMsg(msg, nats.Context(ctx))` returns only after broker ack. Fire-and-forget would race the outbox status update.
+
+8. **Connection options matter at boot.** `RetryOnFailedConnect(true)` + `MaxReconnects(-1)` + `ReconnectWait(2s)` + `Name(...)` survive NATS restarts and identify the connection in NATS server logs. `nats.Timeout(5s)` bounds the dial so `dialNATS` doesn't hang the boot.
+
+9. **Subject-pattern dispatch is lock-free per-message.** The realtime dispatcher uses one `Subscribe` call per pattern (5 patterns, 5 subscriptions). The closure captures the `subjectPattern` per-iteration (Go 1.22+ scope rules) — no manual copy. `strings.Split(subject, ".")` happens once per delivery; the result is reused for both the token-count check and the per-pattern `extract`.
+
+10. **Histogram buckets must match the workload.** `pkg/eventbus.PublishLatency` was originally `prometheus.DefBuckets` (5ms..10s); for healthy-cluster p99 < 50ms, default buckets land 80%+ of samples in the 5-25ms bucket and waste resolution above 100ms. Replaced with custom `{0.5ms..5s}` buckets in the Task 4a follow-up review.
+
+### WebSocket / Connection lifecycle
+
+11. **`coder/websocket` v1.8.14 is the project standard, NOT `nhooyr.io/websocket`.** Same library, new module path. The plan-file Task 7 still references `nhooyr.io` — outdated; Plan 11 Task 7 implementer was explicitly told NOT to copy that section verbatim. Documented in the plan-file as a maintenance lien.
+
+12. **One reader + one writer + one pinger + one Touch ticker = the goroutine budget per WS conn.** `Connection.runReader` / `runWriter` / `runPinger` (Plan 11 Task 2) plus the Plan 11 Task 7 Touch goroutine for presence refresh. ALL spawned via `wg.Go` (Go 1.25+). `goleak.VerifyTestMain` catches any leak.
+
+13. **Drop-oldest backpressure on a per-conn `sendChan`.** A slow consumer is interested in the LATEST state — a stale operator-state transition is more useless than missing one. Dropping the OLDEST queued frame (channel-receive then channel-send the new) is the right pattern for telemetry. Plan 11 Task 10.1 will split this into critical/telemetry queues.
+
+14. **Per-pod refcount for multi-conn-same-user OnDisconnect.** PresenceTracker key is per-(tenant, user) but a single user can have multiple WS connections on the same pod. The WS handler maintains `map[tenant]map[user]int` and only fires PresenceTracker.OnDisconnect on the 1→0 transition. This is per-pod local; cross-pod scenarios rely on TTL refresh from surviving pods.
+
+15. **Subscribe-by-frame goes through `SetHubCallback`.** Plan 11 Task 7 wires `Connection.SetHubCallback` so `FrameSubscribe` / `FrameUnsubscribe` flow through `Connection.Subscribe`/`Unsubscribe` and emit `subscribe.ok`/`subscribe.error` on the wire. The default arm of the dispatch logs at Debug — defensive in case a future regression forwards a different frame kind.
+
+### Redis / Presence
+
+16. **`SET key replicaID PX <ttl_ms>` for OnConnect; `PEXPIRE` for Touch; SET-not-EXPIRE on missing.** Touch on a missing key (key already expired or never set) returns `ErrPresenceLapsed` — the Hub then closes the connection. **Touch MUST NOT silently re-create the key.** Regression-tested in `presence_test.go:TestPresence_TouchDoesNotResurrectMissingKey`.
+
+17. **`strings.SplitN(_, ":", 4)` for the SCAN result, NOT a custom splitN.** The plan-file's illustrative impl had a hand-rolled splitter; Plan 11 Task 5 replaced it with stdlib. Same lesson applied across the project — stdlib over hand-rolled when the semantics are equivalent.
+
+18. **`slices.Sort` for OnlineUsers determinism.** The SCAN order is implementation-defined; tests would flake without a deterministic projection. `slices.Sort([]string)` is stable, deterministic, and free.
+
+### Pipeline & review
+
+19. **2-stage review (spec compliance + code quality) on every task.** Plan 11 ran 7 implementation tasks; reviews caught 13 issues (0 blocker + 2 important + 11 nit) BEFORE merge. The 2 importants were both modernize/style misses (not behavioural). Pattern is: dispatch implementer subagent (opus) → spec reviewer → code-quality reviewer → batch fixes inline → commit follow-up. Same pattern as Plan 10.
+
+20. **Embedded NATS server boot needs a stream BEFORE Publish.** JetStream-backed publishes fail with "no matching stream" if the subject isn't covered by a configured stream. `pkg/eventbus/helpers_test.go:ensureStream` provisions one per test; `internal/realtime/integration_test.go` reuses the same helper.
+
+### Carry-overs from prior plans (NOT closed in Plan 11)
+
+21. **`internal/telephony/nats_bridge` is still a stub.** Originally listed as a Plan 11 carry-over but the scope was too large to land cleanly with the realtime work. Now Plan 11.1.
+
+22. **Dialer `SnapshotPubSub` is still in-memory.** Cross-replica fan-out for operator-state was supposed to swap to NATS in Plan 11; deferred to Plan 11.1.
+
+23. **`internal/dialer/fsm.RefreshPresence` is exported but not wired.** Same story — intended as Plan 11 work, deferred. Need a gin middleware on operator routes so the Heartbeat watchdog only triggers on ungraceful disconnect.
+
+24. **Listen-in v1 (silent mode + audit) is still deferred to Plan 08.** Plan 11 Decision 5 locked this in; Plan 08 (FreeSWITCH cluster) is a prerequisite. Plan 11 Task 7's listen-in handlers return 503 + `telephony.bridge.offline` until then.
