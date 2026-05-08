@@ -58,9 +58,7 @@ func fakeESLServer(t *testing.T, handler func(net.Conn)) (string, func()) {
 		wg    sync.WaitGroup
 	)
 
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -69,14 +67,12 @@ func fakeESLServer(t *testing.T, handler func(net.Conn)) (string, func()) {
 			mu.Lock()
 			conns = append(conns, conn)
 			mu.Unlock()
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+			wg.Go(func() {
 				defer func() { _ = conn.Close() }()
 				handler(conn)
-			}()
+			})
 		}
-	}()
+	})
 
 	stop := func() {
 		_ = ln.Close()
@@ -158,9 +154,7 @@ func healthyHandler(t *testing.T, events <-chan string) func(net.Conn) {
 		done := make(chan struct{})
 
 		var wg sync.WaitGroup
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			defer close(done)
 			for {
 				cmd, err := readUntilDoubleNL(c, 4096)
@@ -186,14 +180,12 @@ func healthyHandler(t *testing.T, events <-chan string) func(net.Conn) {
 				}
 				writeMu.Unlock()
 			}
-		}()
+		})
 
 		// Optional events feeder. Exits on either events-chan close or
 		// conn close (signalled via done). A nil events chan never
 		// emits, so the feeder simply waits on done.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			for {
 				select {
 				case <-done:
@@ -210,7 +202,7 @@ func healthyHandler(t *testing.T, events <-chan string) func(net.Conn) {
 					writeMu.Unlock()
 				}
 			}
-		}()
+		})
 
 		wg.Wait()
 	}
@@ -688,7 +680,7 @@ func TestPool_Events_DropsWhenChannelFull(t *testing.T) {
 
 	// Push 4 events without draining. EventBuffer=1 means at least 3
 	// must be dropped.
-	for i := 0; i < 4; i++ {
+	for i := range 4 {
 		events <- fmt.Sprintf(
 			"Event-Name: CHANNEL_CREATE\nUnique-ID: %08d-0000-0000-0000-000000000000\n\n",
 			i,
@@ -772,9 +764,9 @@ func TestPool_HealthProbeRejectsUnexpectedReply(t *testing.T) {
 func sortedAddrs(in ...string) []string {
 	out := make([]string, len(in))
 	copy(out, in)
-	// strings.Sort is fine here — len is bounded by Config.Nodes (3 in
+	// Bubble-sort is fine here — len is bounded by Config.Nodes (3 in
 	// tests), so importing the heavyweight slices.Sort isn't worth it.
-	for i := 0; i < len(out); i++ {
+	for i := range len(out) {
 		for j := i + 1; j < len(out); j++ {
 			if out[j] < out[i] {
 				out[i], out[j] = out[j], out[i]
