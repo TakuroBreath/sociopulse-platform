@@ -51,4 +51,17 @@ var (
 	// frame, etc.). Reserved for cases the protocol guarantees will not
 	// occur on a healthy server.
 	ErrInvalidFrame = errors.New("esl: invalid frame")
+
+	// ErrInvalidArgument is returned by high-level command methods (e.g.
+	// Originate, Hangup, MixMonitorStart, MixMonitorStop, Play) when the
+	// caller supplies an empty or otherwise invalid argument that fails
+	// pre-flight validation BEFORE any wire I/O. Wrap with %w to attach
+	// context:
+	//
+	//   return fmt.Errorf("%w: call_url required", ErrInvalidArgument)
+	//
+	// Task 4's NATS adapter compares via errors.Is(err, ErrInvalidArgument)
+	// to map these to a 4xx-equivalent NATS reply (operator misuse) rather
+	// than the 5xx bucket reserved for FS-side or transport failures.
+	ErrInvalidArgument = errors.New("esl: invalid argument")
 )

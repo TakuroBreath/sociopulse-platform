@@ -742,13 +742,30 @@ func TestCommandVerb(t *testing.T) {
 	cases := []struct {
 		in, want string
 	}{
-		{"bgapi originate {…}", "bgapi"},
-		{"api status", "api"},
-		{"event plain ALL", "event"},
+		// bgapi-prefixed commands must surface their inner verb so the
+		// {command} metric label differentiates originate vs uuid_kill
+		// vs uuid_record vs uuid_broadcast (operability — see IMPORTANT-1
+		// of the Plan 09 Task 3 review).
+		{"bgapi originate {…}", "originate"},
+		{"bgapi uuid_kill abc NORMAL_CLEARING", "uuid_kill"},
+		{"bgapi uuid_record abc start /path stereo", "uuid_record"},
+		{"bgapi uuid_broadcast abc /path aleg", "uuid_broadcast"},
+		// api-prefixed commands behave the same way.
+		{"api sofia status", "sofia"},
+		{"api reloadxml", "reloadxml"},
+		{"api xml_flush_cache foo.com", "xml_flush_cache"},
+		// Non bgapi/api dispatcher → first token unchanged.
+		{"event plain CHANNEL_CREATE", "event"},
 		{"singletoken", "singletoken"},
 		{"  spaced", "spaced"},
-		{"", "unknown"},
-		{"\t", "unknown"},
+		// Edge: bgapi or api alone (no inner verb) keeps the prefix so
+		// the unwrap only fires when a second word actually exists.
+		{"bgapi", "bgapi"},
+		{"api", "api"},
+		// Empty / whitespace-only input → empty string (sendCommand
+		// short-circuits before commandVerb on empty lines).
+		{"", ""},
+		{"\t", ""},
 	}
 	for _, tc := range cases {
 		require.Equal(t, tc.want, commandVerb(tc.in), "input=%q", tc.in)

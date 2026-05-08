@@ -121,6 +121,32 @@ func TestClient_Originate_ParsesUUIDFromOK(t *testing.T) {
 	require.Equal(t, "11111111-2222-3333-4444-555555555555", got)
 }
 
+// TestClient_Originate_ParsesUUIDFromReplyText covers the wire shape
+// real `bgapi` returns: a Content-Type: command/reply frame with the
+// +OK <uuid> in Reply-Text and an empty body. The ParsesUUIDFromOK
+// test above mocks api/response (body-bearing) instead, which means a
+// silent regression in replyPayload could break Reply-Text Originate
+// parsing without a single test failing. This case keeps that happy
+// path covered.
+func TestClient_Originate_ParsesUUIDFromReplyText(t *testing.T) {
+	t.Parallel()
+	rec := newCommandRecorder()
+	addr, stop := fakeESLServer(t, rec.handler(
+		commandReply("+OK 11111111-2222-3333-4444-555555555555"),
+	))
+	defer stop()
+
+	cli, closeCli := dialClient(t, addr)
+	defer closeCli()
+
+	got, err := cli.Originate(context.Background(), OriginateRequest{
+		CallURL:   "sofia/gateway/main/+79991234567",
+		Extension: "&park()",
+	})
+	require.NoError(t, err)
+	require.Equal(t, "11111111-2222-3333-4444-555555555555", got)
+}
+
 func TestClient_Originate_BuildsCommand(t *testing.T) {
 	t.Parallel()
 	rec := newCommandRecorder()
@@ -202,6 +228,7 @@ func TestClient_Originate_RejectsEmptyCallURL(t *testing.T) {
 
 	_, err := cli.Originate(context.Background(), OriginateRequest{})
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidArgument)
 	require.Contains(t, err.Error(), "call_url required")
 
 	// Confirm no command bytes hit the wire — only the auth-handshake
@@ -288,6 +315,7 @@ func TestClient_Hangup_RejectsEmptyUUID(t *testing.T) {
 
 	err := cli.Hangup(context.Background(), "", "NORMAL_CLEARING")
 	require.Error(t, err)
+	require.ErrorIs(t, err, ErrInvalidArgument)
 	require.Contains(t, err.Error(), "uuid required")
 	require.NotContains(t, rec.Got(), "bgapi uuid_kill")
 }
@@ -350,8 +378,12 @@ func TestClient_MixMonitorStart_RejectsEmptyArgs(t *testing.T) {
 	cli, closeCli := dialClient(t, addr)
 	defer closeCli()
 
-	require.Error(t, cli.MixMonitorStart(context.Background(), "", "/p", nil))
-	require.Error(t, cli.MixMonitorStart(context.Background(), "uuid-1", "", nil))
+	require.ErrorIs(t,
+		cli.MixMonitorStart(context.Background(), "", "/p", nil),
+		ErrInvalidArgument)
+	require.ErrorIs(t,
+		cli.MixMonitorStart(context.Background(), "uuid-1", "", nil),
+		ErrInvalidArgument)
 	require.NotContains(t, rec.Got(), "uuid_record")
 }
 
@@ -379,8 +411,12 @@ func TestClient_MixMonitorStop_RejectsEmptyArgs(t *testing.T) {
 	cli, closeCli := dialClient(t, addr)
 	defer closeCli()
 
-	require.Error(t, cli.MixMonitorStop(context.Background(), "", "/p"))
-	require.Error(t, cli.MixMonitorStop(context.Background(), "uuid-1", ""))
+	require.ErrorIs(t,
+		cli.MixMonitorStop(context.Background(), "", "/p"),
+		ErrInvalidArgument)
+	require.ErrorIs(t,
+		cli.MixMonitorStop(context.Background(), "uuid-1", ""),
+		ErrInvalidArgument)
 	require.NotContains(t, rec.Got(), "uuid_record")
 }
 
@@ -409,8 +445,12 @@ func TestClient_Play_RejectsEmptyArgs(t *testing.T) {
 	cli, closeCli := dialClient(t, addr)
 	defer closeCli()
 
-	require.Error(t, cli.Play(context.Background(), "", "p"))
-	require.Error(t, cli.Play(context.Background(), "uuid-1", ""))
+	require.ErrorIs(t,
+		cli.Play(context.Background(), "", "p"),
+		ErrInvalidArgument)
+	require.ErrorIs(t,
+		cli.Play(context.Background(), "uuid-1", ""),
+		ErrInvalidArgument)
 	require.NotContains(t, rec.Got(), "uuid_broadcast")
 }
 

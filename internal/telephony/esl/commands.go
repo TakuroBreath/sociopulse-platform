@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -80,7 +81,7 @@ type OriginateRequest struct {
 // References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Dialplan/originate_3375460/
 func (c *Client) Originate(ctx context.Context, req OriginateRequest) (string, error) {
 	if req.CallURL == "" {
-		return "", fmt.Errorf("call_url required")
+		return "", fmt.Errorf("%w: call_url required", ErrInvalidArgument)
 	}
 	if req.Extension == "" {
 		req.Extension = "&park()"
@@ -111,7 +112,7 @@ func (c *Client) Originate(ctx context.Context, req OriginateRequest) (string, e
 // References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Dialplan/uuid_kill_3375468/
 func (c *Client) Hangup(ctx context.Context, uuid, cause string) error {
 	if uuid == "" {
-		return fmt.Errorf("uuid required")
+		return fmt.Errorf("%w: uuid required", ErrInvalidArgument)
 	}
 	if cause == "" {
 		cause = "NORMAL_CLEARING"
@@ -126,7 +127,7 @@ func (c *Client) Hangup(ctx context.Context, uuid, cause string) error {
 // References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Dialplan/uuid_record_3375473/
 func (c *Client) MixMonitorStart(ctx context.Context, uuid, path string, flags []string) error {
 	if uuid == "" || path == "" {
-		return fmt.Errorf("uuid and path required")
+		return fmt.Errorf("%w: uuid and path required", ErrInvalidArgument)
 	}
 	cmd := fmt.Sprintf("bgapi uuid_record %s start %s", uuid, path)
 	if len(flags) > 0 {
@@ -141,7 +142,7 @@ func (c *Client) MixMonitorStart(ctx context.Context, uuid, path string, flags [
 // References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Dialplan/uuid_record_3375473/
 func (c *Client) MixMonitorStop(ctx context.Context, uuid, path string) error {
 	if uuid == "" || path == "" {
-		return fmt.Errorf("uuid and path required")
+		return fmt.Errorf("%w: uuid and path required", ErrInvalidArgument)
 	}
 	return c.sendOKCommand(ctx, fmt.Sprintf("bgapi uuid_record %s stop %s", uuid, path))
 }
@@ -154,7 +155,7 @@ func (c *Client) MixMonitorStop(ctx context.Context, uuid, path string) error {
 // References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Dialplan/uuid_broadcast_3375458/
 func (c *Client) Play(ctx context.Context, uuid, path string) error {
 	if uuid == "" || path == "" {
-		return fmt.Errorf("uuid and path required")
+		return fmt.Errorf("%w: uuid and path required", ErrInvalidArgument)
 	}
 	return c.sendOKCommand(ctx, fmt.Sprintf("bgapi uuid_broadcast %s %s aleg", uuid, path))
 }
@@ -284,7 +285,7 @@ func buildVariables(req OriginateRequest) string {
 		vars["origination_caller_id_name"] = req.CallerName
 	}
 	if req.Timeout > 0 {
-		vars["originate_timeout"] = fmt.Sprintf("%d", int(req.Timeout.Round(time.Second).Seconds()))
+		vars["originate_timeout"] = strconv.Itoa(int(req.Timeout.Round(time.Second).Seconds()))
 	}
 	if len(vars) == 0 {
 		return ""

@@ -450,17 +450,52 @@ func (c *Client) recordCommand(verb, result string, dur time.Duration) {
 	c.cfg.Metrics.CommandDuration.WithLabelValues(c.cfg.NodeLabel, verb).Observe(dur.Seconds())
 }
 
-// commandVerb extracts the first whitespace-delimited token from line —
-// e.g. "bgapi originate {…}…" → "bgapi". Used as the {command} label on
-// metrics so cardinality stays bounded (the originate URL would be a
-// per-call unique value otherwise).
+// commandVerb extracts the metric-label token from line. Used as the
+// {command} label on Metrics.CommandsTotal so cardinality stays bounded
+// (the originate URL would otherwise be a per-call unique value).
+//
+// FreeSWITCH high-level commands wrap an inner verb behind a `bgapi` or
+// `api` dispatcher prefix — e.g. `bgapi originate {…}` and
+// `api sofia status`. Returning just the dispatcher would collapse 5+
+// distinct commands (originate, uuid_kill, uuid_record, uuid_broadcast,
+// sofia, reloadxml, xml_flush_cache) into a single "bgapi"/"api" bucket
+// and operators couldn't differentiate originate-vs-uuid_kill failures.
+//
+// Behaviour:
+//   - "bgapi originate {…}"      → "originate"
+//   - "api sofia status"         → "sofia"
+//   - "event plain CHANNEL_…"    → "event" (no bgapi/api prefix)
+//   - "bgapi" (no second word)   → "bgapi" (collapse only fires when an
+//     inner verb actually exists — defends against accidental empty
+//     unwrap on malformed input)
+//   - ""                         → "" (caller decides how to label;
+//     sendCommand never reaches commandVerb on empty lines because it
+//     short-circuits earlier)
 func commandVerb(line string) string {
 	line = strings.TrimSpace(line)
-	if idx := strings.IndexAny(line, " \t"); idx > 0 {
-		return line[:idx]
-	}
 	if line == "" {
-		return "unknown"
+		return ""
 	}
-	return line
+	first, rest := splitFirstToken(line)
+	if first != "bgapi" && first != "api" {
+		return first
+	}
+	inner, _ := splitFirstToken(rest)
+	if inner == "" {
+		return first
+	}
+	return inner
+}
+
+// splitFirstToken returns (firstToken, remainder). remainder has the
+// leading whitespace trimmed; both are empty when s is empty.
+func splitFirstToken(s string) (string, string) {
+	s = strings.TrimLeft(s, " \t")
+	if s == "" {
+		return "", ""
+	}
+	if idx := strings.IndexAny(s, " \t"); idx > 0 {
+		return s[:idx], strings.TrimLeft(s[idx:], " \t")
+	}
+	return s, ""
 }
