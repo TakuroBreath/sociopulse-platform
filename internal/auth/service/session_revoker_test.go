@@ -84,6 +84,34 @@ func TestSessionRevoker_RevokeAllForUser_RespectsCutoff(t *testing.T) {
 	assert.True(t, got, "token issued before cutoff should be revoked")
 }
 
+// 2b. Boundary: a token whose IssuedAt equals the cutoff to the second
+// MUST be revoked. The contract is "issued at or before the cutoff is
+// out" — a token issued in the same nanosecond as the revocation is on
+// the wrong side of the safety line.
+func TestSessionRevoker_RevokeAllForUser_TokenAtCutoffBoundaryIsRevoked(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+	r, _, clk := newRevokerT(t)
+
+	uid := uuid.MustParse("33333333-3333-3333-3333-333333333333")
+
+	// Pin the clock so RevokeAllForUser writes a known cutoff. The
+	// claims under test use the EXACT same Now() value as IssuedAt.
+	cutoff := clk.Now()
+	require.NoError(t, r.RevokeAllForUser(ctx, uid))
+
+	claims := authapi.Claims{
+		UserID:    uid,
+		SessionID: "sid-boundary",
+		IssuedAt:  cutoff, // same instant the cutoff was written
+	}
+
+	got, err := r.IsRevokedClaims(ctx, claims)
+	require.NoError(t, err)
+	assert.True(t, got, "token issued AT the cutoff must be revoked (iat <= cutoff)")
+}
+
 // 3. Tokens with iat after cutoff are not revoked.
 func TestSessionRevoker_RevokeAllForUser_DoesNotRevokeNewerTokens(t *testing.T) {
 	t.Parallel()

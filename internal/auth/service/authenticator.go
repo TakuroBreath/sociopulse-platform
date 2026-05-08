@@ -353,6 +353,13 @@ func (a *Authenticator) loginPreflight(ctx context.Context, in authapi.LoginInpu
 		return authapi.User{}, uuid.Nil, fmt.Errorf("auth/service: rate-limit account: %w", err)
 	}
 	if !allowed {
+		// Timing-safety: this branch fires AFTER user resolution so its
+		// pre-Verify wall-time is otherwise distinguishable from the
+		// not-found branch. Spend the same Argon2 cost on a dummy hash
+		// to keep response time uniform regardless of whether (org_id,
+		// login) resolves to a real user with a saturated bucket or to
+		// no user at all.
+		a.timingSafeDummyVerify(ctx, in.Password)
 		a.writeAuditAction(ctx, "auth.login.rate_limited", in)
 		a.metrics.LoginFailures.WithLabelValues(ReasonRateLimited).Inc()
 		return authapi.User{}, uuid.Nil, authapi.ErrRateLimitExceeded
@@ -674,13 +681,23 @@ func (a *Authenticator) issueFullPair(ctx context.Context, user authapi.User, to
 }
 
 // issueFullPairWithSession mints (access, refresh) using the supplied
-// session id (or a fresh one when empty). The refresh JTI is captured
-// from the issued claims and saved to the whitelist so a subsequent
-// Refresh call can rotate cleanly.
+// session id (or a fresh one when empty). Each token gets its OWN JTI
+// so RFC 7519 §4.1.7 ("MUST be assigned in a manner that ensures
+// uniqueness") holds — without distinct JTIs an access token and its
+// matching refresh token would collide in any store keyed by jti.
+//
+// The refresh JTI is the key under which RefreshStore.Save records the
+// whitelist entry; it is generated up front and reused, eliminating
+// the need to Validate the freshly-issued refresh token just to read
+// back what we already know.
 func (a *Authenticator) issueFullPairWithSession(ctx context.Context, user authapi.User, sid string, totpDone bool) (authapi.AuthResult, error) {
-	jti, err := randomJTI()
+	accessJTI, err := randomJTI()
 	if err != nil {
-		return authapi.AuthResult{}, fmt.Errorf("auth/service: mint jti: %w", err)
+		return authapi.AuthResult{}, fmt.Errorf("auth/service: mint access jti: %w", err)
+	}
+	refreshJTI, err := randomJTI()
+	if err != nil {
+		return authapi.AuthResult{}, fmt.Errorf("auth/service: mint refresh jti: %w", err)
 	}
 
 	if sid == "" {
@@ -690,40 +707,36 @@ func (a *Authenticator) issueFullPairWithSession(ctx context.Context, user autha
 		}
 	}
 
-	claims := authapi.Claims{
+	base := authapi.Claims{
 		UserID:    user.ID,
 		TenantID:  user.TenantID,
 		Login:     user.Login,
 		Roles:     user.Roles,
 		SessionID: sid,
-		JTI:       jti,
 		TOTPDone:  totpDone,
 	}
 
-	access, accessExp, err := a.issuer.IssueAccess(claims)
+	accessClaims := base
+	accessClaims.JTI = accessJTI
+	access, accessExp, err := a.issuer.IssueAccess(accessClaims)
 	if err != nil {
 		return authapi.AuthResult{}, fmt.Errorf("auth/service: issue access: %w", err)
 	}
-	refresh, refreshExp, err := a.issuer.IssueRefresh(claims)
+
+	refreshClaims := base
+	refreshClaims.JTI = refreshJTI
+	refresh, refreshExp, err := a.issuer.IssueRefresh(refreshClaims)
 	if err != nil {
 		return authapi.AuthResult{}, fmt.Errorf("auth/service: issue refresh: %w", err)
-	}
-
-	// Capture the actual JTI the issuer assigned to the refresh token —
-	// the issuer regenerates JTI per token, so the refresh-jti differs
-	// from the access-jti we minted above. Validate locally to read it.
-	refreshClaims, err := a.issuer.Validate(refresh, "refresh")
-	if err != nil {
-		return authapi.AuthResult{}, fmt.Errorf("auth/service: parse fresh refresh: %w", err)
 	}
 
 	rec := authstore.RefreshRecord{
 		UserID:    user.ID,
 		TenantID:  user.TenantID,
-		SessionID: refreshClaims.SessionID,
+		SessionID: sid,
 		ExpiresAt: refreshExp,
 	}
-	if err := a.refreshes.Save(ctx, refreshClaims.JTI, rec); err != nil {
+	if err := a.refreshes.Save(ctx, refreshJTI, rec); err != nil {
 		return authapi.AuthResult{}, fmt.Errorf("auth/service: save refresh: %w", err)
 	}
 
