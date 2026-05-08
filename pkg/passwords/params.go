@@ -65,6 +65,37 @@ func DefaultParams() Params {
 	}
 }
 
+// BackupCodeParams returns Argon2id parameters tuned for hashing
+// short single-use tokens (e.g. TOTP backup codes), NOT user passwords.
+//
+//	Memory      = 1 * 1024 KiB   (1 MiB)
+//	Iterations  = 1
+//	Parallelism = 1
+//	SaltLength  = 16 bytes
+//	KeyLength   = 32 bytes
+//
+// Backup codes in our system are 10 hex characters = 40 bits of entropy.
+// Even cheap Argon2id raises the per-trial cost enough that an offline
+// brute-force of all 2^40 candidates against an exfiltrated hash takes
+// weeks on commodity GPUs — we don't need full password-strength
+// memory-hardness here, and ten of these are hashed up front during
+// TOTP enroll. Using DefaultParams (19 MiB) would burn ~190 MiB and
+// 200 ms per Enroll request; this profile keeps Enroll well under
+// 50 ms while still meeting the offline-attack bar.
+//
+// If a future feature uses these params for anything that resembles a
+// real password (something the user types repeatedly, or with a
+// guessable structure), revisit — those need DefaultParams or stronger.
+func BackupCodeParams() Params {
+	return Params{
+		Memory:      1 * 1024,
+		Iterations:  1,
+		Parallelism: 1,
+		SaltLength:  16,
+		KeyLength:   32,
+	}
+}
+
 // Validate returns nil if all fields are within sane bounds, otherwise an
 // error wrapping ErrInvalidParams with a low-cardinality reason string.
 //

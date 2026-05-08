@@ -187,6 +187,23 @@ func TestDefaultParams_Values(t *testing.T) {
 	assert.Equal(t, uint32(32), p.KeyLength)
 }
 
+func TestBackupCodeParams_Values(t *testing.T) {
+	t.Parallel()
+
+	// Backup codes are 10-hex-char single-use tokens (40 bits entropy);
+	// these params keep the per-hash cost low so Enroll (10 hashes
+	// up front) stays under 50 ms while still raising the offline-
+	// attack bar above commodity-GPU reach. See
+	// pkg/passwords/params.go BackupCodeParams docs for derivation.
+	p := passwords.BackupCodeParams()
+	assert.Equal(t, uint32(1*1024), p.Memory)
+	assert.Equal(t, uint32(1), p.Iterations)
+	assert.Equal(t, uint8(1), p.Parallelism)
+	assert.Equal(t, uint32(16), p.SaltLength)
+	assert.Equal(t, uint32(32), p.KeyLength)
+	require.NoError(t, p.Validate(), "BackupCodeParams must satisfy Params.Validate")
+}
+
 // TestVerify_TimingDeltaSmall asserts that Verify's wall-clock time for a
 // matching vs mismatching password differs by less than 10% of the median.
 //

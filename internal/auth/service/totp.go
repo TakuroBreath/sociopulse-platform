@@ -103,11 +103,15 @@ type TOTPDeps struct {
 	Users UserTOTPUpdater
 	// KMS encrypts the TOTP secret at rest with the per-tenant DEK.
 	KMS tenancyapi.KMSResolver
-	// BackupHasher is the Argon2id hasher used for backup codes. The
-	// service expects this to be configured with cheap params (single-
-	// use tokens, not password equivalents) — the composition root
-	// constructs a dedicated low-cost passwords.Hasher for this slot
-	// rather than reusing the user-password hasher.
+	// BackupHasher is the Argon2id hasher used for backup codes —
+	// distinct from the user-password hasher because backup codes are
+	// 10-hex-char single-use tokens, not password equivalents, and a
+	// deployment that uses DefaultParams here would burn ~190 MiB
+	// and ~200 ms per Enroll (one Hash call per backup code, ten codes
+	// up front). The composition root MUST plumb a hasher constructed
+	// from passwords.BackupCodeParams() — the canonical production
+	// profile (m=1 MiB, t=1, p=1) — into this slot. The constants are
+	// documented inline at pkg/passwords/params.go BackupCodeParams.
 	BackupHasher passwords.Hasher
 	// Audit emits "auth.totp.*" rows. May be a no-op fake in tests but
 	// MUST NOT be nil — see NewTOTPService.
