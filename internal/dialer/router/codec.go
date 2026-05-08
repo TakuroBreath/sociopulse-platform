@@ -132,11 +132,9 @@ func translateChannelEvent(evt telephonyapi.ChannelEvent) (dialerapi.ChannelEven
 		// safe in practice. We clamp negatives to 0 because the dialer
 		// treats Duration as a non-negative ms count and a future
 		// upstream bug must not surface as a stale negative number.
-		dur := evt.DurationMS
-		if dur < 0 {
-			dur = 0
-		}
-		out.Duration = int(dur)
+		// max(_, 0) clamps a stale negative value rather than letting
+		// it surface as a -1 ms duration to the FSM/audit/billing.
+		out.Duration = int(max(evt.DurationMS, 0))
 	}
 	return out, true, true
 }
