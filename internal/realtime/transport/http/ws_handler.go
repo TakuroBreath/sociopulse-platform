@@ -20,6 +20,12 @@ import (
 // before the entry would lapse, surviving a transient Redis hiccup.
 const defaultTouchPeriod = 10 * time.Second
 
+// wireSubprotocol is the WebSocket subprotocol token negotiated at
+// upgrade time. Pinned in code so future protocol revisions surface
+// as a compile-time constant change (and can be tracked in a single
+// grep). Tests use the same constant via the testHTTPDial helpers.
+const wireSubprotocol = "sociopulse-v1"
+
 // wsHandlerConfig groups the collaborators a *wsHandler needs.
 //
 // The handler is intentionally agnostic of how its collaborators were
@@ -135,7 +141,7 @@ func newWSHandler(cfg wsHandlerConfig) *wsHandler {
 //     OnDisconnect on the 1->0 transition, return.
 func (h *wsHandler) handle(c *gin.Context) {
 	wsConn, err := websocket.Accept(c.Writer, c.Request, &websocket.AcceptOptions{
-		Subprotocols:       []string{"sociopulse-v1"},
+		Subprotocols:       []string{wireSubprotocol},
 		OriginPatterns:     h.cfg.origins,
 		InsecureSkipVerify: hasWildcardOrigin(h.cfg.origins),
 	})
@@ -243,7 +249,15 @@ func (h *wsHandler) handleSubscribeFrame(c *service.Connection, frame rtapi.Fram
 	case rtapi.FrameUnsubscribe:
 		c.Unsubscribe(frame.SubID)
 	default:
-		// No-op: only Subscribe / Unsubscribe reach the callback today.
+		// Defensive: only Subscribe / Unsubscribe reach the callback
+		// today (Connection.dispatchFrame is the gate). A future
+		// reader-side regression that forwards a different kind here
+		// would otherwise silently disappear; debug-log it so the
+		// regression is visible in development tail logs.
+		h.cfg.logger.Debug("realtime/ws: unexpected frame on hub callback",
+			zap.String("conn_id", c.ID()),
+			zap.String("kind", string(frame.Type)),
+		)
 	}
 }
 

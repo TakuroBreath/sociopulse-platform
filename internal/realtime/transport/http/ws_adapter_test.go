@@ -141,10 +141,15 @@ func TestCoderWSAdapter_CloseClient(t *testing.T) {
 	adapter := newCoderWSAdapter(conn, "x")
 	require.NoError(t, adapter.Close(rtapi.CloseGoingAway, "bye"))
 
+	// context.WithTimeout instead of time.After (carry-forward rule 5
+	// keeps select-loops free of time.After; a one-shot is OK but
+	// ctx-derived timeouts are the project house style).
+	waitCtx, waitCancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer waitCancel()
 	select {
 	case got := <-serverDone:
 		assert.Equal(t, websocket.StatusGoingAway, got)
-	case <-time.After(2 * time.Second):
+	case <-waitCtx.Done():
 		t.Fatal("server did not observe close in time")
 	}
 }

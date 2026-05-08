@@ -185,7 +185,7 @@ func newWSHandlerFixture(t *testing.T, roles []string) *wsHandlerFixture {
 func dialAndAuth(t *testing.T, ctx context.Context, fx *wsHandlerFixture, token string) *websocket.Conn {
 	t.Helper()
 	conn, resp, err := websocket.Dial(ctx, fx.wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"sociopulse-v1"},
+		Subprotocols: []string{wireSubprotocol},
 	})
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
@@ -399,7 +399,7 @@ func TestWSHandler_BadToken_Closes4401(t *testing.T) {
 	defer cancel()
 
 	conn, resp, err := websocket.Dial(ctx, fx.wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"sociopulse-v1"},
+		Subprotocols: []string{wireSubprotocol},
 	})
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
@@ -529,7 +529,7 @@ func TestWSHandler_NoAuthFrame_TimesOut(t *testing.T) {
 	defer cancel()
 
 	conn, resp, err := websocket.Dial(ctx, fx.wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"sociopulse-v1"},
+		Subprotocols: []string{wireSubprotocol},
 	})
 	require.NoError(t, err)
 	if resp != nil && resp.Body != nil {
@@ -589,7 +589,7 @@ func TestWSHandler_NoOriginAccept_Forbidden(t *testing.T) {
 	// header entirely and the same-origin check passes.
 	hdr.Set("Origin", "http://attacker.example.org")
 	_, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
-		Subprotocols: []string{"sociopulse-v1"},
+		Subprotocols: []string{wireSubprotocol},
 		HTTPHeader:   hdr,
 	})
 	require.Error(t, err)
@@ -650,11 +650,13 @@ func TestWSHandler_RefcountKeepsPresenceWhileSiblingActive(t *testing.T) {
 	}, 2*time.Second, 10*time.Millisecond)
 
 	// Close A. With a refcount, OnDisconnect should NOT fire while B
-	// remains active.
+	// remains active. require.Never gives us a deterministic negative
+	// assertion: the predicate is polled and only the absence of a
+	// fire-up over the window is sufficient.
 	require.NoError(t, connA.Close(websocket.StatusNormalClosure, "a done"))
-	// Allow the conn to fully unwind.
-	time.Sleep(150 * time.Millisecond)
-	assert.EqualValues(t, 0, fx.presence.disconnectCount.Load(),
+	require.Never(t, func() bool {
+		return fx.presence.disconnectCount.Load() != 0
+	}, 150*time.Millisecond, 20*time.Millisecond,
 		"OnDisconnect must not fire while sibling conn is active")
 
 	// Close B. NOW OnDisconnect should fire exactly once.
