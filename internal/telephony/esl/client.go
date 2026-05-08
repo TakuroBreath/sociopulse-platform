@@ -388,8 +388,6 @@ func (c *Client) dispatch(frame Frame) {
 // after-the-fact before releasing the lock. Without that drain the
 // next caller would block on its own select and pick up the prior
 // caller's late reply (CRITICAL-1 in the Plan 09 review).
-//
-//nolint:unused // wired by Task 3 (high-level commands: Originate, Hangup, MixMonitor, Play, SofiaStatus).
 func (c *Client) sendCommand(ctx context.Context, line string) (Frame, error) {
 	if !c.Connected() {
 		return Frame{}, ErrNotConnected
