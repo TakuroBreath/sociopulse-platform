@@ -41,4 +41,15 @@ var (
 	// ErrInvalidArgument is returned when the caller passed a structurally
 	// invalid input (zero UUIDs, empty names, negative target counts, ...).
 	ErrInvalidArgument = errors.New("surveys: invalid argument")
+	// ErrNoMatchingEdge is returned by Runtime.NextNode when none of the
+	// current node's outgoing edges match (no unconditional edge present
+	// and every conditional edge's `when` evaluated to a non-truthy
+	// result). This is a runtime-level signal that the current schema +
+	// answer set put the survey into an unrecoverable state — typically
+	// a fixture / authoring bug rather than a respondent action.
+	ErrNoMatchingEdge = errors.New("surveys: no matching edge")
+	// ErrNodeNotFound is returned by the runtime when a referenced node
+	// id does not exist in the supplied schema (NextNode/ValidateAnswer/
+	// CalculateProgress all surface this for unknown ids).
+	ErrNodeNotFound = errors.New("surveys: node not found")
 )
