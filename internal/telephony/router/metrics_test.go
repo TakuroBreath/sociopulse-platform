@@ -33,6 +33,7 @@ func TestRegisterMetrics_RegistersCollectorsOnFreshRegistry(t *testing.T) {
 	require.NotNil(t, m.SelectsTotal)
 	require.NotNil(t, m.SelectDuration)
 	require.NotNil(t, m.BackpressureRejects)
+	require.NotNil(t, m.Drift)
 
 	// Twice must panic (duplicate registration) — protects boot from a
 	// double-wired composition root.

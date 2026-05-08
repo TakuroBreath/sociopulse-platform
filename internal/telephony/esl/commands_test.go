@@ -504,6 +504,61 @@ func TestClient_SofiaStatus_PropagatesSendCommandError(t *testing.T) {
 	require.ErrorIs(t, err, ErrTimeout)
 }
 
+// --- ChannelsCount ------------------------------------------------------------
+
+// TestClient_ChannelsCount_ParsesNTotal asserts the canonical FS body shape
+// "5 total." is decoded as the integer 5. Plan 09 Task 6's reconciler relies
+// on this parser; a regression here directly causes drift to be silently
+// mis-attributed.
+func TestClient_ChannelsCount_ParsesNTotal(t *testing.T) {
+	t.Parallel()
+	rec := newCommandRecorder()
+	addr, stop := fakeESLServer(t, rec.handler(apiResponse("5 total.\n")))
+	defer stop()
+
+	cli, closeCli := dialClient(t, addr)
+	defer closeCli()
+
+	got, err := cli.ChannelsCount(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, 5, got)
+	require.Contains(t, rec.Got(), "api show channels count")
+}
+
+// TestClient_ChannelsCount_EmptyBody covers the "FS prints just \"\\n\" on
+// empty fleet" build quirk — the helper must return (0, nil) rather than
+// erroring on what is actually a healthy idle node.
+func TestClient_ChannelsCount_EmptyBody(t *testing.T) {
+	t.Parallel()
+	rec := newCommandRecorder()
+	addr, stop := fakeESLServer(t, rec.handler(apiResponse("\n")))
+	defer stop()
+
+	cli, closeCli := dialClient(t, addr)
+	defer closeCli()
+
+	got, err := cli.ChannelsCount(context.Background())
+	require.NoError(t, err)
+	require.Zero(t, got)
+}
+
+// TestClient_ChannelsCount_NonNumericBody surfaces a malformed FS reply as
+// a wrapped ErrCommandFailed — the reconciler skips that node for the
+// current sweep instead of writing a bogus "0" into Redis.
+func TestClient_ChannelsCount_NonNumericBody(t *testing.T) {
+	t.Parallel()
+	rec := newCommandRecorder()
+	addr, stop := fakeESLServer(t, rec.handler(apiResponse("garbage in body\n")))
+	defer stop()
+
+	cli, closeCli := dialClient(t, addr)
+	defer closeCli()
+
+	_, err := cli.ChannelsCount(context.Background())
+	require.ErrorIs(t, err, ErrCommandFailed)
+	require.Contains(t, err.Error(), "garbage")
+}
+
 // --- SubscribeEvents ----------------------------------------------------------
 
 func TestClient_SubscribeEvents_BuildsCommand(t *testing.T) {
@@ -724,6 +779,9 @@ func TestClient_Commands_ReturnNotConnectedAfterClose(t *testing.T) {
 	require.ErrorIs(t, cli.Play(context.Background(), "uuid", "p"), ErrNotConnected)
 
 	_, err = cli.SofiaStatus(context.Background())
+	require.ErrorIs(t, err, ErrNotConnected)
+
+	_, err = cli.ChannelsCount(context.Background())
 	require.ErrorIs(t, err, ErrNotConnected)
 
 	require.ErrorIs(t, cli.SubscribeEvents(context.Background(), []string{"X"}), ErrNotConnected)

@@ -30,6 +30,15 @@ type Metrics struct {
 	// (i.e. the cap was hit). Partitioned by node so on-call can see which
 	// FS node is the bottleneck.
 	BackpressureRejects *prometheus.CounterVec
+
+	// Drift is the absolute difference between the Redis op:active_channels
+	// counter and the FS-truth value reported by `api show channels count`,
+	// per node. Set on every Reconciler sweep — including when the diff is
+	// zero — so operators can graph drift-over-time and alert on
+	// max(drift) > N for 5m. A non-zero value means the reconciler is
+	// actively correcting; a persistently-non-zero value means the
+	// underlying INCR/DECR path has a bug that the reconciler is masking.
+	Drift *prometheus.GaugeVec
 }
 
 // RegisterMetrics builds a fresh *Metrics and registers every collector on
@@ -63,11 +72,19 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 			},
 			[]string{"node"},
 		),
+		Drift: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "telephony_router_active_channels_drift",
+				Help: "Absolute difference between Redis op:active_channels counter and FS truth, by node. Set on every Reconciler sweep (Plan 09 Task 6).",
+			},
+			[]string{"node"},
+		),
 	}
 	reg.MustRegister(
 		m.SelectsTotal,
 		m.SelectDuration,
 		m.BackpressureRejects,
+		m.Drift,
 	)
 	return m
 }

@@ -173,6 +173,36 @@ func (c *Client) SofiaStatus(ctx context.Context) (string, error) {
 	return string(frame.Body), nil
 }
 
+// ChannelsCount issues a synchronous `api show channels count` and parses
+// the integer prefix from the FS response body. Used by the reconciler
+// (router.Reconciler, Plan 09 Task 6) to fetch the ground-truth active-
+// channel count for drift correction against Redis.
+//
+// FS body format on a healthy build is "N total.\n" — we consume the first
+// whitespace-separated token and strconv.Atoi it. An empty body (some FS
+// builds emit just "\n" when no channels exist) returns 0 with no error so
+// callers do not need to special-case the idle node.
+//
+// References: https://developer.signalwire.com/freeswitch/FreeSWITCH-Explained/Modules/mod_commands_1966741/#show
+func (c *Client) ChannelsCount(ctx context.Context) (int, error) {
+	frame, err := c.sendCommand(ctx, "api show channels count")
+	if err != nil {
+		return 0, err
+	}
+	body := strings.TrimSpace(string(frame.Body))
+	if body == "" {
+		return 0, nil
+	}
+	// strings.Fields on a non-empty trimmed string always returns ≥1
+	// element, so we don't re-check len(fields) here.
+	first := strings.Fields(body)[0]
+	n, err := strconv.Atoi(first)
+	if err != nil {
+		return 0, fmt.Errorf("%w: parse channels count %q: %w", ErrCommandFailed, first, err)
+	}
+	return n, nil
+}
+
 // SubscribeEvents issues `event plain <e1> <e2> …`. An empty events
 // slice is a no-op (returns nil without writing to the wire). Validates
 // the FS Reply-Text starts with `+`; anything else maps to

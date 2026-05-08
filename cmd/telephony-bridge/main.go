@@ -283,6 +283,28 @@ func run(ctx context.Context, opts runOptions) error {
 	// no-op safety net.
 	defer bridge.Stop()
 
+	// Reconciler (Plan 09 Task 6). Periodic sweep that aligns the Redis
+	// op:active_channels counter to FS truth via `api show channels count`.
+	// NodesFunc closes over the live ESL pool — sweeps see the current
+	// healthy set on every tick, so a node coming back from a fault is
+	// included automatically. Drift gauge is exported via routerMetrics
+	// for the Plan 09-mandated alert (rule lives in the helm chart).
+	fsCounter, err := router.NewESLFSCounter(eslPool)
+	if err != nil {
+		return fmt.Errorf("init fs counter: %w", err)
+	}
+	reconciler, err := router.NewReconciler(router.ReconcilerConfig{
+		Backpressure: rt.Backpressure(),
+		FSCounter:    fsCounter,
+		NodesFunc:    eslPool.HealthyNodes,
+		Interval:     30 * time.Second,
+		Logger:       logger.Named("reconciler"),
+		DriftGauge:   routerMetrics.Drift,
+	})
+	if err != nil {
+		return fmt.Errorf("init reconciler: %w", err)
+	}
+
 	// 9. HTTP servers. Two gin engines so /metrics scrape traffic stays
 	//    isolated from /healthz public probes (matches cmd/api's split).
 	checks := []healthz.Checker{
@@ -308,6 +330,14 @@ func run(ctx context.Context, opts runOptions) error {
 		if err := listenAndServe(metricsSrv); err != nil {
 			return fmt.Errorf("metrics listen: %w", err)
 		}
+		return nil
+	})
+	// Reconciler runs in the same errgroup so a parent-ctx cancel
+	// (SIGTERM) tears it down cleanly without a separate cancel func.
+	// Run never returns an error — it loops on ctx.Done — so the
+	// closure returns nil unconditionally.
+	g.Go(func() error {
+		reconciler.Run(gctx)
 		return nil
 	})
 
