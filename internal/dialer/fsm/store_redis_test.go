@@ -132,6 +132,13 @@ func TestIntegration_FullRoundTrip(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// SubmitStatus: status → ready (clears call_id / respondent_id).
+	_, err = f.machine.SubmitStatus(ctx, api.SubmitStatusRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID, Status: "success",
+	})
+	require.NoError(t, err)
+
+	// GoVerify is entered from ready (operator-initiated listen-in).
 	_, err = f.machine.GoVerify(ctx, tenantID, operatorID)
 	require.NoError(t, err)
 

@@ -24,23 +24,26 @@ func TestTransitions_KnownEdges(t *testing.T) {
 		{api.StatePause, api.EventEndShift, api.StateOffline},
 		{api.StateStatus, api.EventEndShift, api.StateOffline},
 
-		// Pause / resume / go_ready alias
+		// Pause / resume. The spec recognizes only the {pause, resume}
+		// edge; Machine.GoReady fires EventResume internally so the
+		// supervisor-style entry point traverses this same edge.
 		{api.StateReady, api.EventGoPause, api.StatePause},
 		{api.StatePause, api.EventResume, api.StateReady},
-		{api.StatePause, api.EventGoReady, api.StateReady},
 
-		// Dial → answer → call → status
+		// Dial → answer → call → status. Dialing→status covers both the
+		// no-answer / hangup-before-answer (CallEnded) and tech-failure
+		// (CallFailed) paths — operator MUST submit a wrap-up disposition.
 		{api.StateReady, api.EventCallStarted, api.StateDialing},
 		{api.StateDialing, api.EventCallStarted, api.StateCall},
-		{api.StateDialing, api.EventCallEnded, api.StateReady},
-		{api.StateDialing, api.EventCallFailed, api.StateReady},
+		{api.StateDialing, api.EventCallEnded, api.StateStatus},
+		{api.StateDialing, api.EventCallFailed, api.StateStatus},
 		{api.StateCall, api.EventCallEnded, api.StateStatus},
 
 		// Status submission
 		{api.StateStatus, api.EventStatusSubmitted, api.StateReady},
 
-		// Verify
-		{api.StateStatus, api.EventGoVerify, api.StateVerify},
+		// Verify (supervisor-style listening to recordings, entered from ready)
+		{api.StateReady, api.EventGoVerify, api.StateVerify},
 		{api.StateVerify, api.EventVerifyDone, api.StateReady},
 	}
 	for _, tc := range cases {
@@ -84,7 +87,8 @@ func TestTransitions_RejectsInvalid(t *testing.T) {
 		{api.StateCall, api.EventStatusSubmitted},  // must end call first
 		{api.StateCall, api.EventGoPause},          // can't pause mid-call
 		{api.StateCall, api.EventGoVerify},         // can't verify mid-call
-		{api.StateReady, api.EventGoVerify},        // verify is reached via status
+		{api.StateStatus, api.EventGoVerify},       // verify is reached from ready, not status
+		{api.StatePause, api.EventGoReady},         // spec: only {pause, resume} edge — GoReady aliases via EventResume
 		{api.StateReady, api.EventVerifyDone},      // not in verify
 		{api.StateOffline, api.EventResume},        // can't resume when offline
 	}

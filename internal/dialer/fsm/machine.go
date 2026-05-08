@@ -358,10 +358,10 @@ func (m *Machine) EndShift(ctx context.Context, tenantID, operatorID uuid.UUID) 
 }
 
 // GoReady implements api.OperatorFSM. Equivalent to Resume — both fire
-// EventGoReady which is wired in transitions.go as an alias for
-// EventResume from pause.
+// EventResume so they traverse the spec's single pause→ready edge.
+// GoReady is the supervisor-style entry point; Resume is operator-facing.
 func (m *Machine) GoReady(ctx context.Context, tenantID, operatorID uuid.UUID) (api.Snapshot, error) {
-	return m.applyEvent(ctx, tenantID, operatorID, api.EventGoReady, func(s *Snapshot) {
+	return m.applyEvent(ctx, tenantID, operatorID, api.EventResume, func(s *Snapshot) {
 		s.PauseReason = nil
 	})
 }
@@ -429,20 +429,13 @@ func (m *Machine) RecordCallStarted(ctx context.Context, req api.CallStartedRequ
 	})
 }
 
-// RecordCallEnded implements api.OperatorFSM. From dialing the call ends
-// without a status (no-answer / busy / SIT — straight back to ready);
-// from call we go to status to capture the wrap-up disposition. The
-// transition table determines which.
+// RecordCallEnded implements api.OperatorFSM. Both dialing→status
+// (hangup before answer, no-answer) and call→status (normal hangup
+// after talk) route to the wrap-up state. The call_id and
+// respondent_id flow through unchanged so SubmitStatus has the
+// call_id to attach the status row to.
 func (m *Machine) RecordCallEnded(ctx context.Context, req api.CallEndedRequest) (api.Snapshot, error) {
-	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventCallEnded, func(s *Snapshot) {
-		// Only on dialing→ready do we clear the call_id (no status row
-		// will be written). On call→status we keep the call_id so the
-		// status submission can reference it.
-		if s.State == api.StateReady {
-			s.CurrentCallID = nil
-			s.RespondentID = nil
-		}
-	})
+	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventCallEnded, nil)
 }
 
 // SubmitStatus implements api.OperatorFSM. Clears the call_id /

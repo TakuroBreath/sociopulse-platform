@@ -461,41 +461,19 @@ func TestFullHappyPath(t *testing.T) {
 }
 
 // TestVerifyFlow covers the supervisor-style verify path:
-// status → verify → ready.
+// ready → verify → ready. Verify is operator-initiated listen-in
+// from the idle (ready) state, not from status wrap-up.
 func TestVerifyFlow(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	tenantID, operatorID, projectID := uuid.New(), uuid.New(), uuid.New()
-	respondentID, callID := uuid.New(), uuid.New()
 	ctx := context.Background()
 
-	// Drive to status state.
 	_, err := f.machine.StartShift(ctx, newReq(tenantID, operatorID, projectID))
 	require.NoError(t, err)
-	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
-		TenantID:     tenantID,
-		OperatorID:   operatorID,
-		CallID:       callID,
-		RespondentID: respondentID,
-	})
-	require.NoError(t, err)
-	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
-		TenantID:     tenantID,
-		OperatorID:   operatorID,
-		CallID:       callID,
-		RespondentID: respondentID,
-	})
-	require.NoError(t, err)
-	snap, err := f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
-		TenantID:   tenantID,
-		OperatorID: operatorID,
-		CallID:     callID,
-	})
-	require.NoError(t, err)
-	require.Equal(t, api.StateStatus, snap.State)
 
-	// status → verify
-	snap, err = f.machine.GoVerify(ctx, tenantID, operatorID)
+	// ready → verify
+	snap, err := f.machine.GoVerify(ctx, tenantID, operatorID)
 	require.NoError(t, err)
 	require.Equal(t, api.StateVerify, snap.State)
 
@@ -768,7 +746,8 @@ func TestAuditFailureDoesNotRollbackLiveState(t *testing.T) {
 	require.Equal(t, "pause", st)
 }
 
-// TestRecordCallEnded_FromDialing — dialing → ready clears the call_id.
+// TestRecordCallEnded_FromDialing — dialing → status preserves the call_id
+// so SubmitStatus has the call to attach the wrap-up disposition to.
 func TestRecordCallEnded_FromDialing(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -783,7 +762,7 @@ func TestRecordCallEnded_FromDialing(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	// CallEnded from dialing → ready (no-answer scenario).
+	// CallEnded from dialing → status (no-answer scenario routes through wrap-up).
 	snap, err := f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
 		TenantID:   tenantID,
 		OperatorID: operatorID,
@@ -791,9 +770,11 @@ func TestRecordCallEnded_FromDialing(t *testing.T) {
 		Cause:      "NO_ANSWER",
 	})
 	require.NoError(t, err)
-	require.Equal(t, api.StateReady, snap.State)
-	require.Nil(t, snap.CurrentCallID, "CallEnded from dialing must clear current_call_id")
-	require.Nil(t, snap.RespondentID, "CallEnded from dialing must clear respondent_id")
+	require.Equal(t, api.StateStatus, snap.State)
+	require.NotNil(t, snap.CurrentCallID, "CallEnded from dialing must preserve current_call_id for SubmitStatus")
+	require.Equal(t, callID, *snap.CurrentCallID)
+	require.NotNil(t, snap.RespondentID, "CallEnded from dialing must preserve respondent_id for SubmitStatus")
+	require.Equal(t, respondentID, *snap.RespondentID)
 }
 
 // TestSnapshotPersistsHeartbeatAt — every successful transition refreshes
@@ -1052,7 +1033,8 @@ func TestNilMetricsTolerated(t *testing.T) {
 	})
 	require.NoError(t, err)
 	// Trigger an invalid transition to exercise the nil-metrics path.
-	_, err = mach.GoVerify(ctx, tenantID, operatorID)
+	// VerifyDone from ready (operator never entered verify) is invalid.
+	_, err = mach.VerifyDone(ctx, tenantID, operatorID)
 	require.ErrorIs(t, err, api.ErrInvalidTransition)
 	// Force, also nil-metrics path.
 	_, err = mach.Force(ctx, tenantID, operatorID, api.StateOffline, "test")
@@ -1070,8 +1052,9 @@ func TestMetricsCounters(t *testing.T) {
 	_, err := f.machine.StartShift(ctx, newReq(tenantID, operatorID, projectID))
 	require.NoError(t, err)
 
-	// Trigger an invalid transition.
-	_, err = f.machine.GoVerify(ctx, tenantID, operatorID)
+	// Trigger an invalid transition: VerifyDone from ready (operator
+	// never entered verify) is rejected by the transition table.
+	_, err = f.machine.VerifyDone(ctx, tenantID, operatorID)
 	require.ErrorIs(t, err, api.ErrInvalidTransition)
 
 	// Trigger a force.
@@ -1080,7 +1063,7 @@ func TestMetricsCounters(t *testing.T) {
 
 	// Metrics counters: at least one transition, one invalid, one force.
 	require.InDelta(t, 1.0, testCounterValue(t, f.metrics.Transitions, "offline", "ready", "start_shift"), 0.01)
-	require.InDelta(t, 1.0, testCounterValue(t, f.metrics.InvalidTransitions, "ready", "go_verify"), 0.01)
+	require.InDelta(t, 1.0, testCounterValue(t, f.metrics.InvalidTransitions, "ready", "verify_done"), 0.01)
 	require.InDelta(t, 1.0, testCounterValue(t, f.metrics.Force, "offline", "supervisor_kick"), 0.01)
 }
 
