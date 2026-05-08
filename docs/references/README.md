@@ -45,8 +45,8 @@ Each file follows this structure:
 | Plan 02 — cmd/api skeleton | retroactive — TBD | — |
 | Plan 03 — database | retroactive — TBD | — |
 | Plan 04 — tenancy | retroactive — TBD | `plan-04-tenancy.md` |
-| Plan 05 — auth | **ready** | [`plan-05-auth.md`](plan-05-auth.md) |
-| Plan 06 — CRM | TBD | — |
+| Plan 05 — auth | **shipped (v0.0.7)** | [`plan-05-auth.md`](plan-05-auth.md) |
+| Plan 06 — CRM | **shipped (v0.0.8)** | [`plan-06-crm.md`](plan-06-crm.md) |
 | Plan 07 — surveys | TBD | — |
 | Plan 08 — FreeSWITCH cluster | TBD | — |
 | Plan 09 — telephony-bridge | TBD | — |

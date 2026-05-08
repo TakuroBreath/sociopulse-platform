@@ -2,7 +2,7 @@
 
 > **Living document.** Updated at the end of every plan. Future agents read this first to know what exists and what's next.
 
-**Last updated**: 2026-05-08 — Plan 05 (`v0.0.7-auth`) complete.
+**Last updated**: 2026-05-08 — Plan 06 (`v0.0.8-crm`) complete.
 
 ---
 
@@ -16,7 +16,8 @@
 | `v0.0.4-cmd-api-skeleton` | Plan 02 | 2026-05-07 | pkg/config (Viper + hot-reload), pkg/observability (zap+OTel+Prometheus + PII redaction), internal/healthz (live/ready), cmd/api full composition root, docker-compose.dev.yml. |
 | `v0.0.5-database` | Plan 03 | 2026-05-07 | cmd/migrator (golang-migrate CLI), initial schema (19 tables + RLS), pkg/postgres (`WithTenant` SET LOCAL), pkg/encryption (AES-256-GCM + HMAC-SHA256 PhoneHasher), pkg/outbox (writer + relay + goleak guard). |
 | `v0.0.6-tenancy` | Plan 04 | 2026-05-08 | internal/tenancy fully wired: TenantService CRUD via BypassRLS + outbox + audit; KMSResolver with LRU+TTL DEK cache; PhoneHasher per-tenant pepper resolver; BucketProvisioner (Yandex stub + Local in-memory); Go pinned to 1.26.3 (clears stdlib CVEs). |
-| **`v0.0.7-auth`** | **Plan 05** | **2026-05-08** | **Full auth module across 9 sub-tasks: Argon2id (OWASP-min params + BoundedHasher OOM cap); HS256 JWT issuer/validator (refresh-rotation reuse detection, RFC 7518 32-byte secret floor); UserService CRUD (timing-safe ChangePassword, multi-role[]); Authenticator (login/refresh/logout, partial-token TOTP flow, dummy-verify on every failure path); Redis sliding-window rate-limit + lockout; TOTP enroll/verify/disable with KMS-encrypted secret + 10 single-use backup codes (cheap Argon2 params via `BackupCodeParams()`); static RBAC matrix (operator/supervisor/admin × 20 actions, multi-role union); gin handlers + JWTMiddleware replacing Plan 02 stub; full DI wired in `internal/auth/Module.Register`. Migration 000003 (users schema evolve) + 000004 (auth_totp).** |
+| `v0.0.7-auth` | Plan 05 | 2026-05-08 | Full auth module across 9 sub-tasks: Argon2id (OWASP-min params + BoundedHasher OOM cap); HS256 JWT issuer/validator (refresh-rotation reuse detection, RFC 7518 32-byte secret floor); UserService CRUD (timing-safe ChangePassword, multi-role[]); Authenticator (login/refresh/logout, partial-token TOTP flow, dummy-verify on every failure path); Redis sliding-window rate-limit + lockout; TOTP enroll/verify/disable with KMS-encrypted secret + 10 single-use backup codes (cheap Argon2 params via `BackupCodeParams()`); static RBAC matrix (operator/supervisor/admin × 20 actions, multi-role union); gin handlers + JWTMiddleware replacing Plan 02 stub; full DI wired in `internal/auth/Module.Register`. Migration 000003 (users schema evolve) + 000004 (auth_totp). |
+| **`v0.0.8-crm`** | **Plan 06** | **2026-05-08** | **Full CRM module across 5 sub-tasks: ProjectService Create/Get/List/Update/Pause/Resume/Archive/GetProgress + Assign/Unassign/ListMembers (state machine + idempotent transitions + per-tenant audit + NATS event slot wired for Plan 11); RespondentService.Create with libphonenumber RU normalization (`nyaruka/phonenumbers`) + per-tenant KMS encryption + DNC pre-check (audited block); async CSV/XLSX import via `hibiken/asynq` (streaming `excelize.Rows`, `pgx.CopyFrom` 1000-row batches, dedup-within-file + against-DB, Redis status hash with TTL refresh on terminal write, NATS progress events); Search + Get (masked phone) + GetWithPhone (admin-audited PII access) + Delete (152-ФЗ 30-day soft-delete grace) + daily PurgeWorker via `asynq.Scheduler`; gin transport with 17 endpoints under `/api/projects/*` + `/api/respondents/*` (admin-role gate, multipart upload, 50MB cap). Migrations 000005 (projects evolve) / 000006 (respondents UNIQUE) / 000007 (respondents soft-delete).** |
 
 ---
 
@@ -63,7 +64,14 @@
   - `store/` — `UserStore` (pgx-based, unique-violation→ErrLoginTaken, supports ALL 9 UserService ops), `RefreshStore` (Redis whitelist + Lua atomic `Rotate` returning 3-way: not-found / already-rotated / success), `TOTPStore` (Postgres with RLS, `MarkBackupUsed` via array_remove for race-safety).
   - `transport/http/` — gin handlers for 17 endpoints: 4 public (login/login_totp/refresh/logout), 7 user-scoped (me / change_password / 4× totp), 6 admin (CRUD users / archive / restore / reset_password). `Mount(group, deps)` wiring; `requireRole(...)` middleware; thin handlers (bind→service→render); structured `mapAuthError` covering every sentinel; 87% coverage.
   - `module.go` — REAL composition root: BoundedHasher around Default; BackupCodeParams hasher; JWT issuer; three stores; four Redis services (refresh + revoker + ratelimit + lockout); UserService; TOTPService; Authenticator; RBACMatrix; TenantResolverAdapter; HTTP mount; six locator registrations; graceful audit-logger fallback to noop while internal/audit is still a stub.
-- **`internal/<module>/api/` for the other 10 modules** ✅ Contracts only — no `service/`, `store/`, `http/`, `grpc/`, `events/` implementations yet (auth + tenancy are the two with real wiring as of v0.0.7).
+- **`internal/crm/` ✅✅✅ Plan 06 — FULLY WIRED**:
+  - `api/` — `ProjectService`, `RespondentService`, `QuotaTracker`, `DNCManager` interfaces (Tasks 3-5 fill ProjectService + RespondentService; QuotaTracker/DNCManager are TBD — separate plan or extension). Store ports: `ProjectStorePort`, `RespondentStorePort`. DTOs: `Project`, `Respondent`, `ProjectMember`, `ProjectProgress`, `ImportRequest`, `ImportTicket`, `ImportStatus`, `SearchRespondentsFilter`, `DeletionRequest`, `TOTPState`. Sentinels covering project (NotFound/CodeTaken/Archived/InvalidStatus) + respondent (NotFound/Deleted/InvalidPhone/PhoneInDNC/Duplicate/AdvertisingRejected) + import (NotFound/FormatUnsupported/PayloadTooBig). NATS subjects + event payloads in events.go (`ProjectCreatedEvent`, `ProjectUpdatedEvent`, `ProjectStatusChangedEvent`, `ImportProgressEvent`, `ImportFinishedEvent`, `ImportFailedEvent`).
+  - `service/` — `ProjectService` (full lifecycle, RFC 7519 §4.1.7 unique-JTI, optional NATS publisher slot), `RespondentService` (Create with libphonenumber + KMS + DNC pre-check + dup-check + audit; Get masked / GetWithPhone admin-audited; Search/Delete; constructor panics on nil), `PurgeWorker` (asynq handler, 1000-row batches, audits each ID), import pipeline (parseCSV / parseXLSX streaming, processBatch → stageBatch + filterAgainstDB + persistBatch refactored for gocognit, ProgressTracker with TTL refresh on terminal write).
+  - `store/` — `ProjectStore`, `RespondentStore` (raw pgx; CopyFrom-backed `InsertBatch` for 1000-row import; SoftDelete + PurgeOlderThan + Search; constraint-name discrimination for unique-violation translation; `goleak.VerifyTestMain` in integration build tag).
+  - `transport/http/` — gin handlers for 17 endpoints: 11 project (CRUD + lifecycle + Assign/Unassign/Members + Progress) + 6 respondent (Create/Get/GetWithPhone/Search/Delete/Import + import status). `requireAdminRole` middleware on writes. 80%+ coverage. Multipart upload (50MB cap) for import.
+  - `module.go` — REAL composition: builds Project/Respondent stores + services; looks up audit/KMS/PhoneHasher from locator with noop+warn fallbacks; wires asynq Client + Server when Redis present; registers TaskRespondentImport + TaskRespondentsPurge handlers; starts asynq.Scheduler with `0 3 * * *` cron for purge; mounts HTTP routes when HTTPRouter present; Module.Stop drains asynq Server + Scheduler.
+  - **Migrations 000005 / 000006 / 000007**: project columns evolve, respondents UNIQUE on (tenant_id, project_id, phone_hash), respondents soft-delete columns + partial index.
+- **`internal/<module>/api/` for the other 9 modules** ✅ Contracts only — no `service/`, `store/`, `http/`, `grpc/`, `events/` implementations yet (auth + tenancy + crm are the three with real wiring as of v0.0.8).
 - **`internal/healthz/`** ✅ `Liveness`/`Readiness` handlers + `Checker` interface + `PostgresCheck`/`RedisCheck`/`NATSCheck`.
 - **`internal/modules/`** ✅ `Module` interface + `Deps` struct + `MapLocator` + `Registry`.
 - Per-module `internal/<X>/module.go` ✅ stubs with `Register(d modules.Deps) error { return nil }` — all 12 modules (tenancy is the one with real wiring).
@@ -85,10 +93,12 @@
 
 ## Next plans (in dependency order)
 
-### Plan 06 — CRM Module 🎯 **NEXT**
-Projects, respondents (PII envelope-encrypted via pkg/encryption + per-tenant DEK from KMSResolver), DNC list, quotas, batch import. **Depends on Plan 04 + 05** ✅ both ready.
+### Plan 07 — Surveys Module 🎯 **NEXT**
+Survey schema + DSL evaluator + WASM runtime (TinyGo per ADR-0008). **Depends on Plan 04 + 06** ✅ both ready.
 
-**Plan**: `docs/superpowers/plans/2026-05-06-06-crm-module.md`.
+**Plan**: `docs/superpowers/plans/2026-05-06-07-surveys-module.md`.
+
+**Note (Plan 06 carry-over)**: `QuotaTracker` and `DNCManager` interfaces are declared in `internal/crm/api` but not yet implemented. They are dialer-hot-path concerns (Plan 09/10); track as separate Plan 06 follow-up if not folded into Plan 09.
 
 ### Plan 07 — Surveys Module
 Survey schema + DSL evaluator + WASM runtime (TinyGo per ADR-0008). **Depends on Plan 04**.
