@@ -152,6 +152,54 @@ func TestPool_BypassRLS(t *testing.T) {
 	require.Equal(t, "tenancy_admin", role)
 }
 
+// TestPool_LongLivedAcquire exercises the session-bound connection
+// surface used by the dialer retry orchestrator's PgLeader. Tests:
+//   - Acquire returns a usable conn that survives across multiple
+//     statements on the same session.
+//   - Release returns the conn to the pool; subsequent Exec on the
+//     released *Conn errors (rather than silently mutating a different
+//     pool member).
+//   - The SAME session anchors a Postgres advisory lock — pg_try_advisory_lock
+//     on the same conn is the production use case.
+func TestPool_LongLivedAcquire(t *testing.T) {
+	dsn := startPG(t)
+	ctx := context.Background()
+	pool, err := postgres.Open(ctx, postgres.Config{DSN: dsn, MaxConns: 4})
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+
+	// Acquire a long-lived conn.
+	conn, err := pool.LongLivedAcquire(ctx)
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	// pg_backend_pid stays the same across calls on the same conn —
+	// proves we have a STABLE underlying session.
+	var pid1, pid2 int
+	require.NoError(t, conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid1))
+	require.NoError(t, conn.QueryRow(ctx, "select pg_backend_pid()").Scan(&pid2))
+	require.Equal(t, pid1, pid2, "two QueryRows on the same Conn must hit the same backend pid")
+
+	// pg_try_advisory_lock on the conn — the production primitive the
+	// dialer retry orchestrator uses for leader election.
+	var got bool
+	require.NoError(t, conn.QueryRow(ctx, "select pg_try_advisory_lock(42)").Scan(&got))
+	require.True(t, got)
+
+	// Release the conn (also releases the lock as a side effect of
+	// session rebinding when the pool reaps idle conns; the explicit
+	// pg_advisory_unlock would be cleaner — see retry/leader_election.go).
+	conn.Release()
+
+	// Subsequent calls on the released *Conn error rather than silently
+	// hitting whatever conn pgxpool checked out next.
+	_, err = conn.Exec(ctx, "select 1")
+	require.Error(t, err)
+
+	// Double-Release is a no-op.
+	require.NotPanics(t, func() { conn.Release() })
+}
+
 type fakeError struct{ msg string }
 
 func (e *fakeError) Error() string { return e.msg }

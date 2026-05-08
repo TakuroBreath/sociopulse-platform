@@ -147,6 +147,78 @@ func (p *Pool) RawQueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 	return p.p.QueryRow(ctx, sql, args...)
 }
 
+// LongLivedAcquire pulls a single connection out of the pool and hands
+// the caller exclusive ownership of it for the connection's lifetime.
+// The caller MUST invoke Conn.Release when finished — a leaked Conn
+// permanently shrinks the pool by one.
+//
+// Reserved for use cases where the caller needs a SESSION-bound
+// resource — most notably Postgres advisory locks held via
+// pg_try_advisory_lock(): the lock auto-releases when the underlying
+// session disconnects, which is the desirable property for leader
+// election (a crashed leader frees the lock for a peer without manual
+// intervention). The PG advisory-lock leader in
+// internal/dialer/retry uses this entry point.
+//
+// Application code that does NOT need a session-bound resource MUST
+// continue to use WithTenant or BypassRLS — the SET LOCAL app.tenant_id
+// path that powers RLS is on those, not on the bare connection.
+func (p *Pool) LongLivedAcquire(ctx context.Context) (*Conn, error) {
+	if p == nil || p.p == nil {
+		return nil, errors.New("postgres: pool is not initialised")
+	}
+	c, err := p.p.Acquire(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("postgres: long-lived acquire: %w", err)
+	}
+	return &Conn{c: c}, nil
+}
+
+// Conn is a single connection on long-lived loan from the Pool. The
+// only legitimate consumer today is the dialer retry orchestrator's
+// leader-election loop. The wrapper exposes a minimal Exec / QueryRow
+// surface so callers can run advisory-lock SQL without reaching into
+// pgx.Conn directly (which depguard would reject).
+type Conn struct {
+	c *pgxpool.Conn
+}
+
+// Exec runs a statement on the long-lived connection. Pass a context
+// scoped to the operation — cancelling the ctx interrupts only the
+// current statement, not the underlying connection.
+func (c *Conn) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if c == nil || c.c == nil {
+		return pgconn.CommandTag{}, errors.New("postgres: Conn already released")
+	}
+	return c.c.Exec(ctx, sql, args...)
+}
+
+// QueryRow runs a single-row query on the long-lived connection.
+func (c *Conn) QueryRow(ctx context.Context, sql string, args ...any) pgx.Row {
+	if c == nil || c.c == nil {
+		return errRow{err: errors.New("postgres: Conn already released")}
+	}
+	return c.c.QueryRow(ctx, sql, args...)
+}
+
+// Release returns the connection to the pool. Subsequent Exec/QueryRow
+// calls on this Conn will fail. Idempotent against double-Release.
+func (c *Conn) Release() {
+	if c == nil || c.c == nil {
+		return
+	}
+	c.c.Release()
+	c.c = nil
+}
+
+// errRow is a degenerate pgx.Row that returns the supplied error from
+// Scan. Used to surface "Conn already released" without panicking on a
+// nil dereference in Conn.QueryRow.
+type errRow struct{ err error }
+
+// Scan implements pgx.Row.
+func (r errRow) Scan(_ ...any) error { return r.err }
+
 func (p *Pool) transact(ctx context.Context, fn func(pgx.Tx) error) error {
 	tx, err := p.p.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {

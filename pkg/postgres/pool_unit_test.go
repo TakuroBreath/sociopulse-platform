@@ -70,3 +70,30 @@ func TestWithTenant_RejectsZeroUUID(t *testing.T) {
 	})
 	require.Error(t, err)
 }
+
+// TestLongLivedAcquire_RejectsNilPool guards the constructor contract:
+// a Pool with no underlying pgxpool must error rather than panic.
+func TestLongLivedAcquire_RejectsNilPool(t *testing.T) {
+	t.Parallel()
+
+	var p *postgres.Pool
+	_, err := p.LongLivedAcquire(context.Background())
+	require.Error(t, err)
+}
+
+// TestConn_NilSafeMethods — methods on a zero-value or already-released
+// *Conn must not panic. Release on a zero conn is a no-op; Exec /
+// QueryRow surface a clean error instead of a nil-deref.
+func TestConn_NilSafeMethods(t *testing.T) {
+	t.Parallel()
+
+	var c *postgres.Conn
+	require.NotPanics(t, func() { c.Release() })
+
+	_, err := c.Exec(context.Background(), "select 1")
+	require.Error(t, err)
+
+	row := c.QueryRow(context.Background(), "select 1")
+	var dst int
+	require.Error(t, row.Scan(&dst), "QueryRow on nil Conn returns errRow")
+}
