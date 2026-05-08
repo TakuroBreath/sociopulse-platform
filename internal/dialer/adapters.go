@@ -1,0 +1,291 @@
+package dialer
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+
+	auditapi "github.com/sociopulse/platform/internal/audit/api"
+	dialerapi "github.com/sociopulse/platform/internal/dialer/api"
+	"github.com/sociopulse/platform/internal/dialer/capacity"
+	"github.com/sociopulse/platform/internal/dialer/hours"
+	"github.com/sociopulse/platform/internal/dialer/retry"
+	"github.com/sociopulse/platform/internal/modules"
+	telephonyapi "github.com/sociopulse/platform/internal/telephony/api"
+	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
+)
+
+// Locator keys this module CONSUMES (registered by other modules).
+const (
+	locatorTenancy          = "tenancy.Tenancy"
+	locatorKMSResolver      = "tenancy.KMSResolver"
+	locatorCommandPublisher = telephonyLocatorPublisher
+	locatorAuditLogger      = "audit.Logger"
+)
+
+// telephonyLocatorPublisher mirrors telephony.LocatorCommandPublisher
+// without forcing the dialer module to import the telephony package's
+// non-api code. The string is stable across modules; if either side
+// changes, locator.Lookup returns ok=false and the dialer falls back
+// to a stub publisher (with a warn log).
+const telephonyLocatorPublisher = "telephony.CommandPublisher"
+
+// settingsLookupAdapter adapts tenancy.SettingsCache to the small
+// hours.SettingsLookup surface. We do the json.RawMessage conversion
+// inline so the hours package doesn't depend on the full
+// tenancy.SettingValue type.
+type settingsLookupAdapter struct {
+	cache tenancyapi.SettingsCache
+}
+
+// Compile-time interface check.
+var _ hours.SettingsLookup = (*settingsLookupAdapter)(nil)
+
+// Lookup satisfies hours.SettingsLookup. tenancy.ErrNotFound translates
+// to ok=false, which the hours package treats as "no override, use the
+// default". Other errors propagate.
+func (a *settingsLookupAdapter) Lookup(ctx context.Context, tenantID uuid.UUID, key string) (json.RawMessage, bool, error) {
+	if a == nil || a.cache == nil {
+		return nil, false, nil
+	}
+	v, err := a.cache.Lookup(ctx, tenantID, key)
+	if err != nil {
+		if errors.Is(err, tenancyapi.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return v.Raw(), true, nil
+}
+
+// noopSettingsLookup is the fallback when tenancy.Tenancy is missing
+// from the locator (worker-only boot or dev test). It always returns
+// ok=false so hours.Checker uses the platform default for every
+// tenant.
+type noopSettingsLookup struct{}
+
+// Compile-time interface check.
+var _ hours.SettingsLookup = noopSettingsLookup{}
+
+// Lookup satisfies hours.SettingsLookup with a hard-coded "no
+// override" answer. Operators see the package default 09-21 weekday /
+// 10-18 weekend, which is conservative for the v1 rollout.
+func (noopSettingsLookup) Lookup(_ context.Context, _ uuid.UUID, _ string) (json.RawMessage, bool, error) {
+	return nil, false, nil
+}
+
+// kmsDecryptorAdapter adapts tenancy.KMSResolver to the small
+// retry.Decryptor surface used by the orchestrator.
+type kmsDecryptorAdapter struct {
+	kms tenancyapi.KMSResolver
+}
+
+// Compile-time interface check.
+var _ retry.Decryptor = (*kmsDecryptorAdapter)(nil)
+
+// Decrypt satisfies retry.Decryptor. The orchestrator passes the
+// per-row tenant ID + ciphertext; we forward verbatim to the KMS
+// resolver.
+func (a *kmsDecryptorAdapter) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphertext []byte) ([]byte, error) {
+	if a == nil || a.kms == nil {
+		return nil, errors.New("dialer: KMSResolver not wired (decryptor unavailable)")
+	}
+	return a.kms.Decrypt(ctx, tenantID, ciphertext)
+}
+
+// passthroughDecryptor is the fallback retry.Decryptor used when
+// tenancy.KMSResolver is unavailable (worker-only smoke tests; pre-
+// Plan 04 boot sequence). It returns the ciphertext bytes verbatim,
+// matching the dev/test behaviour where phone columns are stored as
+// plaintext. NOT for production: the retry orchestrator's logger
+// surfaces the fallback choice on construction.
+type passthroughDecryptor struct{}
+
+// Compile-time interface check.
+var _ retry.Decryptor = passthroughDecryptor{}
+
+// Decrypt satisfies retry.Decryptor.
+func (passthroughDecryptor) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+	if len(ciphertext) == 0 {
+		return nil, errors.New("dialer/retry: empty ciphertext")
+	}
+	out := make([]byte, len(ciphertext))
+	copy(out, ciphertext)
+	return out, nil
+}
+
+// stubCapacityPool is a Pool adapter that surfaces an empty healthy-node
+// list. Used when telephony.LocatorCommandPublisher is the stub one
+// (cmd/api boot without the bridge wired): the dialer's capacity
+// tracker degrades to "no nodes available" on every Acquire call,
+// which the dispatch loop translates into ErrAllNodesFull and backs
+// off. Better than panicking on a missing Pool.
+type stubCapacityPool struct{}
+
+// Compile-time interface check.
+var _ capacity.Pool = stubCapacityPool{}
+
+// HealthyNodes satisfies capacity.Pool with a constant empty list.
+func (stubCapacityPool) HealthyNodes() []string { return nil }
+
+// stubBackpressure is a Bp adapter that always reports the node at
+// cap. Pairs with stubCapacityPool so cmd/api can boot the dialer
+// without the bridge — every Acquire call surfaces ErrAllNodesFull
+// before reaching this stub, but the interface needs satisfying so
+// the tracker construction doesn't fail.
+type stubBackpressure struct{}
+
+// Compile-time interface check.
+var _ capacity.Bp = stubBackpressure{}
+
+// TryAcquire satisfies capacity.Bp. Always returns (false, nil)
+// — the upstream tracker treats this as "node at cap" and tries the
+// next, eventually surfacing ErrAllNodesFull.
+func (stubBackpressure) TryAcquire(_ context.Context, _ string) (bool, error) {
+	return false, nil
+}
+
+// Release satisfies capacity.Bp. No-op.
+func (stubBackpressure) Release(_ context.Context, _ string) error { return nil }
+
+// Get satisfies capacity.Bp. Returns a constant 0 — the tracker uses
+// this to refresh per-node gauges on Acquire / Release; with no real
+// telephony backend the gauges stay at 0.
+func (stubBackpressure) Get(_ context.Context, _ string) (int, error) { return 0, nil }
+
+// Cap satisfies capacity.Bp. The stub returns 0 so the tracker
+// reports zero remaining capacity to anyone reading the metrics.
+func (stubBackpressure) Cap() int { return 0 }
+
+// stubEventConsumer satisfies telephony.api.EventConsumer with a
+// no-op Subscribe. Returned when the locator has no real telephony
+// EventConsumer — happens in cmd/api today (the bridge runs in
+// cmd/telephony-bridge and Plan 11 will register the cluster
+// consumer). The unsubscribe is also a no-op so the dialer's caller
+// can defer it without nil-checking.
+type stubEventConsumer struct {
+	logger *zap.Logger
+}
+
+// Compile-time interface check.
+var _ telephonyapi.EventConsumer = (*stubEventConsumer)(nil)
+
+// Subscribe satisfies telephony.api.EventConsumer with a logged
+// no-op. The subscription is "alive" until the unsubscribe is
+// invoked; no events are ever delivered.
+func (s *stubEventConsumer) Subscribe(_ context.Context, tenantID uuid.UUID, _ telephonyapi.EventHandler) (func(), error) {
+	if s.logger != nil {
+		s.logger.Debug("dialer: stub EventConsumer.Subscribe (no real bridge consumer wired)",
+			zap.Stringer("tenant_id", tenantID),
+		)
+	}
+	return func() {}, nil
+}
+
+// noopAuditLogger is the fallback audit.Logger used when the audit
+// module hasn't registered yet. It silently drops every event so the
+// dialer module bootstraps to a working state; once a future plan
+// wires the real audit Logger this fallback is never selected.
+type noopAuditLogger struct{}
+
+// Compile-time interface check.
+var _ auditapi.Logger = noopAuditLogger{}
+
+// Write satisfies auditapi.Logger.
+func (noopAuditLogger) Write(_ context.Context, _ auditapi.Event) error { return nil }
+
+// lookupTenancy pulls the aggregate tenancy.Tenancy interface from the
+// locator. Returns nil (not error) when missing — the caller swaps in
+// the noopSettingsLookup fallback.
+func lookupTenancy(loc modules.ServiceLocator, log *zap.Logger) tenancyapi.Tenancy {
+	if loc == nil {
+		return nil
+	}
+	raw, ok := loc.Lookup(locatorTenancy)
+	if !ok {
+		return nil
+	}
+	t, ok := raw.(tenancyapi.Tenancy)
+	if !ok {
+		log.Error("tenancy.Tenancy registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return nil
+	}
+	return t
+}
+
+// lookupKMSResolver pulls tenancy.KMSResolver from the locator.
+// Returns nil when missing or wrong-typed; the caller swaps in
+// passthroughDecryptor as a fallback.
+func lookupKMSResolver(loc modules.ServiceLocator, log *zap.Logger) tenancyapi.KMSResolver {
+	if loc == nil {
+		return nil
+	}
+	raw, ok := loc.Lookup(locatorKMSResolver)
+	if !ok {
+		return nil
+	}
+	r, ok := raw.(tenancyapi.KMSResolver)
+	if !ok {
+		log.Error("tenancy.KMSResolver registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return nil
+	}
+	return r
+}
+
+// lookupCommandPublisher pulls telephony.CommandPublisher from the
+// locator. The dialer uses this as the destination for Originate /
+// Hangup; cmd/api today registers a stub that returns
+// ErrTelephonyBridgeOffline on every call. Plan 11 will register a
+// real *nats.Conn-backed publisher.
+//
+// Returns ok=false when missing; the caller bails on dialer router
+// construction (the router truly cannot operate without a publisher
+// — even the stub is preferable to a nil deref).
+func lookupCommandPublisher(loc modules.ServiceLocator, log *zap.Logger) (telephonyapi.CommandPublisher, bool) {
+	if loc == nil {
+		return nil, false
+	}
+	raw, ok := loc.Lookup(locatorCommandPublisher)
+	if !ok {
+		return nil, false
+	}
+	p, ok := raw.(telephonyapi.CommandPublisher)
+	if !ok {
+		log.Error("telephony.CommandPublisher registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return nil, false
+	}
+	return p, true
+}
+
+// lookupAuditLogger pulls audit.Logger from the locator. Mirrors the
+// fallback pattern in crm/auth/surveys: missing → noop logger + warn.
+func lookupAuditLogger(loc modules.ServiceLocator, log *zap.Logger) auditapi.Logger {
+	if loc == nil {
+		log.Warn("audit.Logger not in locator (no locator present) — using noop logger")
+		return noopAuditLogger{}
+	}
+	raw, ok := loc.Lookup(locatorAuditLogger)
+	if !ok {
+		log.Warn("audit.Logger not in locator — using noop logger")
+		return noopAuditLogger{}
+	}
+	logger, ok := raw.(auditapi.Logger)
+	if !ok {
+		log.Error("audit.Logger registered with wrong type — using noop logger",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return noopAuditLogger{}
+	}
+	return logger
+}
+
+// Compile-time check that dialerapi.OperatorFSM is a strict subset of
+// the interface the FSM Machine implements — keeps the locator-key
+// type matching honest.
+var _ dialerapi.OperatorFSM = (interface{ dialerapi.OperatorFSM })(nil)

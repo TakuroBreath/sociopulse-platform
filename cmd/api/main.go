@@ -30,9 +30,11 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
 	"github.com/sociopulse/platform/internal/modules"
+	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/observability"
 	"github.com/sociopulse/platform/pkg/outbox"
@@ -154,9 +156,23 @@ func run(ctx context.Context, configDir string) error {
 		checks = append(checks, healthchecks.PostgresCheck{Pool: pool})
 	}
 
-	// 6. Module Deps. Modules will be added here in later plans. The locator
-	//    is created up-front so order-dependent lookups (e.g. tenancy → auth
-	//    → realtime) work the moment Module.Register starts being called.
+	// 6. Redis. Best-effort — a missing Redis only disables the
+	//    Redis-backed modules (auth refresh-token whitelist, dialer FSM
+	//    + queue + heartbeat watchdog). Boot proceeds either way so the
+	//    HTTP layer is still usable for /healthz / /readyz / /metrics.
+	rdb, redisErr := openRedis(ctx, cfg, logger)
+	if rdb != nil {
+		defer func() { _ = rdb.Close() }()
+	}
+
+	// 7. HTTP server (gin engine + middleware + health endpoints). The engine
+	//    is also stashed back on Deps so module Register() can mount routes.
+	httpSrv, engine := buildHTTPServer(cfg, logger, tracer, metrics, checks) //nolint:contextcheck // server inherits ctx via gin handlers, not caller
+	metricsSrv := buildMetricsServer(cfg, metrics)
+
+	// 8. Module Deps. The locator is created up-front so order-
+	//    dependent lookups (e.g. tenancy → auth → dialer) work the
+	//    moment Module.Register starts being called.
 	//
 	//    EventBus is the noop publisher until Plan 04 wires NATS — it lets
 	//    the outbox relay run end-to-end (drain rows, mark them published)
@@ -169,20 +185,30 @@ func run(ctx context.Context, configDir string) error {
 		Logger:     logger,
 		Config:     &cfg,
 		Pool:       pool,
+		Redis:      rdb,
 		EventBus:   publisher,
-		HTTPRouter: nil, // populated below once buildHTTPServer returns
+		HTTPRouter: engine,
 		Locator:    locator,
 	}
-	registry := modules.Registry{Modules: nil} // populated by Plan 04+
-	_ = deps                                   // silence unused-write warning until modules attach
-	_ = registry
 
-	// 7. HTTP server (gin engine + middleware + health endpoints). The engine
-	//    is also stashed back on Deps so module Register() can mount routes.
-	httpSrv := buildHTTPServer(cfg, logger, tracer, metrics, checks) //nolint:contextcheck // server inherits ctx via gin handlers, not caller
-	// deps.HTTPRouter would be the *gin.Engine here once we expose it from
-	// buildHTTPServer; deferred until a module needs it (Plan 04+).
-	metricsSrv := buildMetricsServer(cfg, metrics)
+	// 9. Module registry. Order matters — telephony registers the
+	//    placeholder CommandPublisher under telephony.LocatorCommandPublisher
+	//    before dialer.Register looks it up. The dialer module is the
+	//    final consumer and degrades gracefully when its optional deps
+	//    (Redis, telephony, tenancy) are missing.
+	dialerModule := &dialer.Module{}
+	registry := modules.Registry{Modules: []modules.Module{
+		telephony.Module{},
+		dialerModule,
+	}}
+	if err := registerModules(registry, deps, logger, redisErr); err != nil {
+		return err
+	}
+	defer func() {
+		if err := dialerModule.Stop(); err != nil {
+			logger.Warn("dialer module Stop failed", zap.Error(err))
+		}
+	}()
 
 	// 8. Outbox relay.
 	//

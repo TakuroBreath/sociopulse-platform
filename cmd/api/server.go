@@ -43,7 +43,7 @@ func buildHTTPServer(
 	tracer trace.Tracer,
 	metrics *observability.Metrics,
 	checks []healthz.Checker,
-) *http.Server {
+) (*http.Server, *gin.Engine) {
 	if cfg.Service.Env == "development" {
 		gin.SetMode(gin.DebugMode)
 	} else {
@@ -81,7 +81,7 @@ func buildHTTPServer(
 	r.GET("/healthz", gin.WrapH(healthz.NewLivenessHandler()))
 	r.GET("/readyz", gin.WrapH(healthz.NewReadinessHandler(readinessTimeout, checks...)))
 
-	return &http.Server{
+	srv := &http.Server{
 		Addr:              cfg.HTTP.Bind,
 		Handler:           r,
 		ReadTimeout:       cfg.HTTP.ReadTimeout,
@@ -89,6 +89,7 @@ func buildHTTPServer(
 		WriteTimeout:      cfg.HTTP.WriteTimeout,
 		IdleTimeout:       cfg.HTTP.IdleTimeout,
 	}
+	return srv, r
 }
 
 // buildMetricsServer returns an *http.Server that exposes /metrics on the

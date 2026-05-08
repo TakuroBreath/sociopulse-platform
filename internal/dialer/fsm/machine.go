@@ -31,6 +31,20 @@ type TxRunner interface {
 	WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error
 }
 
+// SnapshotPublisher is the small surface the FSM uses to broadcast a
+// successful transition to subscribers (operator UI WS, supervisor
+// dashboards). Production wiring passes the dialer module's in-memory
+// pubsub; tests pass a fake or nil. Plan 11 swaps the production
+// implementation for a NATS-backed cluster fan-out.
+//
+// Publish is invoked AFTER the Redis CAS commit + the audit row write,
+// on the same goroutine as the FSM call. Implementations MUST be
+// non-blocking: a slow subscriber must drop snapshots rather than
+// stalling the transition path.
+type SnapshotPublisher interface {
+	Publish(snap api.Snapshot)
+}
+
 // Config bundles the dependencies and settings for a Machine. Required
 // fields are documented per-field; nil-tolerated fields fall back to
 // safe defaults.
@@ -67,20 +81,28 @@ type Config struct {
 	// Metrics is the per-package collector group. nil → no metrics
 	// (the Machine is fully functional without it).
 	Metrics *Metrics
+
+	// Publisher receives the new Snapshot after every successful
+	// transition (including Force). nil → no broadcast; the Machine
+	// is fully functional without it. Production wiring passes the
+	// dialer module's in-memory pubsub (Plan 10 Task 10) and Plan 11
+	// swaps for NATS.
+	Publisher SnapshotPublisher
 }
 
 // Machine implements api.OperatorFSM. It coordinates atomic Redis hash
 // CAS writes (live state) with Postgres operator_sessions /
 // operator_state_log audit writes via the outbox.
 type Machine struct {
-	rdb      *redis.Client
-	pg       TxRunner
-	outbox   outbox.Writer
-	sessions SessionStore
-	log      *zap.Logger
-	clock    func() time.Time
-	hashTTL  time.Duration
-	metrics  *Metrics
+	rdb       *redis.Client
+	pg        TxRunner
+	outbox    outbox.Writer
+	sessions  SessionStore
+	log       *zap.Logger
+	clock     func() time.Time
+	hashTTL   time.Duration
+	metrics   *Metrics
+	publisher SnapshotPublisher
 }
 
 // Compile-time interface check. Surfaces api.OperatorFSM signature drift
@@ -116,15 +138,26 @@ func New(cfg Config) (*Machine, error) {
 		sessions = pgSessionStore{}
 	}
 	return &Machine{
-		rdb:      cfg.Redis,
-		pg:       cfg.PG,
-		outbox:   cfg.Outbox,
-		sessions: sessions,
-		log:      logger,
-		clock:    clock,
-		hashTTL:  ttl,
-		metrics:  cfg.Metrics,
+		rdb:       cfg.Redis,
+		pg:        cfg.PG,
+		outbox:    cfg.Outbox,
+		sessions:  sessions,
+		log:       logger,
+		clock:     clock,
+		hashTTL:   ttl,
+		metrics:   cfg.Metrics,
+		publisher: cfg.Publisher,
 	}, nil
+}
+
+// publish forwards a successful transition's Snapshot to the
+// configured Publisher. Nil-tolerated so unit tests that don't wire a
+// PubSub keep their existing setup.
+func (m *Machine) publish(snap api.Snapshot) {
+	if m.publisher == nil {
+		return
+	}
+	m.publisher.Publish(snap)
 }
 
 // now returns m.clock() forced to UTC. All timestamps stored in Redis
@@ -256,7 +289,9 @@ func (m *Machine) applyEventWith(
 	}
 
 	m.metrics.observeTransition(cur.State, next, evt)
-	return updated.toAPI(tenantID, operatorID), nil
+	out := updated.toAPI(tenantID, operatorID)
+	m.publish(out)
+	return out, nil
 }
 
 // StartShift implements api.OperatorFSM. It opens a tenancy_admin tx
@@ -337,7 +372,9 @@ func (m *Machine) StartShift(ctx context.Context, req api.StartShiftRequest) (ap
 
 	updated.Version = 1
 	m.metrics.observeTransition(api.StateOffline, api.StateReady, api.EventStartShift)
-	return updated.toAPI(req.TenantID, req.OperatorID), nil
+	out := updated.toAPI(req.TenantID, req.OperatorID)
+	m.publish(out)
+	return out, nil
 }
 
 // EndShift implements api.OperatorFSM. UPDATEs ended_at on the bound
@@ -391,7 +428,9 @@ func (m *Machine) EndShift(ctx context.Context, tenantID, operatorID uuid.UUID) 
 	}
 
 	m.metrics.observeTransition(cur.State, api.StateOffline, api.EventEndShift)
-	return updated.toAPI(tenantID, operatorID), nil
+	out := updated.toAPI(tenantID, operatorID)
+	m.publish(out)
+	return out, nil
 }
 
 // GoReady implements api.OperatorFSM. Equivalent to Resume — both fire
@@ -606,5 +645,7 @@ func (m *Machine) Force(
 	}
 
 	m.metrics.observeForce(target, reason)
-	return updated.toAPI(tenantID, operatorID), nil
+	out := updated.toAPI(tenantID, operatorID)
+	m.publish(out)
+	return out, nil
 }
