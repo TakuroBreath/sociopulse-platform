@@ -80,6 +80,7 @@ type Module struct {
 	mu         sync.Mutex
 	logger     *zap.Logger
 	hub        *service.Hub
+	presence   *service.RedisPresenceTracker
 	registered bool
 	stopped    bool
 }
@@ -167,10 +168,31 @@ func (m *Module) Register(d modules.Deps) error {
 	d.Locator.Register(rtapi.LocatorHub, rtapi.Hub(hub))
 	d.Locator.Register(rtapi.LocatorConnectionMetrics, connMetrics)
 
+	// Plan 11 Task 5: Redis-backed PresenceTracker. Built only when
+	// Deps.Redis is wired — Redis-less test setups (and any future
+	// degraded-mode boot) skip presence cleanly. The HTTP handlers
+	// look up rtapi.LocatorPresenceTracker and short-circuit when
+	// missing.
+	if d.Redis != nil {
+		presenceMetrics := service.RegisterPresenceMetrics(reg)
+		presence := service.NewRedisPresenceTracker(d.Redis, logger,
+			service.WithPresenceMetrics(presenceMetrics))
+		m.presence = presence
+		d.Locator.Register(rtapi.LocatorPresenceTracker, rtapi.PresenceTracker(presence))
+		logger.Info("realtime: presence tracker registered")
+	} else {
+		// Best-effort fallback: no Redis means no cross-replica
+		// presence map. The handler that consumes the locator entry
+		// must guard against the missing key. We log INFO (not WARN)
+		// because Redis-less boot is a legitimate test/dev mode.
+		logger.Info("realtime: presence tracker skipped (Redis unavailable)")
+	}
+
 	m.registered = true
 
-	logger.Info("realtime module registered (Plan 11 Task 4c)",
+	logger.Info("realtime module registered (Plan 11 Task 4c+5)",
 		zap.Bool("subscriber_wired", d.Subscriber != nil),
+		zap.Bool("presence_wired", d.Redis != nil),
 	)
 	return nil
 }

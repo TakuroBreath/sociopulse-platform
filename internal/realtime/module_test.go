@@ -4,7 +4,9 @@ import (
 	"context"
 	"testing"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -213,4 +215,90 @@ func TestModule_NewWithoutRegisterer(t *testing.T) {
 	raw, ok := deps.Locator.Lookup(rtapi.LocatorHub)
 	require.True(t, ok)
 	require.NotNil(t, raw)
+}
+
+// TestModule_RegisterStashesPresenceTrackerWhenRedisAvailable verifies
+// the Plan 11 Task 5 wiring: when Deps.Redis is non-nil, Register
+// builds a RedisPresenceTracker and stashes it in the locator under
+// rtapi.LocatorPresenceTracker.
+func TestModule_RegisterStashesPresenceTrackerWhenRedisAvailable(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	mod := newModule()
+	deps := newDeps(t)
+	deps.Redis = rdb
+
+	require.NoError(t, mod.Register(deps))
+
+	raw, ok := deps.Locator.Lookup(rtapi.LocatorPresenceTracker)
+	require.True(t, ok, "PresenceTracker should be registered when Deps.Redis is wired")
+	tracker, ok := raw.(rtapi.PresenceTracker)
+	require.True(t, ok, "stored value must satisfy api.PresenceTracker")
+	require.NotNil(t, tracker)
+
+	// Smoke-test the wired tracker against the real miniredis so the
+	// composition path is exercised end-to-end (not just the locator
+	// stash).
+	ctx := t.Context()
+	require.NoError(t, tracker.OnConnect(ctx, "tenant-A", "u1", "replica-test"))
+	online, err := tracker.IsOnline(ctx, "tenant-A", "u1")
+	require.NoError(t, err)
+	assert.True(t, online)
+}
+
+// TestModule_RegisterSkipsPresenceTrackerWhenRedisNil verifies the
+// degraded-mode boot path: a nil Deps.Redis is legitimate (test or
+// dev), Register logs an INFO and continues without registering the
+// tracker. The locator key is absent so downstream consumers can
+// detect the no-presence mode.
+func TestModule_RegisterSkipsPresenceTrackerWhenRedisNil(t *testing.T) {
+	t.Parallel()
+
+	mod := newModule()
+	deps := newDeps(t)
+	require.Nil(t, deps.Redis, "test fixture should default to nil Redis")
+
+	require.NoError(t, mod.Register(deps))
+
+	_, ok := deps.Locator.Lookup(rtapi.LocatorPresenceTracker)
+	assert.False(t, ok, "PresenceTracker should NOT be registered when Deps.Redis is nil")
+
+	// Hub still registers — the absence of presence does not block
+	// the rest of realtime composition.
+	_, ok = deps.Locator.Lookup(rtapi.LocatorHub)
+	assert.True(t, ok, "Hub should still register even without Redis")
+}
+
+// TestModule_RegisterPresenceMetricsLandOnSharedRegistry verifies the
+// presence collectors are registered on the supplied registry, the
+// same way the Hub metrics are. A duplicate-registration probe trips
+// AlreadyRegisteredError if the presence counter is on the right
+// registerer.
+func TestModule_RegisterPresenceMetricsLandOnSharedRegistry(t *testing.T) {
+	t.Parallel()
+
+	mr := miniredis.RunT(t)
+	rdb := redis.NewClient(&redis.Options{Addr: mr.Addr()})
+	t.Cleanup(func() { _ = rdb.Close() })
+
+	reg := prometheus.NewRegistry()
+	mod := realtime.New(realtime.Config{Registerer: reg})
+	deps := newDeps(t)
+	deps.Redis = rdb
+
+	require.NoError(t, mod.Register(deps))
+
+	dup := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "realtime_presence_connect_total",
+		Help: "Total OnConnect events recorded by the realtime presence tracker.",
+	})
+	err := reg.Register(dup)
+	require.Error(t, err, "presence connect counter must already be registered")
+
+	var arErr prometheus.AlreadyRegisteredError
+	require.ErrorAs(t, err, &arErr)
 }

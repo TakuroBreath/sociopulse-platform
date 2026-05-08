@@ -262,3 +262,123 @@ func (m *HubMetrics) observeSubscribeFailure(topic, reason string) {
 	}
 	m.SubscribeFailures.WithLabelValues(topic, reason).Inc()
 }
+
+// presenceTouchResult* are the bounded label values emitted by
+// PresenceMetrics.Touch. Stringly-typed constants rather than enum
+// values so the Prometheus output stays stable across refactors.
+const (
+	presenceTouchResultOK     = "ok"
+	presenceTouchResultLapsed = "lapsed"
+	presenceTouchResultError  = "error"
+)
+
+// PresenceMetrics groups the Prometheus collectors emitted by
+// RedisPresenceTracker. Same construction discipline as Metrics /
+// HubMetrics — RegisterPresenceMetrics gates the registerer.
+//
+// The four counters cover the full presence lifecycle:
+//   - Connect / Disconnect for raw event volume.
+//   - Touch{result} for liveness ratio dashboards (a rising
+//     `lapsed` rate flags a stuck Hub touch loop).
+//   - OnlineUsers (gauge) for per-tenant operator concurrency. The
+//     tenant_id label is bounded by the project's small tenant set
+//     (~30 in production) — safe.
+type PresenceMetrics struct {
+	// Connect counts successful OnConnect calls. No labels — every
+	// connect is a single integer increment.
+	Connect prometheus.Counter
+
+	// Disconnect counts successful OnDisconnect calls. No labels.
+	Disconnect prometheus.Counter
+
+	// Touch counts Touch invocations partitioned by outcome:
+	// {ok, lapsed, error}. Dashboards alert on lapsed/total ratio.
+	Touch *prometheus.CounterVec
+
+	// OnlineUsers is a gauge of currently-online users per tenant.
+	// The tracker does NOT auto-update this gauge — the value is set
+	// explicitly by the periodic snapshotter (Plan 11 Task 10's
+	// janitor) to avoid double-counting when multiple replicas hit
+	// OnConnect for the same user. Unlabelled construction would
+	// hide the per-tenant view, so we accept the label even though
+	// the tracker itself doesn't write it.
+	OnlineUsers *prometheus.GaugeVec
+}
+
+// RegisterPresenceMetrics builds a *PresenceMetrics and registers
+// every collector on reg. nil registerer panics — same boot rule as
+// RegisterMetrics / RegisterHubMetrics.
+func RegisterPresenceMetrics(reg prometheus.Registerer) *PresenceMetrics {
+	if reg == nil {
+		panic("service.RegisterPresenceMetrics: reg must be non-nil; pass prometheus.NewRegistry() in tests")
+	}
+	m := &PresenceMetrics{
+		Connect: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "realtime_presence_connect_total",
+				Help: "Total OnConnect events recorded by the realtime presence tracker.",
+			},
+		),
+		Disconnect: prometheus.NewCounter(
+			prometheus.CounterOpts{
+				Name: "realtime_presence_disconnect_total",
+				Help: "Total OnDisconnect events recorded by the realtime presence tracker.",
+			},
+		),
+		Touch: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "realtime_presence_touch_total",
+				Help: "Total Touch invocations on the realtime presence tracker, by result (ok|lapsed|error).",
+			},
+			[]string{"result"},
+		),
+		OnlineUsers: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "realtime_presence_online_users_count",
+				Help: "Current number of online users per tenant.",
+			},
+			[]string{"tenant_id"},
+		),
+	}
+	reg.MustRegister(m.Connect, m.Disconnect, m.Touch, m.OnlineUsers)
+	return m
+}
+
+// observePresenceConnect increments the Connect counter.
+// nil-tolerated so a tracker without metrics keeps working.
+func (m *PresenceMetrics) observePresenceConnect() {
+	if m == nil || m.Connect == nil {
+		return
+	}
+	m.Connect.Inc()
+}
+
+// observePresenceDisconnect increments the Disconnect counter.
+// nil-tolerated.
+func (m *PresenceMetrics) observePresenceDisconnect() {
+	if m == nil || m.Disconnect == nil {
+		return
+	}
+	m.Disconnect.Inc()
+}
+
+// observePresenceTouch increments the Touch counter for the given
+// result. Result values are constrained to the package-private
+// presenceTouchResult* constants.
+func (m *PresenceMetrics) observePresenceTouch(result string) {
+	if m == nil || m.Touch == nil {
+		return
+	}
+	m.Touch.WithLabelValues(result).Inc()
+}
+
+// SetOnlineUsers updates the OnlineUsers gauge for the given tenant.
+// Exposed publicly so Plan 11 Task 10's janitor (in a separate file
+// in this package) can publish authoritative counts without
+// double-counting via per-OnConnect updates. nil-tolerated.
+func (m *PresenceMetrics) SetOnlineUsers(tenantID string, count int) {
+	if m == nil || m.OnlineUsers == nil {
+		return
+	}
+	m.OnlineUsers.WithLabelValues(tenantID).Set(float64(count))
+}

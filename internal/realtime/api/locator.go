@@ -21,4 +21,16 @@ const (
 	// reads this when constructing the Connection so per-conn counters
 	// are wired into the production registry.
 	LocatorConnectionMetrics = "realtime.ConnectionMetrics"
+
+	// LocatorPresenceTracker is the locator key for the realtime
+	// *service.RedisPresenceTracker. The stored value satisfies
+	// api.PresenceTracker. Plan 11 Task 7's HTTP handlers (presence
+	// endpoints + the WS lifecycle's OnConnect/OnDisconnect/Touch
+	// hooks) resolve it through the locator so they don't take a
+	// transitive dependency on internal/realtime/service.
+	//
+	// The tracker is built only when Deps.Redis is non-nil; in
+	// Redis-less test setups the locator entry is absent and the
+	// handler short-circuits to a no-op presence layer.
+	LocatorPresenceTracker = "realtime.PresenceTracker"
 )
