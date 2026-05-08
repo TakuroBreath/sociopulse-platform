@@ -422,30 +422,9 @@ func (g *graph) checkForwardReferences() []Issue {
 			if e.when == "" {
 				continue
 			}
-			refs := extractNodeRefs(e.when)
-			for _, ref := range refs {
-				switch {
-				case ref == id:
-					// Self-reference: the node's answer is available
-					// once the node has been visited. The runtime
-					// guarantees the node fires its `next` evaluation
-					// after the answer is recorded, so a self-ref is
-					// never a forward reference.
-					continue
-				case g.nodes[ref] == nil:
-					out = append(out, Issue{
-						Code:    CodeGraphBadNodeRef,
-						Path:    fmt.Sprintf("/nodes/%s/next/%d/when", id, i),
-						Message: fmt.Sprintf("when-expression on edge %s→%s references unknown node: %s", id, e.to, ref),
-					})
-				default:
-					if _, dominates := dom[id][ref]; !dominates {
-						out = append(out, Issue{
-							Code:    CodeGraphForwardRef,
-							Path:    fmt.Sprintf("/nodes/%s/next/%d/when", id, i),
-							Message: fmt.Sprintf("when-expression on edge %s→%s references %s but %s is not on every path from start", id, e.to, ref, ref),
-						})
-					}
+			for _, ref := range extractNodeRefs(e.when) {
+				if issue, ok := g.validateRef(id, e.to, ref, i, dom); ok {
+					out = append(out, issue)
 				}
 			}
 		}
@@ -453,16 +432,55 @@ func (g *graph) checkForwardReferences() []Issue {
 	return out
 }
 
-// nodeRefRE matches the q<id>.value / q<id>.answered identifier
-// grammar from the DSL whitelist. The leading `\b` boundary keeps
-// the matcher from scooping the trailing characters of a longer
-// identifier (e.g. "myq1.value" must NOT match "q1").
+// validateRef applies the per-reference forward-ref rules. Returns
+// (issue, true) when the reference is bad, (zero, false) when OK.
 //
-// The id grammar is the same character class as the survey-1.0.json
-// node id pattern: `^[a-zA-Z0-9_-]+$`. We also accept the bare
-// identifier prefix (e.g. "q1" with no dot suffix) so a future
-// reference shape can be picked up gracefully.
-var nodeRefRE = regexp.MustCompile(`\b([a-zA-Z][a-zA-Z0-9_-]*)\.(value|answered)\b`)
+// Rules:
+//   - Self-reference is OK: the runtime records the answer for `id`
+//     before evaluating its outgoing edges, so `id.value` inside an
+//     edge of `id` is always defined.
+//   - Reference to an unknown node id → bad-node-reference issue.
+//   - Reference to a node that does NOT dominate `id` → forward-ref
+//     issue (the answer might not exist when the predicate runs).
+func (g *graph) validateRef(id, to, ref string, edgeIdx int, dom map[string]map[string]struct{}) (Issue, bool) {
+	if ref == id {
+		return Issue{}, false
+	}
+	path := fmt.Sprintf("/nodes/%s/next/%d/when", id, edgeIdx)
+	if g.nodes[ref] == nil {
+		return Issue{
+			Code:    CodeGraphBadNodeRef,
+			Path:    path,
+			Message: fmt.Sprintf("when-expression on edge %s→%s references unknown node: %s", id, to, ref),
+		}, true
+	}
+	if _, dominates := dom[id][ref]; !dominates {
+		return Issue{
+			Code:    CodeGraphForwardRef,
+			Path:    path,
+			Message: fmt.Sprintf("when-expression on edge %s→%s references %s but %s is not on every path from start", id, to, ref, ref),
+		}, true
+	}
+	return Issue{}, false
+}
+
+// nodeRefRE matches the q<id>.value / q<id>.answered identifier
+// grammar from the DSL whitelist (§11.3). The leading `\b` boundary
+// keeps the matcher from scooping the trailing characters of a longer
+// identifier (e.g. "myq1.value" must NOT match "q1"); the explicit
+// `q` prefix keeps the matcher from grabbing the spec's other allowed
+// identifier `answer.value` would-have-been-a-false-positive
+// (`answer` is not a node id but DOES end in `.value` syntactically).
+//
+// The id grammar after the `q` prefix is the same character class as
+// the survey-1.0.json node id pattern: `^[a-zA-Z0-9_-]+$`. Project
+// convention: every question node has a `q`-prefixed id.
+//
+// Plan 07 Task 3 (DSL.RealEvaluator) parses identifiers via expr-lang
+// AST walking. Once the validator is wired to consume that, this
+// regex retires — until then, the q-prefix anchor prevents the
+// false-positive flagged in the Task 2 quality review.
+var nodeRefRE = regexp.MustCompile(`\b(q[a-zA-Z0-9_-]*)\.(value|answered)\b`)
 
 // extractNodeRefs returns the unique node ids referenced from the
 // given expression. Order is alphabetical so the issue list stays

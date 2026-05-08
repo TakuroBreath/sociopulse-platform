@@ -151,7 +151,7 @@ func TestGraphValidator_Cases(t *testing.T) {
                 "primary_mode": "flow",
                 "nodes": [
                     {"id": "start", "kind": "start",
-                     "next": [{"to": "e", "when": "phantom.value == \"x\""}]},
+                     "next": [{"to": "e", "when": "q_phantom.value == \"x\""}]},
                     {"id": "e", "kind": "success-end"}
                 ]
             }`,
