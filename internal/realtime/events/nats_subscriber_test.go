@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -123,8 +124,8 @@ func (b *fakeBus) Queues() []string {
 // token) are used by the dispatcher's subject patterns; we do not
 // emulate ">" terminal wildcards because no current pattern uses one.
 func natsSubjectMatch(pattern, subject string) bool {
-	pp := splitDot(pattern)
-	sp := splitDot(subject)
+	pp := strings.Split(pattern, ".")
+	sp := strings.Split(subject, ".")
 	if len(pp) != len(sp) {
 		return false
 	}
@@ -137,21 +138,6 @@ func natsSubjectMatch(pattern, subject string) bool {
 		}
 	}
 	return true
-}
-
-func splitDot(s string) []string {
-	out := []string{}
-	cur := ""
-	for _, r := range s {
-		if r == '.' {
-			out = append(out, cur)
-			cur = ""
-			continue
-		}
-		cur += string(r)
-	}
-	out = append(out, cur)
-	return out
 }
 
 // hubBroadcastRecorder captures Hub.Broadcast invocations.
@@ -570,8 +556,7 @@ func TestNATSSubscriber_ConcurrentDispatchRaceClean(t *testing.T) {
 	var wg sync.WaitGroup
 	for range goroutines {
 		wg.Go(func() {
-			for j := range messagesEach {
-				_ = j
+			for range messagesEach {
 				require.NoError(t, bus.Fire("tenant.X.dialer.queue", []byte(`{}`)))
 			}
 		})

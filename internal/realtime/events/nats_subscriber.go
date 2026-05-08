@@ -71,8 +71,10 @@ type subjectPattern struct {
 
 // NewNATSSubscriber constructs a dispatcher.
 //
-// bus and hub MUST be non-nil. logger nil-safe (defaults to
-// zap.NewNop). metrics nil-safe (every observe* helper short-circuits
+// bus and hub MUST be non-nil — passing nil for either PANICS at
+// construction time. These are wiring bugs that we want to surface at
+// boot rather than at first message dispatch. logger nil-safe (defaults
+// to zap.NewNop). metrics nil-safe (every observe* helper short-circuits
 // on nil).
 func NewNATSSubscriber(bus eventbus.Subscriber, hub HubBroadcaster, logger *zap.Logger, metrics *Metrics, opts ...Option) *NATSSubscriber {
 	if bus == nil {
