@@ -2,19 +2,18 @@
 // HTTP/WS/gRPC server.
 //
 // run() is the composition root: it loads configuration, builds telemetry
-// (logger, tracer, metrics), opens infrastructure clients (DB, Redis, NATS —
-// stubbed until Plan 03/04), constructs the module Deps struct, registers
-// every Module in dependency order, starts the HTTP and metrics listeners,
-// runs platform-wide background goroutines (the outbox relay), then waits on
-// SIGINT/SIGTERM to drive graceful shutdown.
+// (logger, tracer, metrics), opens infrastructure clients (DB, Redis, NATS),
+// constructs the module Deps struct, registers every Module in dependency
+// order, starts the HTTP and metrics listeners, runs platform-wide
+// background goroutines (the outbox relay + realtime dispatcher), then
+// waits on SIGINT/SIGTERM to drive graceful shutdown.
 //
-// Subsequent plans plug into this skeleton:
-//   - Plan 03 Task 6 (this commit): outbox relay wired with a noop
-//     eventbus.Publisher; the relay drains event_outbox to that publisher
-//     until Plan 04 swaps in the real NATS-backed Publisher.
-//   - Plan 04+: each business module's Register() runs inside this run() —
-//     they receive the same Deps and mount their handlers on the gin
-//     engine via Deps.HTTPRouter.
+// Plan 11 Task 4c (this version) wires the real JetStream Publisher +
+// Subscriber + the realtime Hub + dispatcher. The bring-up is best-effort:
+// when NATS is unreachable the publisher falls back to noopPublisher, the
+// dispatcher is skipped, and the gateway remains useful for /healthz /
+// /readyz / /metrics. The realtime Hub is built unconditionally so future
+// modules can resolve it via the locator even with no NATS.
 package main
 
 import (
@@ -27,6 +26,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
@@ -34,8 +34,12 @@ import (
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
 	"github.com/sociopulse/platform/internal/modules"
+	"github.com/sociopulse/platform/internal/realtime"
+	rtapi "github.com/sociopulse/platform/internal/realtime/api"
+	rtevents "github.com/sociopulse/platform/internal/realtime/events"
 	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/pkg/config"
+	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/observability"
 	"github.com/sociopulse/platform/pkg/outbox"
 )
@@ -165,6 +169,65 @@ func run(ctx context.Context, configDir string) error {
 		defer func() { _ = rdb.Close() }()
 	}
 
+	// 6b. NATS. Best-effort (mirrors Redis): a connection failure logs
+	//     a WARN, the publisher falls back to noopPublisher, and the
+	//     realtime dispatcher is skipped. Boot proceeds either way.
+	//     URLs are redacted for log safety (mirrors redactDSN); only
+	//     the host:port pair surfaces in info-level logs.
+	natsPub, natsSub, natsErr := openNATS(ctx, cfg, logger)
+	var (
+		publisher  eventbus.Publisher
+		subscriber eventbus.Subscriber
+	)
+	switch {
+	case natsErr != nil:
+		logger.Warn("nats unreachable; falling back to noop publisher/subscriber",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+			zap.Error(natsErr),
+		)
+		publisher = newNoopPublisher(logger.Named("eventbus"))
+		subscriber = newNoopSubscriber(logger.Named("eventbus"))
+	default:
+		logger.Info("nats publisher + subscriber up",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+		)
+		publisher = natsPub
+		subscriber = natsSub
+		// Healthz: only register the NATS check when we actually have
+		// a real connection; the noop fallback would always report OK
+		// and mask a misconfiguration.
+		checks = append(checks, healthchecks.NATSCheck{Conn: natsPub})
+	}
+	// Lifecycle ordering — drain in REVERSE of construction. The Hub
+	// shutdown defer below MUST run BEFORE these so it gets a clean
+	// shot at closing every WS connection while the dispatcher is
+	// still consuming. With Go's LIFO defer order, defining these
+	// drains before the Hub-shutdown defer (which we add below in
+	// step 9) gives us:
+	//
+	//   defer subscriber.Close()   // runs LAST (drained 4th)
+	//   defer publisher.Close()    // runs LAST-1 (drained 3rd)
+	//   defer dispatcher.Stop()    // runs LAST-2 (drained 2nd)
+	//   defer realtimeModule.Stop()// runs FIRST after Hub close
+	//   ...                        // ↑ Hub.Shutdown closes WS conns
+	//
+	// The errgroup's shutdown goroutine drains the HTTP server first;
+	// this defer chain handles the NATS path explicitly.
+	if natsPub != nil {
+		defer func() {
+			if err := natsPub.Close(); err != nil {
+				logger.Warn("nats publisher close", zap.Error(err))
+			}
+		}()
+	}
+	if natsSub != nil {
+		defer func() {
+			if err := natsSub.Close(); err != nil {
+				logger.Warn("nats subscriber close", zap.Error(err))
+			}
+		}()
+	}
+
 	// 7. HTTP server (gin engine + middleware + health endpoints). The engine
 	//    is also stashed back on Deps so module Register() can mount routes.
 	httpSrv, engine := buildHTTPServer(cfg, logger, tracer, metrics, checks) //nolint:contextcheck // server inherits ctx via gin handlers, not caller
@@ -174,11 +237,10 @@ func run(ctx context.Context, configDir string) error {
 	//    dependent lookups (e.g. tenancy → auth → dialer) work the
 	//    moment Module.Register starts being called.
 	//
-	//    EventBus is the noop publisher until Plan 04 wires NATS — it lets
-	//    the outbox relay run end-to-end (drain rows, mark them published)
-	//    without a NATS cluster being available. Modules that need NATS
-	//    publishing today should wait for Plan 04.
-	publisher := newNoopPublisher(logger.Named("eventbus"))
+	//    EventBus is the real NATS publisher when available; otherwise
+	//    the noop publisher. Subscriber follows the same fallback so
+	//    realtime.Module.Register can reject a nil Subscriber as a
+	//    composition-root wiring bug.
 	locator := modules.NewMapLocator()
 	deps := modules.Deps{
 		Ctx:        ctx,
@@ -187,19 +249,22 @@ func run(ctx context.Context, configDir string) error {
 		Pool:       pool,
 		Redis:      rdb,
 		EventBus:   publisher,
+		Subscriber: subscriber,
 		HTTPRouter: engine,
 		Locator:    locator,
 	}
 
 	// 9. Module registry. Order matters — telephony registers the
 	//    placeholder CommandPublisher under telephony.LocatorCommandPublisher
-	//    before dialer.Register looks it up. The dialer module is the
-	//    final consumer and degrades gracefully when its optional deps
-	//    (Redis, telephony, tenancy) are missing.
+	//    before dialer.Register looks it up. realtime is registered
+	//    AFTER dialer so any future module that wants to look up the
+	//    realtime Hub via Deps.Locator can do so.
 	dialerModule := &dialer.Module{}
+	realtimeModule := realtime.New(realtime.Config{Registerer: metrics.Registry})
 	registry := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
+		realtimeModule,
 	}}
 	if err := registerModules(registry, deps, logger, redisErr); err != nil {
 		return err
@@ -207,6 +272,58 @@ func run(ctx context.Context, configDir string) error {
 	defer func() {
 		if err := dialerModule.Stop(); err != nil {
 			logger.Warn("dialer module Stop failed", zap.Error(err))
+		}
+	}()
+
+	// 9b. Realtime dispatcher. Built ONLY when a real NATS subscriber
+	//     is available — the noop subscriber would silently drop every
+	//     message, so spawning the dispatcher against it wastes a
+	//     goroutine and clutters the logs. Plan 11 gotcha at line 97:
+	//     the dispatcher MUST live in cmd/api (NOT in
+	//     realtime.Module.Register) so its Start/Stop is errgroup-driven.
+	var dispatcher *rtevents.NATSSubscriber
+	if natsSub != nil {
+		hubVal, ok := locator.Lookup(rtapi.LocatorHub)
+		if !ok {
+			logger.Warn("realtime Hub missing from locator — dispatcher skipped")
+		} else if hub, ok := hubVal.(rtevents.HubBroadcaster); !ok {
+			logger.Warn("realtime Hub registered with wrong type — dispatcher skipped",
+				zap.String("got_type", fmt.Sprintf("%T", hubVal)),
+			)
+		} else {
+			eventsMetrics := rtevents.RegisterMetrics(metrics.Registry)
+			dispatcher = rtevents.NewNATSSubscriber(
+				natsSub,
+				hub,
+				logger.Named("realtime.dispatcher"),
+				eventsMetrics,
+				rtevents.WithReplicaID(uuid.NewString()),
+			)
+		}
+	} else {
+		logger.Info("realtime dispatcher skipped: NATS subscriber unavailable")
+	}
+	// Defer chain — declarations in REVERSE shutdown order (LIFO).
+	// Spec ordering: httpSrv.Shutdown → Hub.Shutdown → dispatcher.Stop
+	// → subscriber.Close → publisher.Close.
+	//
+	// HTTP shutdown happens inside the errgroup goroutine on
+	// gctx.Done; once g.Wait() returns the defers below fire LIFO:
+	//
+	//   defer realtimeModule.Stop  → fires FIRST  (Hub.Shutdown)
+	//   defer dispatcher.Stop      → fires SECOND
+	//   (existing) natsSub.Close   → fires THIRD  (drains subscriber)
+	//   (existing) natsPub.Close   → fires FOURTH (drains publisher)
+	if dispatcher != nil {
+		defer func() {
+			if err := dispatcher.Stop(); err != nil {
+				logger.Warn("realtime dispatcher Stop failed", zap.Error(err))
+			}
+		}()
+	}
+	defer func() {
+		if err := realtimeModule.Stop(); err != nil {
+			logger.Warn("realtime module Stop failed", zap.Error(err))
 		}
 	}()
 
@@ -251,6 +368,20 @@ func run(ctx context.Context, configDir string) error {
 			if err := relay.Run(gctx); err != nil {
 				return fmt.Errorf("outbox relay: %w", err)
 			}
+			return nil
+		})
+	}
+	if dispatcher != nil {
+		// Dispatcher.Start is synchronous — it registers every subject
+		// pattern with the bus and returns. The push-consumer
+		// goroutines are owned by the underlying nats.go subscriber;
+		// our errgroup goroutine just waits on gctx so the goroutine
+		// exits with the rest at shutdown.
+		g.Go(func() error {
+			if err := dispatcher.Start(gctx); err != nil {
+				return fmt.Errorf("realtime dispatcher start: %w", err)
+			}
+			<-gctx.Done()
 			return nil
 		})
 	}

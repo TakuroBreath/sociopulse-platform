@@ -140,6 +140,78 @@ func (p *NATSPublisher) Publish(ctx context.Context, subject string, payload []b
 	return nil
 }
 
+// Healthy reports whether the publisher's underlying NATS connection
+// is currently usable. Returns nil when the connection is CONNECTED;
+// returns a wrapped error otherwise (closed publisher, dropped
+// connection, in-flight reconnect). Used by the /readyz NATSCheck so
+// the gateway surfaces "NATS unreachable" without waiting for a
+// publish to fail.
+//
+// Healthy does NOT issue a wire round-trip — it inspects the local
+// connection state. This keeps the readiness probe O(µs) and avoids
+// adding broker load on every probe tick.
+func (p *NATSPublisher) Healthy() error {
+	if p == nil {
+		return fmt.Errorf("pkg/eventbus: healthy: %w", errClosed)
+	}
+	p.closeMu.Lock()
+	closed := p.closed
+	p.closeMu.Unlock()
+	if closed {
+		return fmt.Errorf("pkg/eventbus: healthy: %w", errClosed)
+	}
+	if p.nc == nil || !p.nc.IsConnected() {
+		return fmt.Errorf("pkg/eventbus: healthy: nats not connected (status=%d)", natsStatus(p.nc))
+	}
+	return nil
+}
+
+// IsConnected reports whether the underlying *nats.Conn is currently
+// in CONNECTED state. Mirrors the nats.go method of the same name so a
+// *NATSPublisher value can be passed directly to healthz.NATSCheck
+// (which only needs IsConnected + Status). nil-safe (returns false).
+func (p *NATSPublisher) IsConnected() bool {
+	if p == nil || p.nc == nil {
+		return false
+	}
+	p.closeMu.Lock()
+	closed := p.closed
+	p.closeMu.Unlock()
+	if closed {
+		return false
+	}
+	return p.nc.IsConnected()
+}
+
+// Status returns the underlying *nats.Conn status as an int. The
+// numeric values match the nats.Status enum (0=DISCONNECTED,
+// 1=CONNECTED, 2=CLOSED, 3=RECONNECTING, 4=CONNECTING). Used by
+// healthz.NATSCheck to embed the state in its error message. nil-safe
+// (returns nats.CLOSED).
+func (p *NATSPublisher) Status() int {
+	return natsStatus(p.connOrNil())
+}
+
+// connOrNil returns the underlying connection or nil for the
+// nil-receiver case so accessors above don't have to inline the nil
+// guard repeatedly.
+func (p *NATSPublisher) connOrNil() *nats.Conn {
+	if p == nil {
+		return nil
+	}
+	return p.nc
+}
+
+// natsStatus returns the underlying connection status as an int (or
+// nats.CLOSED when the conn is nil) so callers can include it in
+// diagnostic error messages without importing nats.go.
+func natsStatus(nc *nats.Conn) int {
+	if nc == nil {
+		return int(nats.CLOSED)
+	}
+	return int(nc.Status())
+}
+
 // Close drains the publisher and closes the underlying connection.
 // Safe to call multiple times — subsequent calls are no-ops.
 //

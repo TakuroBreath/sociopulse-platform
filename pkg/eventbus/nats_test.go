@@ -789,3 +789,110 @@ func TestWaitForConnected_AlreadyClosed(t *testing.T) {
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "connection closed before reaching CONNECTED")
 }
+
+// TestNATSPublisher_HealthyOK validates Healthy() returns nil while the
+// underlying NATS connection is in CONNECTED state. Mirrors the
+// NATSCheck contract used by /readyz: the publisher exposes a single
+// method that reports liveness without doing a wire round-trip.
+func TestNATSPublisher_HealthyOK(t *testing.T) {
+	t.Parallel()
+
+	url := startEmbeddedJetStream(t)
+	pub, err := NewNATSPublisher(t.Context(), []string{url}, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pub.Close() })
+
+	require.NoError(t, pub.Healthy())
+}
+
+// TestNATSPublisher_HealthyAfterClose verifies Healthy() returns an
+// error after the publisher has been Close'd.
+func TestNATSPublisher_HealthyAfterClose(t *testing.T) {
+	t.Parallel()
+
+	url := startEmbeddedJetStream(t)
+	pub, err := NewNATSPublisher(t.Context(), []string{url}, "")
+	require.NoError(t, err)
+
+	require.NoError(t, pub.Close())
+
+	err = pub.Healthy()
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrClosed)
+}
+
+// TestNATSPublisher_HealthyNilReceiver verifies Healthy() handles the
+// nil receiver — same nil-tolerated pattern as Publish/Close.
+func TestNATSPublisher_HealthyNilReceiver(t *testing.T) {
+	t.Parallel()
+
+	var pub *NATSPublisher
+	err := pub.Healthy()
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrClosed)
+}
+
+// TestNATSPublisher_IsConnectedAndStatus verifies the IsConnected/
+// Status accessors satisfy the healthz.NATSCheck contract. They are
+// the bridge into checks.NATSCheck so cmd/api can wire the publisher
+// directly without importing pkg/eventbus from the healthz package.
+func TestNATSPublisher_IsConnectedAndStatus(t *testing.T) {
+	t.Parallel()
+
+	url := startEmbeddedJetStream(t)
+	pub, err := NewNATSPublisher(t.Context(), []string{url}, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pub.Close() })
+
+	require.True(t, pub.IsConnected())
+	require.Equal(t, int(nats.CONNECTED), pub.Status())
+
+	require.NoError(t, pub.Close())
+	require.False(t, pub.IsConnected())
+
+	var nilPub *NATSPublisher
+	require.False(t, nilPub.IsConnected())
+	require.Equal(t, int(nats.CLOSED), nilPub.Status())
+}
+
+// TestNATSPublisher_HealthyAfterServerShutdown verifies Healthy()
+// flips to error once the broker disappears. Used by /readyz to
+// surface "NATS unreachable" without waiting for a publish to fail.
+func TestNATSPublisher_HealthyAfterServerShutdown(t *testing.T) {
+	t.Parallel()
+
+	storeDir := filepath.Join(t.TempDir(), "jetstream")
+	opts := &server.Options{
+		Host:                  "127.0.0.1",
+		Port:                  -1,
+		NoLog:                 true,
+		NoSigs:                true,
+		MaxControlLine:        4096,
+		DisableShortFirstPing: true,
+		JetStream:             true,
+		StoreDir:              storeDir,
+	}
+	srv, err := server.NewServer(opts)
+	require.NoError(t, err)
+	go srv.Start()
+	require.True(t, srv.ReadyForConnections(5*time.Second))
+
+	pub, err := NewNATSPublisher(t.Context(), []string{srv.ClientURL()}, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pub.Close() })
+
+	require.NoError(t, pub.Healthy())
+
+	srv.Shutdown()
+	srv.WaitForShutdown()
+
+	// Poll because nats.go's reconnection state flips asynchronously.
+	// awaitOK retries until fn returns nil; we want "Healthy reports
+	// an error" to be the success condition, so we invert the sense.
+	awaitOK(t, 2*time.Second, func() error {
+		if pub.Healthy() == nil {
+			return errors.New("publisher still reports healthy")
+		}
+		return nil
+	})
+}
