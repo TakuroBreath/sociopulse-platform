@@ -224,10 +224,22 @@ func run(ctx context.Context, opts runOptions) error {
 		return errors.New("telephony.bridge.fs_nodes must list at least one FreeSWITCH ESL endpoint")
 	}
 
-	// 8. Telephony subsystems — Task 1 stubs; Tasks 2-6 fill the bodies.
+	// 8. Telephony subsystems — Task 4 (pool) is real; Tasks 5/6 still
+	//    fill the router + nats_bridge bodies.
+	//
+	//    HealthcheckInterval comes from cfg.Telephony.Bridge — operators
+	//    tune it per-environment via Helm values. Zero falls back to the
+	//    pool's 5s default (declared in internal/telephony/pool/pool.go).
+	//
+	//    Metrics are registered against the shared *prometheus.Registry
+	//    so /metrics exposes both the cross-cutting collectors and the
+	//    telephony-pool series under the same scrape.
+	poolMetrics := pool.RegisterMetrics(metrics.Registry)
 	eslPool, err := pool.New(ctx, pool.Config{
-		Nodes:  fsNodes,
-		Logger: logger.Named("pool"),
+		Nodes:          fsNodes,
+		HealthInterval: cfg.Telephony.Bridge.HealthcheckInterval,
+		Logger:         logger.Named("pool"),
+		Metrics:        poolMetrics,
 	})
 	if err != nil {
 		return fmt.Errorf("init esl pool: %w", err)
