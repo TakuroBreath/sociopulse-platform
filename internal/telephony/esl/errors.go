@@ -51,9 +51,4 @@ var (
 	// frame, etc.). Reserved for cases the protocol guarantees will not
 	// occur on a healthy server.
 	ErrInvalidFrame = errors.New("esl: invalid frame")
-
-	// ErrClosed is returned by Close() callers that observe the client has
-	// already terminated (currently surfaced only via channel-closure on
-	// Events()). Close() itself is idempotent and returns nil.
-	ErrClosed = errors.New("esl: client closed")
 )

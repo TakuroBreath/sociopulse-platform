@@ -149,3 +149,34 @@ func TestMapEvent_HeadersPropagated(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, "+79991234567", ev.Headers["caller-caller-id-number"])
 }
+
+// TestMapEvent_HeadersAreCloned proves IMPORTANT-2: the Headers map
+// returned in api.ChannelEvent must be a clone of the parser's
+// internal Event.headers — mutating the returned map MUST NOT affect
+// subsequent MapEvent invocations on the same source Event.
+func TestMapEvent_HeadersAreCloned(t *testing.T) {
+	t.Parallel()
+	src := makeEvent("CHANNEL_CREATE", uuid.New().String(), map[string]string{
+		"caller-caller-id-number": "+79991234567",
+	})
+
+	first, ok := MapEvent(src)
+	require.True(t, ok)
+	require.Equal(t, "+79991234567", first.Headers["caller-caller-id-number"])
+
+	// Mutate the consumer-facing Headers map. The parser's internal
+	// state and any FUTURE MapEvent call on the same source Event must
+	// be unaffected.
+	first.Headers["caller-caller-id-number"] = "MUTATED"
+	first.Headers["new-key"] = "injected"
+
+	second, ok := MapEvent(src)
+	require.True(t, ok)
+	require.Equal(t, "+79991234567", second.Headers["caller-caller-id-number"],
+		"second MapEvent must not see the consumer's mutation")
+	_, hasNew := second.Headers["new-key"]
+	require.False(t, hasNew, "second MapEvent must not see consumer-injected key")
+
+	// And the source Event's own Header() lookup is also unaffected.
+	require.Equal(t, "+79991234567", src.Header("caller-caller-id-number"))
+}

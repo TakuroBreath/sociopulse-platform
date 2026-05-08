@@ -23,19 +23,29 @@ const (
 	// when the consumer is briefly slow.
 	defaultEventBuffer = 1024
 
-	// defaultReplyBuffer is the replies channel capacity. Inflight
-	// commands are serialised by Client.mu, so capacity 16 only matters
-	// when the readLoop sees replies the caller has already given up on
-	// (ctx cancelled mid-flight). Drop-on-full keeps readLoop responsive.
+	// defaultReplyBuffer is the replies channel capacity. cmdMu
+	// serialises sendCommand end-to-end (write+flush+receive-reply is
+	// one critical section), so at any instant exactly one caller is
+	// waiting on this chan. Capacity 16 leaves headroom for replies that
+	// arrive after the caller's ctx fired — sendCommand non-blockingly
+	// drains a stale reply on its way out so the next caller starts
+	// from an empty chan. Capacity 1 would also be correct.
 	defaultReplyBuffer = 16
 
 	// defaultConnectTimeout caps DialContext on the initial TCP connect.
 	defaultConnectTimeout = 10 * time.Second
 
 	// defaultReadTimeout is the inactivity deadline applied to readLoop.
-	// We add 30s slack on top so that an FS HEARTBEAT (default 20s
-	// interval) doesn't trip a false disconnect.
+	// readLoop adds readDeadlineSlack on top so an FS HEARTBEAT (default
+	// 20s interval) does not trip a false disconnect.
 	defaultReadTimeout = 60 * time.Second
+
+	// readDeadlineSlack is the conservative grace period added to
+	// Config.ReadTimeout when computing the per-frame read deadline.
+	// FreeSWITCH HEARTBEAT events fire every 20s by default; the slack
+	// ensures a transient HEARTBEAT delay does not trip a false
+	// disconnect on an otherwise healthy socket.
+	readDeadlineSlack = 30 * time.Second
 )
 
 // Config configures Dial. All fields are optional; defaults() fills the
@@ -55,8 +65,10 @@ type Config struct {
 	ConnectTimeout time.Duration
 
 	// ReadTimeout is the per-frame inactivity deadline applied during
-	// readLoop. Zero uses defaultReadTimeout. Set negative to disable
-	// (not recommended outside tests).
+	// readLoop. The effective socket deadline is ReadTimeout +
+	// readDeadlineSlack so an FS HEARTBEAT (default 20s) doesn't trip
+	// a false disconnect. Zero uses defaultReadTimeout. Set negative
+	// to disable (not recommended outside tests).
 	ReadTimeout time.Duration
 
 	// Logger is the zap logger used for warn/info/debug messages from
@@ -97,8 +109,13 @@ func (c *Config) defaults() {
 //
 // Concurrency:
 //   - Close() is idempotent and goroutine-safe via the closed atomic.Bool.
-//   - sendCommand serialises writes through mu; only one inflight command
-//     at a time per Client.
+//     Both the success and CAS-fail paths block on readLoopDone so callers
+//     can rely on goroutine quiescence after Close() returns.
+//   - sendCommand holds cmdMu for the entire write+flush+receive-reply
+//     critical section. The protocol guarantees replies arrive in the
+//     same order commands are issued, but the shared replies chan is
+//     only safe for one waiter at a time — without this discipline a
+//     concurrent caller could "steal" the prior caller's reply.
 //   - readLoop is the SOLE writer to events and replies. It also
 //     exclusively closes events on exit. No other goroutine touches
 //     these channels' close state.
@@ -106,11 +123,14 @@ func (c *Config) defaults() {
 //     observed; callers needing strict guarantees should compose with
 //     <-Done() (not exposed here — Task 4 may add).
 type Client struct {
-	cfg       Config
-	conn      net.Conn
-	reader    *bufio.Reader
-	writer    *bufio.Writer
-	writeMu   sync.Mutex // serialises sendCommand writes
+	cfg    Config
+	conn   net.Conn
+	reader *bufio.Reader
+	writer *bufio.Writer
+	// cmdMu serialises sendCommand end-to-end: write+flush+receive-reply
+	// is one critical section. Holding the lock across the wait-for-reply
+	// is what prevents reply-stealing on the shared replies chan.
+	cmdMu     sync.Mutex
 	connected atomic.Bool
 	closed    atomic.Bool
 
@@ -226,10 +246,21 @@ func (c *Client) Events() <-chan Event {
 }
 
 // Close shuts the TCP connection and waits for readLoop to drain.
-// Idempotent — every call after the first returns nil. Safe to call from
-// any goroutine.
+// Idempotent — every call after the first returns nil. Safe to call
+// from any goroutine.
+//
+// Both branches converge on the invariant "Close() unblocks only
+// after readLoop has fully exited": the CAS-success path closes the
+// conn and then blocks on readLoopDone; the CAS-fail path (someone
+// else — typically dispatch's disconnect-notice handler — already
+// flipped closed) also blocks on readLoopDone, so callers can rely
+// on goroutine quiescence regardless of who won the CAS race.
 func (c *Client) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
+		// Another path (dispatch on disconnect-notice, or a concurrent
+		// Close()) already set closed=true. Wait for readLoop to exit
+		// so the caller's goroutine-quiescence expectation still holds.
+		<-c.readLoopDone
 		return nil
 	}
 	c.connected.Store(false)
@@ -261,10 +292,9 @@ func (c *Client) readLoop() {
 
 	for {
 		if c.cfg.ReadTimeout > 0 {
-			// Conservative slack on top of ReadTimeout: FS HEARTBEAT
-			// every 20s keeps the socket alive; a true network hang
-			// will trip the deadline + 30s slack.
-			_ = c.conn.SetReadDeadline(time.Now().Add(c.cfg.ReadTimeout + 30*time.Second))
+			// FS HEARTBEAT every 20s keeps the socket alive; a true
+			// network hang trips ReadTimeout + readDeadlineSlack.
+			_ = c.conn.SetReadDeadline(time.Now().Add(c.cfg.ReadTimeout + readDeadlineSlack))
 		}
 
 		frame, err := parseFrame(c.reader)
@@ -328,12 +358,14 @@ func (c *Client) dispatch(frame Frame) {
 		c.cfg.Logger.Info("esl disconnect notice",
 			zap.String("addr", c.cfg.Addr),
 		)
-		// Returning nothing here would just continue the loop; we want
-		// to mirror FS's intent and tear down. Setting closed → true
-		// makes the next parseFrame loop iteration's read fail (or the
-		// already-pending Close() complete cleanly).
-		c.closed.Store(true)
-		_ = c.conn.Close()
+		// Mirror FS's intent and tear down. Use CAS rather than Store so
+		// the invariant "exactly one path drives shutdown" holds — if
+		// the caller's Close() raced ahead and won the CAS, it already
+		// closed the conn and we must NOT close it again. The CAS-loser
+		// just lets readLoop's natural EOF path drive the rest.
+		if c.closed.CompareAndSwap(false, true) {
+			_ = c.conn.Close()
+		}
 
 	default:
 		c.cfg.Logger.Warn("esl unknown content-type",
@@ -343,13 +375,19 @@ func (c *Client) dispatch(frame Frame) {
 	}
 }
 
-// sendCommand writes line + the ESL terminator to the wire and waits for
-// the next reply (command/reply or api/response). Concurrent
-// sendCommand calls serialise on c.writeMu — one inflight command per
-// Client, matching the protocol's reply-by-arrival semantics.
+// sendCommand writes line + the ESL terminator to the wire and waits
+// for the next reply (command/reply or api/response). Concurrent
+// callers serialise on cmdMu for the ENTIRE send+wait window — one
+// inflight command per Client, matching the protocol's
+// reply-by-arrival semantics.
 //
-// The supplied ctx bounds the wait for a reply. Cancellation surfaces as
-// ErrTimeout. Disconnection mid-wait surfaces as ErrNotConnected.
+// The supplied ctx bounds the wait for a reply. Cancellation surfaces
+// as ErrTimeout. Disconnection mid-wait surfaces as ErrNotConnected.
+//
+// On ctx-cancel, sendCommand drains a stale reply that may arrive
+// after-the-fact before releasing the lock. Without that drain the
+// next caller would block on its own select and pick up the prior
+// caller's late reply (CRITICAL-1 in the Plan 09 review).
 //
 //nolint:unused // wired by Task 3 (high-level commands: Originate, Hangup, MixMonitor, Play, SofiaStatus).
 func (c *Client) sendCommand(ctx context.Context, line string) (Frame, error) {
@@ -360,18 +398,25 @@ func (c *Client) sendCommand(ctx context.Context, line string) (Frame, error) {
 	verb := commandVerb(line)
 	start := time.Now()
 
-	c.writeMu.Lock()
+	c.cmdMu.Lock()
+	defer c.cmdMu.Unlock()
+
+	// Re-check connectedness under the lock: the previous caller may
+	// have observed a disconnect mid-wait and returned ErrNotConnected,
+	// but readLoop's teardown is asynchronous from us.
+	if !c.Connected() {
+		c.recordCommand(verb, "err", time.Since(start))
+		return Frame{}, ErrNotConnected
+	}
+
 	if _, err := fmt.Fprintf(c.writer, "%s\r\n\r\n", line); err != nil {
-		c.writeMu.Unlock()
 		c.recordCommand(verb, "err", time.Since(start))
 		return Frame{}, fmt.Errorf("write: %w", err)
 	}
 	if err := c.writer.Flush(); err != nil {
-		c.writeMu.Unlock()
 		c.recordCommand(verb, "err", time.Since(start))
 		return Frame{}, fmt.Errorf("flush: %w", err)
 	}
-	c.writeMu.Unlock()
 
 	select {
 	case f, ok := <-c.replies:
@@ -382,6 +427,13 @@ func (c *Client) sendCommand(ctx context.Context, line string) (Frame, error) {
 		c.recordCommand(verb, "ok", time.Since(start))
 		return f, nil
 	case <-ctx.Done():
+		// Drain a stale reply that may have raced past our select.
+		// readLoop publishes on c.replies asynchronously; without this
+		// drain the NEXT caller would receive our reply.
+		select {
+		case <-c.replies:
+		default:
+		}
 		c.recordCommand(verb, "timeout", time.Since(start))
 		return Frame{}, ErrTimeout
 	case <-c.readLoopDone:

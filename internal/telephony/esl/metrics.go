@@ -38,14 +38,18 @@ type Metrics struct {
 	ReconnectsTotal *prometheus.CounterVec
 }
 
-// RegisterMetrics builds a fresh *Metrics and registers every collector on
-// the supplied registerer. The caller owns the registerer's lifetime — a
-// typical wiring is `metrics.Registry` from pkg/observability, but tests
-// pass `prometheus.NewRegistry()`.
+// RegisterMetrics builds a fresh *Metrics and registers every collector
+// on the supplied registerer. The caller owns the registerer's lifetime
+// — a typical wiring is `metrics.Registry` from pkg/observability, but
+// tests pass `prometheus.NewRegistry()`.
 //
-// Panics on duplicate registration; this surfaces wiring mistakes loudly
-// during boot rather than silently dropping metrics.
+// reg must be non-nil; a nil registerer is a wiring error and panics
+// here so the failure surfaces at boot instead of at first metric
+// emission. Panics also on duplicate registration for the same reason.
 func RegisterMetrics(reg prometheus.Registerer) *Metrics {
+	if reg == nil {
+		panic("esl.RegisterMetrics: reg must be non-nil; pass prometheus.NewRegistry() in tests")
+	}
 	m := &Metrics{
 		Connected: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{

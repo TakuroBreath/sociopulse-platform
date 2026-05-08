@@ -1,6 +1,7 @@
 package esl
 
 import (
+	"maps"
 	"strconv"
 	"time"
 
@@ -32,10 +33,15 @@ func MapEvent(ev Event) (api.ChannelEvent, bool) {
 		return api.ChannelEvent{}, false
 	}
 
+	// Clone the per-event header bag so consumers cannot mutate parser
+	// internals — the Event value is intended to be immutable from the
+	// caller's perspective, and aliasing the underlying map would let a
+	// downstream component corrupt subsequent MapEvent invocations on
+	// the same Event.
 	out := api.ChannelEvent{
 		Type:      t,
 		Timestamp: parseEventTimestamp(ev),
-		Headers:   ev.headers,
+		Headers:   maps.Clone(ev.headers),
 	}
 
 	if ev.UUID != "" {
