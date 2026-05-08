@@ -17,10 +17,11 @@
 package router
 
 import (
-	"errors"
 	"math/rand/v2"
 	"sort"
 	"sync/atomic"
+
+	"github.com/sociopulse/platform/internal/telephony/api"
 )
 
 // Trunk is a SIP trunk picked by a Strategy. Fields mirror what the
@@ -68,10 +69,11 @@ type Trunk struct {
 
 // ErrNoTrunkAvailable is returned by Strategy.Pick (and propagated by
 // Router.Select) when no trunk in the supplied list satisfies the strategy's
-// active-set predicate. errors.Is-friendly: the same sentinel is also
-// declared in internal/telephony/api/errors.go so callers across module
-// boundaries can match without importing this package.
-var ErrNoTrunkAvailable = errors.New("router: no available trunk")
+// active-set predicate. Aliased to api.ErrNoTrunkAvailable so callers
+// across module boundaries — particularly the dialer (Plan 10) which only
+// imports the api package — can match via errors.Is without depending on
+// internal/telephony/router.
+var ErrNoTrunkAvailable = api.ErrNoTrunkAvailable
 
 // Strategy picks a Trunk for a destination phone number. The dest argument is
 // reserved for region-aware strategies (e.g. Russian +7-prefix routing); the
