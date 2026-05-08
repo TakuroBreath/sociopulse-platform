@@ -1,7 +1,6 @@
 package service
 
 import (
-	"errors"
 	"fmt"
 	"strings"
 	"unicode"
@@ -118,10 +117,3 @@ func sanitisePhoneInput(in string) string {
 	}
 	return b.String()
 }
-
-// errPhoneInvalid is reserved for future internal wrapping if we need
-// to discriminate between "input parse failed" and "input not a Russian
-// number" in tests. Today we collapse both under api.ErrInvalidPhone via
-// errors.Is. The blank import keeps `errors` reachable so future code
-// in this file can use it without a churn-y diff.
-var _ = errors.New

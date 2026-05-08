@@ -143,10 +143,11 @@ func (s *RespondentStore) Insert(ctx context.Context, tx postgres.Tx, r api.Resp
 		source,
 	))
 	if err != nil {
-		if terr := translateRespondentErr(err); errors.Is(terr, api.ErrDuplicateRespondent) {
-			return api.Respondent{}, terr
-		}
-		return api.Respondent{}, fmt.Errorf("crm/store: insert respondent: %w", err)
+		// Always run through translateRespondentErr so callers can
+		// errors.Is on every recognised sentinel — wrapping the raw
+		// err on fall-through could hide a future constraint that
+		// translate() learns to map.
+		return api.Respondent{}, fmt.Errorf("crm/store: insert respondent: %w", translateRespondentErr(err))
 	}
 	return saved, nil
 }
@@ -159,10 +160,7 @@ func (s *RespondentStore) GetByID(ctx context.Context, tx postgres.Tx, id uuid.U
 
 	out, err := scanRespondentRow(tx.QueryRow(ctx, q, id))
 	if err != nil {
-		if terr := translateRespondentErr(err); errors.Is(terr, api.ErrRespondentNotFound) {
-			return api.Respondent{}, terr
-		}
-		return api.Respondent{}, fmt.Errorf("crm/store: get respondent by id: %w", err)
+		return api.Respondent{}, fmt.Errorf("crm/store: get respondent by id: %w", translateRespondentErr(err))
 	}
 	return out, nil
 }
@@ -181,10 +179,7 @@ func (s *RespondentStore) GetByHash(ctx context.Context, tx postgres.Tx, tenantI
 
 	out, err := scanRespondentRow(tx.QueryRow(ctx, q, tenantID, projectID, phoneHash))
 	if err != nil {
-		if terr := translateRespondentErr(err); errors.Is(terr, api.ErrRespondentNotFound) {
-			return api.Respondent{}, terr
-		}
-		return api.Respondent{}, fmt.Errorf("crm/store: get respondent by hash: %w", err)
+		return api.Respondent{}, fmt.Errorf("crm/store: get respondent by hash: %w", translateRespondentErr(err))
 	}
 	return out, nil
 }
