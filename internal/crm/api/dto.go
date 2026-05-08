@@ -212,11 +212,27 @@ type CreateRespondentInput struct {
 }
 
 // SearchRespondentsFilter narrows RespondentService.Search.
+//
+// TenantID is mandatory for the store layer (RLS still scopes the
+// query, but the explicit predicate makes the query plan cheaper); the
+// HTTP transport derives it from the JWT claims.
+//
+// PhoneSearch is matched against the masked phone-suffix column (when
+// the project gains one) — for v1 we restrict the search to project +
+// status + region filters, plus an optional Query token that runs
+// against the JSON attributes blob (full_name / external_ref columns
+// when present). Wide-open phone-prefix search is INTENTIONALLY not
+// supported: phone_hash is the only at-rest representation, and
+// hashing is not reversible. Future tasks may add a separate
+// phone-suffix index, but for v1 operators who need a phone-based
+// lookup use Get / GetWithPhone with a known id.
 type SearchRespondentsFilter struct {
+	TenantID    uuid.UUID
 	ProjectID   uuid.UUID
 	Status      *RespondentStatus
 	PhoneSearch string
 	Region      string
+	Query       string
 	Page        int
 	PageSize    int
 }

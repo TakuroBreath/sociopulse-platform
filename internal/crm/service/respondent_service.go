@@ -18,29 +18,36 @@ import (
 )
 
 // respondentTxRunner is the cross-tenant transaction owner the
-// RespondentService uses for write paths. *postgres.Pool satisfies
-// this interface via its WithTenant method; tests substitute an in-
+// RespondentService uses. *postgres.Pool satisfies this interface
+// via its WithTenant + BypassRLS methods; tests substitute an in-
 // memory implementation that invokes fn with a zero postgres.Tx.
 //
 // Defined here at the consumer per project convention (see
-// project_service.go projectTxRunner). RespondentService never opens
-// a BypassRLS tx — every write is per-tenant and the service derives
-// the tenant id from the caller's input.
+// project_service.go projectTxRunner). BypassRLS is used by the
+// Get/GetWithPhone/Delete entry points where the caller supplies an
+// id but not necessarily the tenant — the service then resolves the
+// tenant from the row via a BypassRLS GetByID, then runs the actual
+// per-tenant work through WithTenant so RLS still scopes any joined
+// reads.
 type respondentTxRunner interface {
 	WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error
+	BypassRLS(ctx context.Context, fn func(postgres.Tx) error) error
 }
 
-// RespondentService implements api.RespondentService for the Create
-// path (Plan 06 Task 3). The remaining methods (Get/GetWithPhone/
-// Search/Delete/Import/GetImportStatus) are stubbed to return
-// ErrUnimplemented; Tasks 4-5 fill those in.
+// RespondentService implements api.RespondentService.
+//
+// Plan 06 Task 3 wired the Create path (sync single-add). Task 4 added
+// the async CSV/XLSX import. Task 5 (this commit) fills in
+// Get/GetWithPhone/Search/Delete with the 152-ФЗ subject-rights
+// semantics: 30-day soft-delete grace + admin-only PII reveal.
 //
 // Security boundary: every write goes through KMSResolver.Encrypt for
 // the at-rest phone ciphertext and PhoneHasher.Hash for the
 // indexed-lookup hash. The plaintext phone NEVER lands in the audit
-// payload, the response DTO's Phone field, or any zap logger field —
-// this is enforced by tests (json.Marshal-then-Contains check on the
-// audit row) and by reviewer scrutiny.
+// payload, the response DTO's Phone field (except via the
+// admin-gated GetWithPhone which itself audits the access), or any
+// zap logger field — this is enforced by tests (json.Marshal-then-
+// Contains check on the audit row) and by reviewer scrutiny.
 type RespondentService struct {
 	tx     respondentTxRunner
 	store  api.RespondentStorePort
@@ -59,12 +66,21 @@ type RespondentService struct {
 // Compile-time assertion: *RespondentService must satisfy api.RespondentService.
 var _ api.RespondentService = (*RespondentService)(nil)
 
-// errRespondentUnimplemented is returned by every method that Plan 06
-// Task 3 doesn't implement (Get/GetWithPhone/Search/Delete/Import/
-// GetImportStatus). Tasks 4-5 replace the stub bodies with real ones;
-// until then the service surface stays usable for the Create path
-// without panicking on an unrelated call.
-var errRespondentUnimplemented = errors.New("crm/service: respondent method not implemented in Task 3")
+// deletionGracePeriod is the canonical 152-ФЗ §21 grace window
+// between Delete (soft-delete) and PurgeOlderThan (hard-delete). 30
+// days lets operators reverse an accidental delete; the purge worker
+// runs once a day and removes rows whose deleted_at is past this
+// window. The constant is exported as a package-level so the worker,
+// the service, and tests share one source of truth.
+const deletionGracePeriod = 30 * 24 * time.Hour
+
+// defaultSearchPageSize / maxSearchPageSize are the pagination clamps
+// the Search service applies before calling the store. The values
+// match the Plan 05 conventions for List endpoints.
+const (
+	defaultSearchPageSize = 50
+	maxSearchPageSize     = 500
+)
 
 // NewRespondentService constructs a RespondentService.
 //
@@ -277,24 +293,253 @@ func (s *RespondentService) applyRespondentCreate(ctx context.Context, tx postgr
 	return saved, nil
 }
 
-// Get is stubbed pending Task 4.
-func (s *RespondentService) Get(_ context.Context, _ uuid.UUID) (*api.Respondent, error) {
-	return nil, errRespondentUnimplemented
+// Get implements api.RespondentService.Get. Returns the respondent
+// with the masked phone populated; the plaintext Phone field is left
+// empty so an operator-facing handler cannot accidentally leak it.
+//
+// Resolution order: BypassRLS GetByID picks the row regardless of the
+// caller's tenant context (admin tooling routinely needs this), then
+// the service masks the encrypted phone via the per-tenant decrypt +
+// MaskPhone pipeline. Soft-deleted rows return ErrRespondentDeleted —
+// not ErrRespondentNotFound — so the UI can render "this respondent
+// is pending purge" instead of a generic 404.
+func (s *RespondentService) Get(ctx context.Context, id uuid.UUID) (*api.Respondent, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get respondent: %w", api.ErrInvalidArgument)
+	}
+	row, err := s.lookupRespondent(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if row.DeleteAt != nil {
+		return nil, api.ErrRespondentDeleted
+	}
+	masked, derr := s.maskedPhoneFor(ctx, row)
+	if derr != nil {
+		// Decryption failure must NOT leak details to the caller —
+		// log via audit-context downstream, return a generic wrapped
+		// error here.
+		return nil, fmt.Errorf("crm/service: get respondent: mask phone: %w", derr)
+	}
+	row.PhoneMasked = masked
+	row.Phone = "" // explicit: never populate plaintext on Get
+	// Strip the at-rest representations from the DTO returned to the
+	// transport — operators have no business consuming bytea blobs,
+	// and removing them avoids accidental leakage through naive
+	// JSON-encoders.
+	row.PhoneEncrypted = nil
+	row.PhoneHash = nil
+	return &row, nil
 }
 
-// GetWithPhone is stubbed pending Task 4.
-func (s *RespondentService) GetWithPhone(_ context.Context, _ uuid.UUID) (*api.Respondent, error) {
-	return nil, errRespondentUnimplemented
+// GetWithPhone implements api.RespondentService.GetWithPhone. The
+// caller must already have passed an admin RBAC gate at the HTTP
+// layer; this method nevertheless writes one audit row per
+// invocation (action `crm.respondent.read_pii`) so the access trail
+// is complete even for service-internal callers.
+//
+// Returns Phone (plaintext, decrypted via the per-tenant KMS) and
+// PhoneMasked. Soft-deleted rows return ErrRespondentDeleted — admin
+// access to pending-purge rows is allowed via the dedicated path; the
+// public service intentionally rejects them so the audit trail has a
+// clean "this row is gone" signal.
+func (s *RespondentService) GetWithPhone(ctx context.Context, id uuid.UUID) (*api.Respondent, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get with phone: %w", api.ErrInvalidArgument)
+	}
+	row, err := s.lookupRespondent(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if row.DeleteAt != nil {
+		return nil, api.ErrRespondentDeleted
+	}
+	plaintext, derr := s.kms.Decrypt(ctx, row.TenantID, row.PhoneEncrypted)
+	if derr != nil {
+		return nil, fmt.Errorf("crm/service: get with phone: decrypt: %w", derr)
+	}
+	phone := string(plaintext)
+	row.Phone = phone
+	row.PhoneMasked = MaskPhone(phone)
+	row.PhoneEncrypted = nil
+	row.PhoneHash = nil
+
+	if aerr := s.writeAudit(ctx, auditapi.Event{
+		TenantID: row.TenantID,
+		Action:   "crm.respondent.read_pii",
+		Target:   "respondent:" + row.ID.String(),
+		Payload: map[string]any{
+			"respondent_id": row.ID,
+			"project_id":    row.ProjectID,
+		},
+	}); aerr != nil {
+		// Non-fatal — audit write failure must not gate access; surface
+		// a structured log, return the result. Plan 05 lessons § 11
+		// established this pattern (stubbed audit must never silently
+		// drop a row, but it must also never fail a happy-path call).
+		s.logger.Warn("audit write failed",
+			zap.String("action", "crm.respondent.read_pii"),
+			zap.Error(aerr))
+	}
+	return &row, nil
 }
 
-// Search is stubbed pending Task 4.
-func (s *RespondentService) Search(_ context.Context, _ api.SearchRespondentsFilter) (*api.SearchRespondentsResult, error) {
-	return nil, errRespondentUnimplemented
+// Search implements api.RespondentService.Search. Pagination is
+// clamped to the project conventions (page>=1, pageSize in
+// [1, maxSearchPageSize]); soft-deleted rows are filtered out by the
+// store. Returns the page slice + total count.
+//
+// The HTTP transport derives TenantID + ProjectID from the JWT claims
+// + path parameters. The service rejects uuid.Nil up-front so a
+// careless caller cannot enumerate cross-tenant rows.
+func (s *RespondentService) Search(ctx context.Context, f api.SearchRespondentsFilter) (*api.SearchRespondentsResult, error) {
+	if f.TenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: search respondents: tenant id required: %w", api.ErrInvalidArgument)
+	}
+	if f.ProjectID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: search respondents: project id required: %w", api.ErrInvalidArgument)
+	}
+	if f.Page <= 0 {
+		f.Page = 1
+	}
+	if f.PageSize <= 0 {
+		f.PageSize = defaultSearchPageSize
+	}
+	if f.PageSize > maxSearchPageSize {
+		f.PageSize = maxSearchPageSize
+	}
+
+	var (
+		rows  []api.Respondent
+		total int64
+	)
+	err := s.tx.WithTenant(ctx, f.TenantID, func(tx postgres.Tx) error {
+		var qerr error
+		rows, total, qerr = s.store.Search(ctx, tx, f)
+		return qerr
+	})
+	if err != nil {
+		return nil, fmt.Errorf("crm/service: search respondents: %w", err)
+	}
+
+	// Mask phone + strip at-rest fields so the operator UI can
+	// json-encode the slice without accidentally leaking phone hash
+	// bytes (bytea would render base64 — useless to operators and a
+	// minor PII vector).
+	masked := make([]api.Respondent, len(rows))
+	for i, r := range rows {
+		m, derr := s.maskedPhoneFor(ctx, r)
+		if derr != nil {
+			s.logger.Warn("mask phone failed during search",
+				zap.String("respondent_id", r.ID.String()),
+				zap.Error(derr))
+			m = MaskPhone("") // safe fallback "***"
+		}
+		r.PhoneMasked = m
+		r.Phone = ""
+		r.PhoneEncrypted = nil
+		r.PhoneHash = nil
+		masked[i] = r
+	}
+	return &api.SearchRespondentsResult{
+		Items:      masked,
+		TotalCount: int(total),
+	}, nil
 }
 
-// Delete is stubbed pending Task 5.
-func (s *RespondentService) Delete(_ context.Context, _ uuid.UUID) (*api.DeletionRequest, error) {
-	return nil, errRespondentUnimplemented
+// Delete implements api.RespondentService.Delete with the 152-ФЗ §21
+// 30-day grace window. Soft-marks deleted_at + deletion_reason so the
+// purge worker can hard-delete after the grace period; emits an audit
+// row "crm.respondent.deleted" inside the same transaction so the
+// trail is durable iff the soft-delete committed.
+//
+// Idempotency: a second Delete on the same id returns
+// ErrRespondentDeleted — the first call already stamped deleted_at,
+// the row stays in the soft-delete state until purge.
+func (s *RespondentService) Delete(ctx context.Context, id uuid.UUID) (*api.DeletionRequest, error) {
+	if id == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: delete respondent: %w", api.ErrInvalidArgument)
+	}
+	row, err := s.lookupRespondent(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if row.DeleteAt != nil {
+		return nil, api.ErrRespondentDeleted
+	}
+
+	deleteAt := s.clock().UTC()
+	scheduledPurge := deleteAt.Add(deletionGracePeriod)
+	const reason = "user_request"
+
+	err = s.tx.WithTenant(ctx, row.TenantID, func(tx postgres.Tx) error {
+		if derr := s.store.SoftDelete(ctx, tx, id, reason, deleteAt); derr != nil {
+			return derr
+		}
+		return s.writeAudit(ctx, auditapi.Event{
+			TenantID: row.TenantID,
+			Action:   "crm.respondent.deleted",
+			Target:   "respondent:" + id.String(),
+			Payload: map[string]any{
+				"respondent_id":      id,
+				"project_id":         row.ProjectID,
+				"reason":             reason,
+				"deleted_at":         deleteAt,
+				"scheduled_purge_at": scheduledPurge,
+			},
+		})
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrRespondentNotFound) {
+			// Lost the race against a concurrent Delete — surface the
+			// same sentinel so callers can distinguish "never existed"
+			// from "already deleted".
+			return nil, api.ErrRespondentDeleted
+		}
+		return nil, fmt.Errorf("crm/service: delete respondent: %w", err)
+	}
+
+	return &api.DeletionRequest{
+		RespondentID: id,
+		DeleteAt:     scheduledPurge,
+	}, nil
+}
+
+// lookupRespondent resolves a respondent by id via BypassRLS. Returns
+// ErrRespondentNotFound on a missing row; otherwise wraps the
+// underlying error. The caller is responsible for any tenant-scoped
+// follow-up (we keep this read separate so admin tooling that needs
+// to resolve a row id to its tenant doesn't have to know the tenant
+// up front).
+func (s *RespondentService) lookupRespondent(ctx context.Context, id uuid.UUID) (api.Respondent, error) {
+	var row api.Respondent
+	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+		var qerr error
+		row, qerr = s.store.GetByID(ctx, tx, id)
+		return qerr
+	})
+	if err != nil {
+		if errors.Is(err, api.ErrRespondentNotFound) {
+			return api.Respondent{}, err
+		}
+		return api.Respondent{}, fmt.Errorf("crm/service: lookup respondent: %w", err)
+	}
+	return row, nil
+}
+
+// maskedPhoneFor decrypts the at-rest phone ciphertext and returns
+// the display-safe mask. Returns an empty string + the wrapped KMS
+// error on decrypt failure — callers decide whether to render "***"
+// or surface the error.
+func (s *RespondentService) maskedPhoneFor(ctx context.Context, r api.Respondent) (string, error) {
+	if len(r.PhoneEncrypted) == 0 {
+		return "", nil
+	}
+	plaintext, err := s.kms.Decrypt(ctx, r.TenantID, r.PhoneEncrypted)
+	if err != nil {
+		return "", err
+	}
+	return MaskPhone(string(plaintext)), nil
 }
 
 // Import and GetImportStatus live in import.go (Plan 06 Task 4).

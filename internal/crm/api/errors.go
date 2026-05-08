@@ -40,4 +40,11 @@ var (
 	// ErrImportFormatUnsupported is returned when ImportRequest.Format
 	// is not one of the canonical values ("csv", "xlsx").
 	ErrImportFormatUnsupported = errors.New("crm: unsupported import format")
+	// ErrRespondentDeleted is returned when an operation targets a
+	// respondent that is already soft-deleted (deleted_at IS NOT NULL).
+	// Operators see the row only via the dedicated admin path; Get /
+	// GetWithPhone / Delete on a deleted row surface this sentinel so
+	// callers can render "this respondent is pending purge" instead of
+	// a generic "not found".
+	ErrRespondentDeleted = errors.New("crm: respondent already soft-deleted")
 )

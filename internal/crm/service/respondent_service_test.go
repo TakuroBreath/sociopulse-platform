@@ -42,6 +42,9 @@ type fakeRespondentStore struct {
 	isBlockedDNCErr   error
 	insertBatchErr    error
 	existingHashesErr error
+	softDeleteErr     error
+	purgeErr          error
+	searchErr         error
 
 	// counters so tests can confirm the service short-circuited.
 	insertCalls         int
@@ -49,6 +52,9 @@ type fakeRespondentStore struct {
 	isBlockedDNCCalls   int
 	insertBatchCalls    int
 	existingHashesCalls int
+	softDeleteCalls     int
+	purgeCalls          int
+	searchCalls         int
 }
 
 func newFakeRespondentStore() *fakeRespondentStore {
@@ -195,6 +201,116 @@ func (s *fakeRespondentStore) InsertBatch(_ context.Context, _ postgres.Tx, rows
 	return len(rows), nil
 }
 
+// SoftDelete satisfies api.RespondentStorePort.SoftDelete. The fake
+// stamps the supplied timestamp + reason on the row at id; a missing
+// or already-deleted row returns ErrRespondentNotFound.
+func (s *fakeRespondentStore) SoftDelete(_ context.Context, _ postgres.Tx, id uuid.UUID, reason string, at time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.softDeleteErr != nil {
+		err := s.softDeleteErr
+		s.softDeleteErr = nil
+		return err
+	}
+	s.softDeleteCalls++
+	row, ok := s.rows[id]
+	if !ok || row.DeleteAt != nil {
+		return crmapi.ErrRespondentNotFound
+	}
+	t := at
+	row.DeleteAt = &t
+	if reason != "" {
+		// store reason inside attributes for round-trip assertions
+		// (production stores it in deletion_reason; the fake mirrors
+		// its semantics without adding a column).
+		if row.Attributes == nil {
+			row.Attributes = map[string]any{}
+		}
+		row.Attributes["__deletion_reason"] = reason
+	}
+	s.rows[id] = row
+	return nil
+}
+
+// PurgeOlderThan satisfies api.RespondentStorePort.PurgeOlderThan. The
+// fake walks its in-memory rows, removes ones whose DeleteAt < cutoff
+// (up to limit), and returns the affected ids.
+func (s *fakeRespondentStore) PurgeOlderThan(_ context.Context, _ postgres.Tx, cutoff time.Time, limit int) ([]uuid.UUID, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.purgeErr != nil {
+		err := s.purgeErr
+		s.purgeErr = nil
+		return nil, err
+	}
+	s.purgeCalls++
+	if limit <= 0 {
+		return nil, nil
+	}
+	candidates := make([]uuid.UUID, 0)
+	for id, row := range s.rows {
+		if row.DeleteAt != nil && row.DeleteAt.Before(cutoff) {
+			candidates = append(candidates, id)
+			if len(candidates) == limit {
+				break
+			}
+		}
+	}
+	for _, id := range candidates {
+		row := s.rows[id]
+		key := respondentKey(row.TenantID, row.ProjectID, row.PhoneHash)
+		delete(s.hashIndex, key)
+		delete(s.rows, id)
+	}
+	return candidates, nil
+}
+
+// Search satisfies api.RespondentStorePort.Search. Returns the
+// in-memory rows matching the filter; pagination is honored.
+func (s *fakeRespondentStore) Search(_ context.Context, _ postgres.Tx, f crmapi.SearchRespondentsFilter) ([]crmapi.Respondent, int64, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.searchErr != nil {
+		err := s.searchErr
+		s.searchErr = nil
+		return nil, 0, err
+	}
+	s.searchCalls++
+	matches := make([]crmapi.Respondent, 0)
+	for _, row := range s.rows {
+		if row.TenantID != f.TenantID || row.ProjectID != f.ProjectID {
+			continue
+		}
+		if row.DeleteAt != nil {
+			continue
+		}
+		if f.Status != nil && row.Status != *f.Status {
+			continue
+		}
+		if f.Region != "" && row.RegionCode != f.Region {
+			continue
+		}
+		matches = append(matches, row)
+	}
+	total := int64(len(matches))
+	limit := f.PageSize
+	if limit <= 0 {
+		limit = 50
+	}
+	offset := 0
+	if f.Page > 1 {
+		offset = (f.Page - 1) * limit
+	}
+	if offset >= len(matches) {
+		return []crmapi.Respondent{}, total, nil
+	}
+	end := offset + limit
+	if end > len(matches) {
+		end = len(matches)
+	}
+	return matches[offset:end], total, nil
+}
+
 // ExistingHashes satisfies api.RespondentStorePort.ExistingHashes. The
 // fake walks its in-memory hash index and returns the subset of hashes
 // already present.
@@ -300,17 +416,25 @@ func (h *fakePhoneHasher) Normalise(phone string) (string, error) {
 var _ tenancyapi.PhoneHasher = (*fakePhoneHasher)(nil)
 
 // fakeRespondentTxRunner runs every fn synchronously with a zero
-// postgres.Tx. Mirrors fakeTxRunner in project_service_test.go but
-// stripped down — RespondentService never opens BypassRLS; only
-// WithTenant.
+// postgres.Tx. Mirrors fakeTxRunner in project_service_test.go.
+// RespondentService uses both WithTenant (write paths and per-tenant
+// reads) and BypassRLS (resolve-by-id when the tenant is unknown).
 type fakeRespondentTxRunner struct {
 	mu                sync.Mutex
 	withTenantTenants []uuid.UUID
+	bypassCount       int
 }
 
 func (f *fakeRespondentTxRunner) WithTenant(_ context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error {
 	f.mu.Lock()
 	f.withTenantTenants = append(f.withTenantTenants, tenantID)
+	f.mu.Unlock()
+	return fn(postgres.Tx{})
+}
+
+func (f *fakeRespondentTxRunner) BypassRLS(_ context.Context, fn func(postgres.Tx) error) error {
+	f.mu.Lock()
+	f.bypassCount++
 	f.mu.Unlock()
 	return fn(postgres.Tx{})
 }
@@ -785,29 +909,258 @@ func TestNewRespondentService_NilClockDefaultsToTimeNow(t *testing.T) {
 	require.False(t, got.CreatedAt.IsZero())
 }
 
-// TestRespondentService_StubbedMethodsReturnUnimplemented exercises the
-// Get/GetWithPhone/Search/Delete/Import/GetImportStatus signatures so a
-// future task discovers a stub by getting an error rather than seeing
-// silent zero-value returns.
-func TestRespondentService_StubbedMethodsReturnUnimplemented(t *testing.T) {
+// TestRespondentService_Get_HappyPath exercises Get on a freshly-
+// created respondent: it must populate PhoneMasked from the decrypted
+// ciphertext and never expose Phone / PhoneEncrypted / PhoneHash.
+func TestRespondentService_Get_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     validRussianPhone,
+	})
+	require.NoError(t, err)
+
+	got, err := svc.Get(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, created.ID, got.ID)
+	require.Empty(t, got.Phone, "Get must NOT populate plaintext phone")
+	require.NotEmpty(t, got.PhoneMasked)
+	require.NotContains(t, got.PhoneMasked, "1234567")
+	require.Nil(t, got.PhoneEncrypted, "Get must strip at-rest ciphertext")
+	require.Nil(t, got.PhoneHash, "Get must strip at-rest hash")
+}
+
+// TestRespondentService_Get_RejectsNilID exercises the nil-id guard.
+func TestRespondentService_Get_RejectsNilID(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Get(context.Background(), uuid.Nil)
+	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
+}
+
+// TestRespondentService_Get_MissingReturnsErrRespondentNotFound covers
+// the lookup-miss branch.
+func TestRespondentService_Get_MissingReturnsErrRespondentNotFound(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Get(context.Background(), uuid.New())
+	require.ErrorIs(t, err, crmapi.ErrRespondentNotFound)
+}
+
+// TestRespondentService_GetWithPhone_HappyPath exercises the admin
+// PII-reveal path: the response carries the plaintext Phone AND a
+// masked variant; one audit row "crm.respondent.read_pii" is emitted.
+func TestRespondentService_GetWithPhone_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, audit := newRespSvc(t)
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     validRussianPhone,
+	})
+	require.NoError(t, err)
+
+	got, err := svc.GetWithPhone(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, validRussianPhone, got.Phone)
+	require.NotEmpty(t, got.PhoneMasked)
+
+	events := audit.snapshot()
+	// 1 created + 1 read_pii
+	require.Len(t, events, 2)
+	require.Equal(t, "crm.respondent.read_pii", events[1].Action)
+	require.Equal(t, "respondent:"+created.ID.String(), events[1].Target)
+
+	// audit payload must NOT contain the plaintext.
+	raw, jerr := json.Marshal(events[1])
+	require.NoError(t, jerr)
+	require.NotContains(t, string(raw), validRussianPhone, "PII audit row must not embed plaintext")
+}
+
+// TestRespondentService_GetWithPhone_DeletedReturnsErrRespondentDeleted
+// exercises the soft-deleted branch.
+func TestRespondentService_GetWithPhone_DeletedReturnsErrRespondentDeleted(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _, _ := newRespSvc(t)
 	ctx := context.Background()
 
-	_, err := svc.Get(ctx, uuid.New())
-	require.Error(t, err)
+	created, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  uuid.New(),
+		ProjectID: uuid.New(),
+		Phone:     validRussianPhone,
+	})
+	require.NoError(t, err)
 
-	_, err = svc.GetWithPhone(ctx, uuid.New())
-	require.Error(t, err)
+	_, err = svc.Delete(ctx, created.ID)
+	require.NoError(t, err)
 
-	_, err = svc.Search(ctx, crmapi.SearchRespondentsFilter{ProjectID: uuid.New()})
-	require.Error(t, err)
+	_, err = svc.GetWithPhone(ctx, created.ID)
+	require.ErrorIs(t, err, crmapi.ErrRespondentDeleted)
+}
 
-	_, err = svc.Delete(ctx, uuid.New())
-	require.Error(t, err)
+// TestRespondentService_Search_HappyPath inserts two respondents and
+// asserts Search returns them with masked phones, total=2.
+func TestRespondentService_Search_HappyPath(t *testing.T) {
+	t.Parallel()
 
-	_, err = svc.Import(ctx, crmapi.ImportRequest{ProjectID: uuid.New()})
+	svc, _, _, _, _, _ := newRespSvc(t)
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	ctx := context.Background()
+
+	_, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     "+79161234567",
+	})
+	require.NoError(t, err)
+	_, err = svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     "+79261234567",
+	})
+	require.NoError(t, err)
+
+	res, err := svc.Search(ctx, crmapi.SearchRespondentsFilter{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Page:      1,
+		PageSize:  10,
+	})
+	require.NoError(t, err)
+	require.Equal(t, 2, res.TotalCount)
+	require.Len(t, res.Items, 2)
+	for _, r := range res.Items {
+		require.Empty(t, r.Phone, "search items must never carry plaintext")
+		require.NotEmpty(t, r.PhoneMasked)
+		require.Nil(t, r.PhoneEncrypted)
+		require.Nil(t, r.PhoneHash)
+	}
+}
+
+// TestRespondentService_Search_RejectsNilTenantID covers the validator.
+func TestRespondentService_Search_RejectsNilTenantID(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Search(context.Background(), crmapi.SearchRespondentsFilter{
+		ProjectID: uuid.New(),
+	})
+	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
+}
+
+// TestRespondentService_Search_RejectsNilProjectID covers the second
+// branch of the validator.
+func TestRespondentService_Search_RejectsNilProjectID(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Search(context.Background(), crmapi.SearchRespondentsFilter{
+		TenantID: uuid.New(),
+	})
+	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
+}
+
+// TestRespondentService_Delete_HappyPath asserts DeletionRequest is
+// returned with DeleteAt = now+30d and a "crm.respondent.deleted"
+// audit row is emitted.
+func TestRespondentService_Delete_HappyPath(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, audit := newRespSvc(t)
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     validRussianPhone,
+	})
+	require.NoError(t, err)
+
+	dr, err := svc.Delete(ctx, created.ID)
+	require.NoError(t, err)
+	require.Equal(t, created.ID, dr.RespondentID)
+
+	expected := time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC).Add(deletionGracePeriod)
+	require.True(t, dr.DeleteAt.Equal(expected),
+		"DeleteAt must be 30d after the service clock; got %v want %v", dr.DeleteAt, expected)
+
+	events := audit.snapshot()
+	// 1 created + 1 deleted
+	require.Len(t, events, 2)
+	require.Equal(t, "crm.respondent.deleted", events[1].Action)
+	require.Equal(t, "user_request", events[1].Payload["reason"])
+}
+
+// TestRespondentService_Delete_AlreadyDeletedReturnsErrRespondentDeleted
+// asserts a second Delete on the same id is idempotent (returns the
+// dedicated sentinel rather than ErrRespondentNotFound).
+func TestRespondentService_Delete_AlreadyDeletedReturnsErrRespondentDeleted(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	ctx := context.Background()
+
+	created, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  uuid.New(),
+		ProjectID: uuid.New(),
+		Phone:     validRussianPhone,
+	})
+	require.NoError(t, err)
+
+	_, err = svc.Delete(ctx, created.ID)
+	require.NoError(t, err)
+
+	_, err = svc.Delete(ctx, created.ID)
+	require.ErrorIs(t, err, crmapi.ErrRespondentDeleted)
+}
+
+// TestRespondentService_Delete_RejectsNilID covers the nil-id guard.
+func TestRespondentService_Delete_RejectsNilID(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Delete(context.Background(), uuid.Nil)
+	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
+}
+
+// TestRespondentService_Delete_MissingReturnsNotFound covers the
+// resolve-by-id missing branch.
+func TestRespondentService_Delete_MissingReturnsNotFound(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	_, err := svc.Delete(context.Background(), uuid.New())
+	require.ErrorIs(t, err, crmapi.ErrRespondentNotFound)
+}
+
+// TestRespondentService_StubbedImportMethodsReturnError keeps
+// Import/GetImportStatus signatures honest for callers that don't
+// configure the optional asynq deps.
+func TestRespondentService_StubbedImportMethodsReturnError(t *testing.T) {
+	t.Parallel()
+
+	svc, _, _, _, _, _ := newRespSvc(t)
+	ctx := context.Background()
+
+	_, err := svc.Import(ctx, crmapi.ImportRequest{ProjectID: uuid.New()})
 	require.Error(t, err)
 
 	_, err = svc.GetImportStatus(ctx, "job-1")

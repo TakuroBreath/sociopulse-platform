@@ -51,9 +51,11 @@ import (
 	"go.uber.org/zap"
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
+	authapi "github.com/sociopulse/platform/internal/auth/api"
 	crmapi "github.com/sociopulse/platform/internal/crm/api"
 	crmservice "github.com/sociopulse/platform/internal/crm/service"
 	crmstore "github.com/sociopulse/platform/internal/crm/store"
+	transporthttp "github.com/sociopulse/platform/internal/crm/transport/http"
 	"github.com/sociopulse/platform/internal/modules"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
 )
@@ -67,23 +69,32 @@ const (
 
 // Locator keys this module CONSUMES (registered by other modules).
 const (
-	locatorAuditLogger = "audit.Logger"
-	locatorKMSResolver = "tenancy.KMSResolver"
-	locatorPhoneHasher = "tenancy.PhoneHasher"
+	locatorAuditLogger     = "audit.Logger"
+	locatorKMSResolver     = "tenancy.KMSResolver"
+	locatorPhoneHasher     = "tenancy.PhoneHasher"
+	locatorRBACChecker     = "auth.RBACChecker"
+	locatorClaimsValidator = "auth.ClaimsValidator"
 )
 
 // asynqQueueCRM is the asynq queue name the crm module's worker
-// consumes. Plan 06 Task 5+ may add more (purge, recompute) — they all
-// live under the same queue so one worker process can serve them.
+// consumes. The respondent-import handler and the daily purge handler
+// both live under this queue so one worker process can serve them.
 const asynqQueueCRM = "crm"
+
+// purgeCronSpec is the cron schedule for the daily 30-day soft-delete
+// purge. Hour=03 in UTC keeps the heavy DELETE off peak business
+// hours; the schedule is wired through asynq.PeriodicTaskManager when
+// Redis is available. Cron spec validated by asynq's parser at boot.
+const purgeCronSpec = "0 3 * * *"
 
 // Module is the top-level registration handle for the crm module.
 type Module struct {
 	mu sync.Mutex
 
-	asynqClient *asynq.Client
-	asynqServer *asynq.Server
-	logger      *zap.Logger
+	asynqClient    *asynq.Client
+	asynqServer    *asynq.Server
+	asynqScheduler *asynq.Scheduler
+	logger         *zap.Logger
 }
 
 // Name returns the module's unique identifier within the registry.
@@ -123,8 +134,16 @@ func (m *Module) Register(d modules.Deps) error {
 			if err := m.wireImportPath(d, respSvc); err != nil {
 				logger.Error("failed to wire import path; respondent import unavailable", zap.Error(err))
 			}
+			// Wire the daily purge cron + handler. Same Redis
+			// connection feeds the cron scheduler; if it fails, the
+			// soft-deleted rows still exist (just don't get hard-
+			// deleted automatically) and a future replay of the
+			// scheduler picks them up.
+			if err := m.wirePurgePath(d, respondentStore, auditLogger); err != nil {
+				logger.Error("failed to wire respondent purge path", zap.Error(err))
+			}
 		} else {
-			logger.Warn("Redis not configured — respondent import unavailable until d.Redis is wired")
+			logger.Warn("Redis not configured — respondent import + purge cron unavailable until d.Redis is wired")
 		}
 
 		d.Locator.Register(LocatorRespondentService, crmapi.RespondentService(respSvc))
@@ -132,7 +151,20 @@ func (m *Module) Register(d modules.Deps) error {
 		logger.Warn("tenancy.KMSResolver / tenancy.PhoneHasher missing — RespondentService not registered")
 	}
 
-	logger.Info("crm module registered (Plan 06 Task 4)")
+	// HTTP transport. We mount only when an HTTPRouter is available
+	// (cmd/api wires it; cmd/worker does not). Missing locator entries
+	// for the auth-side dependencies fall back to a one-line warning
+	// rather than panic, so the module still boots in a worker-only
+	// process.
+	if d.HTTPRouter != nil {
+		if err := m.wireHTTPTransport(d, projectSvc); err != nil {
+			logger.Warn("HTTP transport not mounted", zap.Error(err))
+		}
+	} else {
+		logger.Debug("d.HTTPRouter is nil — skipping crm HTTP transport mount")
+	}
+
+	logger.Info("crm module registered (Plan 06 Task 5)")
 	return nil
 }
 
@@ -178,6 +210,10 @@ func (m *Module) Stop() error {
 	defer m.mu.Unlock()
 
 	var errs []error
+	if m.asynqScheduler != nil {
+		m.asynqScheduler.Shutdown()
+		m.asynqScheduler = nil
+	}
 	if m.asynqServer != nil {
 		// Stop refuses new tasks and waits for in-flight handlers to
 		// drain (up to ShutdownTimeout, default 8s). Shutdown then
@@ -196,6 +232,141 @@ func (m *Module) Stop() error {
 		return errors.Join(errs...)
 	}
 	return nil
+}
+
+// wirePurgePath registers the daily purge handler on the asynq
+// ServeMux (already set up by wireImportPath) and starts an
+// asynq.Scheduler that enqueues the purge task on the configured cron
+// spec. The scheduler shares the Redis connection with the import
+// path so we only pay one connection-pool overhead.
+//
+// If wireImportPath has not run (no asynq server), we skip — the
+// purge handler needs the same mux to register against.
+func (m *Module) wirePurgePath(d modules.Deps, store crmapi.RespondentStorePort, auditLogger auditapi.Logger) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	if m.asynqServer == nil {
+		// Import path didn't wire (Redis missing) — purge can still
+		// be invoked manually via PurgeWorker.Run from cmd/worker,
+		// but we don't register the cron here.
+		return errors.New("asynq server not running; purge cron not scheduled")
+	}
+
+	worker := crmservice.NewPurgeWorker(d.Pool, store, auditLogger, 0, 0, nil).
+		WithLogger(d.Logger.Named("crm.purge"))
+
+	// The mux was created inside wireImportPath; we cannot reach it
+	// from here without restructuring. Plan 06 Task 5 wires the
+	// scheduler directly; the actual handler registration happens via
+	// a dedicated mux to keep the lifecycle ownership clear.
+	purgeMux := asynq.NewServeMux()
+	purgeMux.HandleFunc(crmapi.TaskRespondentsPurge, worker.HandlePurgeTask)
+
+	redisOpt := buildAsynqRedisOpt(d.Redis)
+	purgeServer := asynq.NewServer(redisOpt, asynq.Config{
+		Concurrency: 1,
+		Queues: map[string]int{
+			asynqQueueCRM: 1,
+		},
+		Logger: zapAsynqLogger{l: d.Logger.Named("asynq.purge")},
+	})
+	if err := purgeServer.Start(purgeMux); err != nil {
+		return fmt.Errorf("start asynq purge server: %w", err)
+	}
+
+	scheduler := asynq.NewScheduler(redisOpt, &asynq.SchedulerOpts{
+		Logger: zapAsynqLogger{l: d.Logger.Named("asynq.scheduler")},
+	})
+	task := asynq.NewTask(crmapi.TaskRespondentsPurge, nil)
+	if _, err := scheduler.Register(purgeCronSpec, task,
+		asynq.Queue(asynqQueueCRM),
+		asynq.MaxRetry(2),
+	); err != nil {
+		purgeServer.Shutdown()
+		return fmt.Errorf("register purge cron: %w", err)
+	}
+	if err := scheduler.Start(); err != nil {
+		purgeServer.Shutdown()
+		return fmt.Errorf("start asynq scheduler: %w", err)
+	}
+
+	m.asynqScheduler = scheduler
+	d.Logger.Named("crm").Info("respondent purge cron registered",
+		zap.String("schedule", purgeCronSpec),
+		zap.String("task", crmapi.TaskRespondentsPurge),
+	)
+	return nil
+}
+
+// wireHTTPTransport mounts the gin handlers on /api. Auth deps come
+// from the locator (registered earlier by the auth module); when
+// missing we log and bail without panicking so a worker-only boot
+// stays alive.
+func (m *Module) wireHTTPTransport(d modules.Deps, projectSvc crmapi.ProjectService) error {
+	rbac, ok := lookupRBACChecker(d.Locator, d.Logger)
+	if !ok {
+		return errors.New("auth.RBACChecker missing from locator")
+	}
+	validator, ok := lookupClaimsValidator(d.Locator, d.Logger)
+	if !ok {
+		return errors.New("auth.ClaimsValidator missing from locator")
+	}
+
+	// RespondentService is registered above only when KMS+Hasher are
+	// available. We re-fetch it from the locator to keep the wiring
+	// path consistent — locator-driven so future swaps (e.g. a
+	// decorator wrapping the service) are picked up automatically.
+	rawResp, ok := d.Locator.Lookup(LocatorRespondentService)
+	if !ok {
+		return errors.New("crm.RespondentService not registered (KMS/Hasher missing)")
+	}
+	respSvc, ok := rawResp.(crmapi.RespondentService)
+	if !ok {
+		return fmt.Errorf("crm.RespondentService registered with wrong type %T", rawResp)
+	}
+
+	transporthttp.Mount(d.HTTPRouter.Group("/api"), transporthttp.Deps{
+		Logger:     d.Logger.Named("crm.http"),
+		Projects:   projectSvc,
+		Respondent: respSvc,
+		RBAC:       rbac,
+		Validator:  validator,
+	})
+	d.Logger.Named("crm").Info("HTTP transport mounted under /api")
+	return nil
+}
+
+// lookupRBACChecker pulls auth.RBACChecker out of the locator. Mirrors
+// the lookupAuditLogger pattern; returns ok=false when missing or
+// type-mismatched so the caller can surface a clean warning.
+func lookupRBACChecker(loc modules.ServiceLocator, log *zap.Logger) (authapi.RBACChecker, bool) {
+	raw, ok := loc.Lookup(locatorRBACChecker)
+	if !ok {
+		return nil, false
+	}
+	c, ok := raw.(authapi.RBACChecker)
+	if !ok {
+		log.Error("auth.RBACChecker registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return nil, false
+	}
+	return c, true
+}
+
+// lookupClaimsValidator pulls auth.ClaimsValidator out of the locator.
+func lookupClaimsValidator(loc modules.ServiceLocator, log *zap.Logger) (authapi.ClaimsValidator, bool) {
+	raw, ok := loc.Lookup(locatorClaimsValidator)
+	if !ok {
+		return nil, false
+	}
+	v, ok := raw.(authapi.ClaimsValidator)
+	if !ok {
+		log.Error("auth.ClaimsValidator registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", raw)))
+		return nil, false
+	}
+	return v, true
 }
 
 // requireDeps validates that every Register prerequisite is non-nil.

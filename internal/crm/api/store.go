@@ -136,6 +136,39 @@ type RespondentStorePort interface {
 	// (tenant_id, project_id, phone_hash) UNIQUE index. Empty input
 	// returns (nil, nil) without a query.
 	ExistingHashes(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, hashes [][]byte) ([][]byte, error)
+
+	// SoftDelete stamps deleted_at + deletion_reason on the row at the
+	// supplied id. The row stays visible to admin tooling but is hidden
+	// from operator surfaces (Get/Search filter on deleted_at IS NULL).
+	// Returns ErrRespondentNotFound when no row matched (id missing or
+	// already soft-deleted by a concurrent caller). Idempotent against
+	// the same row only when the caller supplies the same reason — a
+	// second call with a different reason will overwrite the column,
+	// which the service layer prevents by short-circuiting on the
+	// pre-existing deleted_at via GetByID.
+	SoftDelete(ctx context.Context, tx postgres.Tx, id uuid.UUID, reason string, at time.Time) error
+
+	// PurgeOlderThan hard-deletes up to `limit` respondents whose
+	// deleted_at < cutoff and returns the ids that were removed. The
+	// daily purge worker calls this once per tick; the per-row id list
+	// lets the caller emit one audit row per purged id without a
+	// follow-up SELECT.
+	//
+	// Implementation MUST use a single DELETE ... LIMIT $2 RETURNING id
+	// so concurrent purgers can't double-delete the same row. Empty
+	// result returns (nil, nil); a zero limit returns (nil, nil) without
+	// running a query.
+	PurgeOlderThan(ctx context.Context, tx postgres.Tx, cutoff time.Time, limit int) (purgedIDs []uuid.UUID, err error)
+
+	// Search returns one page of respondents matching f, plus the total
+	// count of matching rows. The query filters out soft-deleted rows
+	// (deleted_at IS NULL) by default; admin tooling that needs to see
+	// pending-purge rows uses the dedicated admin path (not Search).
+	//
+	// Pagination is via Page (1-based) + PageSize; the service layer
+	// clamps both to the documented bounds before calling the store.
+	// Sort order is created_at DESC so newest rows surface first.
+	Search(ctx context.Context, tx postgres.Tx, f SearchRespondentsFilter) (rows []Respondent, total int64, err error)
 }
 
 // UpdatePatch carries the partial-update fields for ProjectStorePort.Update.

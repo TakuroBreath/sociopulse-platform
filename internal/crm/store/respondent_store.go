@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -15,9 +17,15 @@ import (
 
 // respondentColumns is the canonical projection used by every read
 // query so the field order matches scanRespondentRow without drift.
+//
+// deleted_at is included so the service layer can short-circuit
+// operations on already-deleted rows with ErrRespondentDeleted instead
+// of a confusing ErrRespondentNotFound. The row stays visible to
+// admin tooling for the 30-day grace window before the purge worker
+// hard-deletes it.
 const respondentColumns = `id, tenant_id, project_id, phone_encrypted, phone_hash,
 		region_code, attributes, status, attempts,
-		last_attempt_at, next_attempt_at, source, created_at`
+		last_attempt_at, next_attempt_at, source, created_at, deleted_at`
 
 // respondentUniqueConstraintCode is the constraint name added by
 // 000006_respondents_uniq.up.sql. We match on the explicit name (rather
@@ -69,6 +77,7 @@ func scanRespondentRow(r rowScanner) (api.Respondent, error) {
 		&out.NextAttemptAt,
 		&out.Source,
 		&out.CreatedAt,
+		&out.DeleteAt,
 	)
 	if err != nil {
 		return api.Respondent{}, err
@@ -296,6 +305,179 @@ func (s *RespondentStore) InsertBatch(ctx context.Context, tx postgres.Tx, rows 
 // is defense-in-depth so a misbehaving caller cannot smuggle a
 // 100M-row request that would exhaust connection memory.
 const maxBatchInsertRows = 100000
+
+// SoftDelete implements api.RespondentStorePort.SoftDelete.
+//
+// Stamps deleted_at + deletion_reason on the row inside the caller's
+// per-tenant transaction. The WHERE clause includes
+// `deleted_at IS NULL` so a second SoftDelete against the same id is
+// reported as ErrRespondentNotFound (the row exists but is already
+// soft-deleted) — the service layer translates that to the more
+// specific ErrRespondentDeleted via a follow-up GetByID, which is the
+// canonical idempotency check for the public Delete path.
+//
+// Reason is stored verbatim. The HTTP transport's bind validation caps
+// the length so the column never grows past a sensible upper bound.
+func (s *RespondentStore) SoftDelete(ctx context.Context, tx postgres.Tx, id uuid.UUID, reason string, at time.Time) error {
+	const q = `
+		UPDATE respondents
+		SET deleted_at = $2, deletion_reason = NULLIF($3, '')
+		WHERE id = $1 AND deleted_at IS NULL`
+
+	tag, err := tx.Exec(ctx, q, id, at, reason)
+	if err != nil {
+		return fmt.Errorf("crm/store: soft-delete respondent: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return api.ErrRespondentNotFound
+	}
+	return nil
+}
+
+// PurgeOlderThan implements api.RespondentStorePort.PurgeOlderThan.
+//
+// Hard-deletes up to `limit` rows whose deleted_at < cutoff and
+// returns the affected ids. The DELETE ... LIMIT clause uses a CTE
+// because PostgreSQL does not accept LIMIT directly on DELETE; the
+// CTE picks the candidate ids first (with `FOR UPDATE SKIP LOCKED`
+// so multiple purger replicas can run concurrently without
+// double-counting) and the outer DELETE removes them.
+//
+// Empty result returns (nil, nil); a non-positive limit returns (nil, nil)
+// without running a query.
+func (s *RespondentStore) PurgeOlderThan(ctx context.Context, tx postgres.Tx, cutoff time.Time, limit int) ([]uuid.UUID, error) {
+	if limit <= 0 {
+		return nil, nil
+	}
+
+	const q = `
+		WITH candidates AS (
+			SELECT id FROM respondents
+			WHERE deleted_at IS NOT NULL AND deleted_at < $1
+			ORDER BY deleted_at ASC
+			LIMIT $2
+			FOR UPDATE SKIP LOCKED
+		)
+		DELETE FROM respondents
+		WHERE id IN (SELECT id FROM candidates)
+		RETURNING id`
+
+	rows, err := tx.Query(ctx, q, cutoff, limit)
+	if err != nil {
+		return nil, fmt.Errorf("crm/store: purge respondents: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]uuid.UUID, 0, limit)
+	for rows.Next() {
+		var id uuid.UUID
+		if scanErr := rows.Scan(&id); scanErr != nil {
+			return nil, fmt.Errorf("crm/store: purge respondents scan: %w", scanErr)
+		}
+		out = append(out, id)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, fmt.Errorf("crm/store: purge respondents iterate: %w", rerr)
+	}
+	return out, nil
+}
+
+// Search implements api.RespondentStorePort.Search.
+//
+// Builds a parameterised WHERE clause from the filter, runs one paged
+// SELECT and one COUNT(*) query, returns the materialised slice plus
+// the total count. The query filters out soft-deleted rows
+// (deleted_at IS NULL) — admin tooling that needs to surface
+// pending-purge respondents uses a dedicated path (not Search).
+//
+// Sort order is created_at DESC, id DESC so newest rows surface first
+// and the secondary id key keeps pagination stable when many rows
+// share the same created_at.
+func (s *RespondentStore) Search(ctx context.Context, tx postgres.Tx, f api.SearchRespondentsFilter) ([]api.Respondent, int64, error) {
+	clause, args := buildSearchPredicate(f)
+
+	limit := f.PageSize
+	if limit <= 0 {
+		limit = 50
+	}
+	offset := 0
+	if f.Page > 1 {
+		offset = (f.Page - 1) * limit
+	}
+
+	listQ := `
+		SELECT ` + respondentColumns + `
+		FROM respondents
+		WHERE ` + clause + `
+		ORDER BY created_at DESC, id DESC
+		LIMIT $` + intArg(len(args)+1) + ` OFFSET $` + intArg(len(args)+2)
+
+	countQ := `
+		SELECT count(*)
+		FROM respondents
+		WHERE ` + clause
+
+	listArgs := append(append([]any{}, args...), limit, offset)
+
+	rows, err := tx.Query(ctx, listQ, listArgs...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("crm/store: search respondents query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([]api.Respondent, 0)
+	for rows.Next() {
+		r, scanErr := scanRespondentRow(rows)
+		if scanErr != nil {
+			return nil, 0, fmt.Errorf("crm/store: search respondents scan: %w", scanErr)
+		}
+		out = append(out, r)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, 0, fmt.Errorf("crm/store: search respondents iterate: %w", rerr)
+	}
+
+	var total int64
+	if cerr := tx.QueryRow(ctx, countQ, args...).Scan(&total); cerr != nil {
+		return nil, 0, fmt.Errorf("crm/store: search respondents count: %w", cerr)
+	}
+	return out, total, nil
+}
+
+// buildSearchPredicate constructs the parameterised WHERE clause for
+// Search from the filter. The returned args slice is positional;
+// placeholders $1..$N reference args[0..N-1] in order. Limit/Offset
+// are NOT included — the caller appends those at the end of the args
+// slice for the SELECT query.
+func buildSearchPredicate(f api.SearchRespondentsFilter) (string, []any) {
+	args := []any{f.TenantID, f.ProjectID}
+	predicates := []string{
+		"tenant_id = $1",
+		"project_id = $2",
+		"deleted_at IS NULL",
+	}
+
+	if f.Status != nil {
+		args = append(args, string(*f.Status))
+		predicates = append(predicates, "status = $"+intArg(len(args)))
+	}
+	if region := strings.TrimSpace(f.Region); region != "" {
+		args = append(args, region)
+		predicates = append(predicates, "region_code = $"+intArg(len(args)))
+	}
+	if q := strings.TrimSpace(f.Query); q != "" {
+		// Match against the JSON attributes blob. We cast to text and
+		// use ILIKE so the query stays portable without the pg_trgm
+		// extension (which not every test fixture has installed). The
+		// cost is one full scan per page; for v1's expected scale (a
+		// few thousand respondents per project) this is fine.
+		args = append(args, "%"+strings.ToLower(q)+"%")
+		predicates = append(predicates,
+			"(lower(attributes::text) LIKE $"+intArg(len(args))+
+				" OR lower(region_code) LIKE $"+intArg(len(args))+")")
+	}
+	return strings.Join(predicates, " AND "), args
+}
 
 // ExistingHashes implements api.RespondentStorePort.ExistingHashes.
 // Used by the import path to filter out rows whose phone_hash is
