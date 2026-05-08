@@ -4,6 +4,7 @@ go 1.26.1
 
 require (
 	github.com/alicebob/miniredis/v2 v2.37.0
+	github.com/expr-lang/expr v1.17.8
 	github.com/fsnotify/fsnotify v1.9.0
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-viper/mapstructure/v2 v2.4.0
