@@ -124,7 +124,13 @@
       "required": ["to"],
       "additionalProperties": false,
       "properties": {
-        "to": { "type": "string" },
+        "to": {
+          "type": "string",
+          "pattern": "^[a-zA-Z0-9_-]+$",
+          "minLength": 1,
+          "maxLength": 64,
+          "description": "Target node id; must match the same character set as `node.id` so a typo with leading whitespace is caught at JSON-Schema time, not as a dangling-edge graph error."
+        },
         "when": {
           "type": "string",
           "description": "Optional expr-lang predicate. The graph validator parses and whitelists identifiers."
