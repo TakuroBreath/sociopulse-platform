@@ -36,13 +36,17 @@ type Project struct {
 	SurveyID               *uuid.UUID
 	DefaultSurveyVersionID *uuid.UUID
 	IsAdvertising          bool
+	CreatedBy              *uuid.UUID
 	CreatedAt              time.Time
+	UpdatedAt              time.Time
+	ArchivedAt             *time.Time
 	Quotas                 []Quota
 	Assignments            []ProjectMember
 }
 
 // CreateProjectInput is the payload for ProjectService.Create.
 type CreateProjectInput struct {
+	TenantID       uuid.UUID
 	Code           string
 	Name           string
 	Customer       string
@@ -73,17 +77,24 @@ type ProjectMember struct {
 }
 
 // ListProjectsFilter narrows ProjectService.List.
+//
+// Limit/Offset are the canonical pagination knobs the service layer clamps
+// to [1, 500] / >=0 (defaults: Limit=50, Offset=0). IncludeArchived defaults
+// to false so admin lists hide soft-deleted rows; passing true surfaces them
+// for a "show all" view. Status/Search remain optional narrow filters.
 type ListProjectsFilter struct {
-	Status   *ProjectStatus
-	Search   string
-	Page     int
-	PageSize int
+	TenantID        uuid.UUID
+	Status          *ProjectStatus
+	Search          string
+	IncludeArchived bool
+	Limit           int
+	Offset          int
 }
 
 // ListProjectsResult is the page-with-total response for ProjectService.List.
 type ListProjectsResult struct {
 	Items      []Project
-	TotalCount int
+	TotalCount int64
 }
 
 // ProjectProgress is the live counter snapshot used by the dashboard
