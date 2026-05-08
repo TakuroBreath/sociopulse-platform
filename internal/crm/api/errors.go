@@ -33,4 +33,11 @@ var (
 	// id slice, nil-uuid id, etc.) that do not warrant a more specific
 	// sentinel. Callers can errors.Is for a 4xx-class fall-through.
 	ErrInvalidArgument = errors.New("crm: invalid argument")
+	// ErrImportNotFound is returned when GetImportStatus is called with
+	// a job id that has no Redis-side status hash (TTL elapsed, or the
+	// id was never enqueued).
+	ErrImportNotFound = errors.New("crm: import job not found")
+	// ErrImportFormatUnsupported is returned when ImportRequest.Format
+	// is not one of the canonical values ("csv", "xlsx").
+	ErrImportFormatUnsupported = errors.New("crm: unsupported import format")
 )

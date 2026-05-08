@@ -227,9 +227,39 @@ type SearchRespondentsResult struct {
 	TotalCount int
 }
 
+// ImportFormat enumerates the file formats accepted by Import.
+type ImportFormat string
+
+const (
+	// ImportFormatCSV is text/csv (RFC 4180-ish; we strip BOM, accept
+	// CRLF line endings, and tolerate NBSP / em-dash inside phone cells).
+	ImportFormatCSV ImportFormat = "csv"
+	// ImportFormatXLSX is the Office Open XML spreadsheet format read
+	// via the streaming excelize iterator.
+	ImportFormatXLSX ImportFormat = "xlsx"
+)
+
 // ImportRequest is the payload for RespondentService.Import.
+//
+// JobID is optional at the API surface — the service mints a UUIDv7
+// when blank and returns the assigned id in the ticket. Callers that
+// implement client-side retry should mint and pass the same JobID
+// across retries; asynq's Unique option ensures the second enqueue is
+// dropped (ErrDuplicateTask) so a flaky network does not double-import.
+//
+// TenantID is mandatory and MUST be derived from the caller's JWT
+// claims by the HTTP transport (Plan 06 Task 5). The service rejects
+// uuid.Nil with ErrInvalidArgument.
+//
+// Body is the raw file bytes; for v1 we accept payload-inline so
+// integration tests don't need an S3 backend. Plan 12 swaps this for a
+// blob_key reference when S3 is wired.
 type ImportRequest struct {
+	JobID        string
+	TenantID     uuid.UUID
 	ProjectID    uuid.UUID
+	Format       ImportFormat
+	Source       string
 	Filename     string
 	ContentType  string
 	Body         []byte
@@ -242,6 +272,8 @@ type ImportRequest struct {
 type ImportTicket struct {
 	JobID     string
 	ProjectID uuid.UUID
+	Enqueued  bool
+	Status    string
 	Total     int
 	StartedAt time.Time
 }

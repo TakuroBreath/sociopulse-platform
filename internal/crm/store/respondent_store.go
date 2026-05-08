@@ -215,3 +215,128 @@ func (s *RespondentStore) IsBlockedDNC(ctx context.Context, tx postgres.Tx, tena
 	}
 	return blocked, nil
 }
+
+// insertBatchColumns is the column projection used by InsertBatch's
+// COPY stream. The order MUST match the row produced by
+// CopyFromSlice's callback below; any drift between the two corrupts
+// the inserted rows silently.
+var insertBatchColumns = []string{
+	"tenant_id",
+	"project_id",
+	"phone_encrypted",
+	"phone_hash",
+	"region_code",
+	"attributes",
+	"status",
+	"source",
+}
+
+// InsertBatch implements api.RespondentStorePort.InsertBatch via
+// pgx.CopyFrom. The PostgreSQL COPY protocol streams the rows in a
+// single network round-trip and avoids per-row planner work — empirical
+// numbers from the pgx README show 10x-100x throughput vs. per-row
+// INSERT.
+//
+// CopyFrom does NOT support ON CONFLICT. The caller MUST run
+// ExistingHashes (and dedupe within the batch) BEFORE calling this
+// method; a leftover collision rolls back the whole COPY and is
+// surfaced as ErrDuplicateRespondent.
+//
+// Empty input is a no-op that returns (0, nil); CopyFrom on an empty
+// source still opens a server-side stream, so the early return is a
+// small but real optimisation.
+func (s *RespondentStore) InsertBatch(ctx context.Context, tx postgres.Tx, rows []api.Respondent) (int, error) {
+	if len(rows) == 0 {
+		return 0, nil
+	}
+
+	src := pgx.CopyFromSlice(len(rows), func(i int) ([]any, error) {
+		r := rows[i]
+		status := r.Status
+		if status == "" {
+			status = api.RespPending
+		}
+		source := r.Source
+		if source == "" {
+			source = api.SourceImported
+		}
+		attrs := r.Attributes
+		if attrs == nil {
+			attrs = map[string]any{}
+		}
+		return []any{
+			r.TenantID,
+			r.ProjectID,
+			r.PhoneEncrypted,
+			r.PhoneHash,
+			r.RegionCode,
+			attrs,
+			string(status),
+			source,
+		}, nil
+	})
+
+	count, err := tx.CopyFrom(ctx, pgx.Identifier{"respondents"}, insertBatchColumns, src)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == pgUniqueViolation && pgErr.ConstraintName == respondentUniqueConstraintCode {
+			return 0, errors.Join(api.ErrDuplicateRespondent, fmt.Errorf("constraint=%s", pgErr.ConstraintName))
+		}
+		return 0, fmt.Errorf("crm/store: copy from respondents: %w", err)
+	}
+
+	// pgx.CopyFrom returns int64; convert with the bounds check the
+	// project standards require (07-go-coding-standards.md § Safety).
+	if count < 0 {
+		return 0, fmt.Errorf("crm/store: copy from respondents: negative row count %d", count)
+	}
+	if count > int64(maxBatchInsertRows) {
+		return 0, fmt.Errorf("crm/store: copy from respondents: row count %d exceeds %d", count, maxBatchInsertRows)
+	}
+	return int(count), nil
+}
+
+// maxBatchInsertRows is the hard cap on rows passed to InsertBatch in
+// one call. The import service buffers in 1k-row groups; the cap here
+// is defense-in-depth so a misbehaving caller cannot smuggle a
+// 100M-row request that would exhaust connection memory.
+const maxBatchInsertRows = 100000
+
+// ExistingHashes implements api.RespondentStorePort.ExistingHashes.
+// Used by the import path to filter out rows whose phone_hash is
+// already present in (tenant_id, project_id) BEFORE the COPY runs —
+// CopyFrom doesn't support ON CONFLICT and a single collision rolls
+// back the whole batch.
+//
+// Empty input returns (nil, nil) without a query.
+func (s *RespondentStore) ExistingHashes(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, hashes [][]byte) ([][]byte, error) {
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+
+	const q = `
+		SELECT phone_hash
+		FROM respondents
+		WHERE tenant_id = $1
+		  AND project_id = $2
+		  AND phone_hash = ANY($3::bytea[])`
+
+	rows, err := tx.Query(ctx, q, tenantID, projectID, hashes)
+	if err != nil {
+		return nil, fmt.Errorf("crm/store: existing hashes query: %w", err)
+	}
+	defer rows.Close()
+
+	out := make([][]byte, 0, len(hashes))
+	for rows.Next() {
+		var h []byte
+		if scanErr := rows.Scan(&h); scanErr != nil {
+			return nil, fmt.Errorf("crm/store: existing hashes scan: %w", scanErr)
+		}
+		out = append(out, h)
+	}
+	if rerr := rows.Err(); rerr != nil {
+		return nil, fmt.Errorf("crm/store: existing hashes rows: %w", rerr)
+	}
+	return out, nil
+}

@@ -111,6 +111,31 @@ type RespondentStorePort interface {
 	// entries and tenant-wide entries (project_id IS NULL). Pure read;
 	// no audit row, no event publish.
 	IsBlockedDNC(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, phoneHash []byte) (bool, error)
+
+	// InsertBatch bulk-inserts respondents using the PostgreSQL COPY
+	// protocol (10x-100x faster than per-row INSERT). The supplied rows
+	// must already be deduplicated against the existing project — the
+	// caller is responsible for filtering on (tenant_id, project_id,
+	// phone_hash) collisions BEFORE this call (see ExistingHashes).
+	// Returns the number of rows actually written; zero rows is a no-op
+	// that returns (0, nil) without opening a copy stream.
+	//
+	// On a UNIQUE constraint violation the entire COPY operation rolls
+	// back — CopyFrom does NOT support ON CONFLICT. The error is wrapped
+	// so callers can errors.Is(err, ErrDuplicateRespondent) and retry
+	// after re-running ExistingHashes.
+	InsertBatch(ctx context.Context, tx postgres.Tx, rows []Respondent) (inserted int, err error)
+
+	// ExistingHashes returns the subset of `hashes` that already exist
+	// for (tenantID, projectID). Callers use this to dedupe their batch
+	// against rows already in Postgres before InsertBatch runs.
+	//
+	// The query is "SELECT phone_hash FROM respondents WHERE
+	// tenant_id = $1 AND project_id = $2 AND phone_hash = ANY($3)", so
+	// the cost is one round-trip plus a partial index scan on the
+	// (tenant_id, project_id, phone_hash) UNIQUE index. Empty input
+	// returns (nil, nil) without a query.
+	ExistingHashes(ctx context.Context, tx postgres.Tx, tenantID, projectID uuid.UUID, hashes [][]byte) ([][]byte, error)
 }
 
 // UpdatePatch carries the partial-update fields for ProjectStorePort.Update.

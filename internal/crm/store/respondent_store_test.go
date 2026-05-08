@@ -324,6 +324,129 @@ func TestRespondentStore_IsBlockedDNC_NoMatchReturnsFalse(t *testing.T) {
 	require.False(t, blocked)
 }
 
+func TestRespondentStore_InsertBatch_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-RESP-COPY")
+	projectID := seedProject(t, ctx, pool, tenantID, "RESP-PROJ-COPY")
+	s := store.NewRespondentStore(pool)
+
+	// Build 1500 respondents — exercises a batch larger than the
+	// service-layer batch size to confirm pgx.CopyFrom handles it.
+	const rowCount = 1500
+	rows := make([]crmapi.Respondent, rowCount)
+	for i := range rows {
+		hash := make([]byte, 32)
+		// distinct deterministic hashes
+		hash[0] = byte(i & 0xff)
+		hash[1] = byte((i >> 8) & 0xff)
+		rows[i] = crmapi.Respondent{
+			TenantID:       tenantID,
+			ProjectID:      projectID,
+			PhoneEncrypted: []byte{0xee, 0xee},
+			PhoneHash:      hash,
+			RegionCode:     "RU",
+			Source:         crmapi.SourceImported,
+		}
+	}
+
+	var inserted int
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		inserted, err = s.InsertBatch(ctx, tx, rows)
+		return err
+	}))
+	require.Equal(t, rowCount, inserted)
+
+	// ExistingHashes returns all the rows we just inserted.
+	hashes := make([][]byte, rowCount)
+	for i, r := range rows {
+		hashes[i] = r.PhoneHash
+	}
+	var existing [][]byte
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		existing, err = s.ExistingHashes(ctx, tx, tenantID, projectID, hashes)
+		return err
+	}))
+	require.Len(t, existing, rowCount)
+}
+
+func TestRespondentStore_InsertBatch_DuplicateInBatchFails(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-RESP-COPY-DUP")
+	projectID := seedProject(t, ctx, pool, tenantID, "RESP-PROJ-COPY-DUP")
+	s := store.NewRespondentStore(pool)
+
+	hash := []byte{0xfe, 0xfe, 0xfe, 0xfe}
+	rows := []crmapi.Respondent{
+		{TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x01}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
+		{TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x02}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
+	}
+
+	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		_, ierr := s.InsertBatch(ctx, tx, rows)
+		return ierr
+	})
+	require.ErrorIs(t, err, crmapi.ErrDuplicateRespondent)
+}
+
+func TestRespondentStore_ExistingHashes_ReturnsOnlyMatching(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-RESP-EH")
+	projectID := seedProject(t, ctx, pool, tenantID, "RESP-PROJ-EH")
+	s := store.NewRespondentStore(pool)
+
+	present := []byte{0xa1, 0xa2}
+	missing := []byte{0xb1, 0xb2}
+	insertRespondent(t, ctx, pool, s, crmapi.Respondent{
+		TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x01}, PhoneHash: present, RegionCode: "RU", Source: crmapi.SourceImported,
+	})
+
+	var existing [][]byte
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		existing, err = s.ExistingHashes(ctx, tx, tenantID, projectID, [][]byte{present, missing})
+		return err
+	}))
+	require.Len(t, existing, 1)
+	require.Equal(t, present, existing[0])
+}
+
+func TestRespondentStore_ExistingHashes_EmptyInputReturnsNil(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newCRMTestPool(t)
+	tenantID := seedTenant(t, ctx, pool, "CC-RESP-EH-EMPTY")
+	projectID := seedProject(t, ctx, pool, tenantID, "RESP-PROJ-EH-EMPTY")
+	s := store.NewRespondentStore(pool)
+
+	var existing [][]byte
+	require.NoError(t, pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var err error
+		existing, err = s.ExistingHashes(ctx, tx, tenantID, projectID, nil)
+		return err
+	}))
+	require.Empty(t, existing)
+}
+
 func TestRespondentStore_IsBlockedDNC_OtherProjectDoesNotBlock(t *testing.T) {
 	t.Parallel()
 

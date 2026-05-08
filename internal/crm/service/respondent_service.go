@@ -8,10 +8,12 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"go.uber.org/zap"
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	"github.com/sociopulse/platform/internal/crm/api"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
+	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/postgres"
 )
 
@@ -46,6 +48,12 @@ type RespondentService struct {
 	hasher tenancyapi.PhoneHasher
 	audit  auditapi.Logger
 	clock  func() time.Time
+	// Optional, attached via With* setters by the composition root.
+	// Tests inject hand-rolled fakes per behaviour-under-test.
+	enqueuer importEnqueuer
+	progress progressTracker
+	events   eventbus.Publisher
+	logger   *zap.Logger
 }
 
 // Compile-time assertion: *RespondentService must satisfy api.RespondentService.
@@ -100,6 +108,7 @@ func NewRespondentService(
 		hasher: hasher,
 		audit:  auditLogger,
 		clock:  clock,
+		logger: zap.NewNop(),
 	}
 }
 
@@ -288,15 +297,7 @@ func (s *RespondentService) Delete(_ context.Context, _ uuid.UUID) (*api.Deletio
 	return nil, errRespondentUnimplemented
 }
 
-// Import is stubbed pending Task 4.
-func (s *RespondentService) Import(_ context.Context, _ api.ImportRequest) (*api.ImportTicket, error) {
-	return nil, errRespondentUnimplemented
-}
-
-// GetImportStatus is stubbed pending Task 4.
-func (s *RespondentService) GetImportStatus(_ context.Context, _ string) (*api.ImportStatus, error) {
-	return nil, errRespondentUnimplemented
-}
+// Import and GetImportStatus live in import.go (Plan 06 Task 4).
 
 // validateCreateRespondentInput checks the synchronous-rejection
 // invariants on CreateRespondentInput. TenantID and ProjectID are

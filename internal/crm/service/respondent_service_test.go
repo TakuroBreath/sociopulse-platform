@@ -36,15 +36,19 @@ type fakeRespondentStore struct {
 
 	// programmable error injection — when not nil, the next
 	// matching call returns it (and clears the slot).
-	insertErr       error
-	getByIDErr      error
-	getByHashErr    error
-	isBlockedDNCErr error
+	insertErr         error
+	getByIDErr        error
+	getByHashErr      error
+	isBlockedDNCErr   error
+	insertBatchErr    error
+	existingHashesErr error
 
 	// counters so tests can confirm the service short-circuited.
-	insertCalls       int
-	getByHashCalls    int
-	isBlockedDNCCalls int
+	insertCalls         int
+	getByHashCalls      int
+	isBlockedDNCCalls   int
+	insertBatchCalls    int
+	existingHashesCalls int
 }
 
 func newFakeRespondentStore() *fakeRespondentStore {
@@ -139,6 +143,83 @@ func (s *fakeRespondentStore) IsBlockedDNC(_ context.Context, _ postgres.Tx, ten
 		return false, err
 	}
 	return s.dncBlocks[respondentKey(tenantID, projectID, phoneHash)], nil
+}
+
+// InsertBatch satisfies api.RespondentStorePort.InsertBatch. The fake
+// performs the same dedupe semantics as the real store (a duplicate in
+// the supplied slice causes the entire batch to fail), so tests can
+// assert the import service correctly pre-dedupes.
+func (s *fakeRespondentStore) InsertBatch(_ context.Context, _ postgres.Tx, rows []crmapi.Respondent) (int, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.insertBatchCalls++
+	if s.insertBatchErr != nil {
+		err := s.insertBatchErr
+		s.insertBatchErr = nil
+		return 0, err
+	}
+	if len(rows) == 0 {
+		return 0, nil
+	}
+	// Pre-validate the entire batch — CopyFrom is all-or-nothing.
+	keys := make([]string, 0, len(rows))
+	seen := make(map[string]struct{}, len(rows))
+	for _, r := range rows {
+		k := respondentKey(r.TenantID, r.ProjectID, r.PhoneHash)
+		if _, dup := seen[k]; dup {
+			return 0, crmapi.ErrDuplicateRespondent
+		}
+		seen[k] = struct{}{}
+		if _, dup := s.hashIndex[k]; dup {
+			return 0, crmapi.ErrDuplicateRespondent
+		}
+		keys = append(keys, k)
+	}
+	for i, r := range rows {
+		row := r
+		if row.ID == uuid.Nil {
+			row.ID = uuid.New()
+		}
+		if row.CreatedAt.IsZero() {
+			row.CreatedAt = time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC)
+		}
+		if row.Status == "" {
+			row.Status = crmapi.RespPending
+		}
+		if row.Source == "" {
+			row.Source = crmapi.SourceImported
+		}
+		s.rows[row.ID] = row
+		s.hashIndex[keys[i]] = row.ID
+	}
+	return len(rows), nil
+}
+
+// ExistingHashes satisfies api.RespondentStorePort.ExistingHashes. The
+// fake walks its in-memory hash index and returns the subset of hashes
+// already present.
+func (s *fakeRespondentStore) ExistingHashes(_ context.Context, _ postgres.Tx, tenantID, projectID uuid.UUID, hashes [][]byte) ([][]byte, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.existingHashesCalls++
+	if s.existingHashesErr != nil {
+		err := s.existingHashesErr
+		s.existingHashesErr = nil
+		return nil, err
+	}
+	if len(hashes) == 0 {
+		return nil, nil
+	}
+	out := make([][]byte, 0, len(hashes))
+	for _, h := range hashes {
+		k := respondentKey(tenantID, projectID, h)
+		if _, ok := s.hashIndex[k]; ok {
+			cp := make([]byte, len(h))
+			copy(cp, h)
+			out = append(out, cp)
+		}
+	}
+	return out, nil
 }
 
 // fakeKMS is a no-op KMS resolver: every Encrypt call returns
