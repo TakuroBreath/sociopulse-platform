@@ -116,3 +116,149 @@ func (m *Metrics) observeRateLimitClosure() {
 	}
 	m.RateLimitClosures.Inc()
 }
+
+// HubMetrics groups the Prometheus collectors emitted by the Hub. The
+// Hub-level counters live on a separate struct from the
+// per-connection Metrics so the Hub can be tested in isolation
+// (without a *Connection) and so the composition root can attach a
+// scoped registerer per layer.
+//
+// Construction is gated behind RegisterHubMetrics — same boot
+// discipline as RegisterMetrics. Plan 09/10 carry-forward (no
+// init()-time MustRegister).
+type HubMetrics struct {
+	// Connections is a gauge of currently-registered connections.
+	// Maintained by Hub.Connect (+1) / disconnect callback (-1).
+	Connections prometheus.Gauge
+
+	// Subscriptions is a gauge of active subscriptions, partitioned
+	// by topic. Bounded label set (six topics) — safe for dashboards.
+	Subscriptions *prometheus.GaugeVec
+
+	// BroadcastsTotal counts Hub.Broadcast invocations by topic.
+	// Useful for spotting a runaway publisher (one tenant flooding
+	// TopicCallEvents). Pairs with BroadcastFanout for ratio analysis.
+	BroadcastsTotal *prometheus.CounterVec
+
+	// BroadcastFanout counts the cumulative number of conn.Send
+	// dispatches issued by Broadcast, partitioned by topic. Divided
+	// by BroadcastsTotal it gives the average fan-out per topic —
+	// dashboards alert on ratio drops (subscriber leakage) or spikes
+	// (subscription explosion).
+	BroadcastFanout *prometheus.CounterVec
+
+	// SubscribeFailures counts Subscribe RBAC rejections, partitioned
+	// by topic + reason ("forbidden", "filter_required", "unknown").
+	// Bounded labels.
+	SubscribeFailures *prometheus.CounterVec
+}
+
+// RegisterHubMetrics builds a fresh *HubMetrics and registers every
+// collector on the supplied registerer. nil registerer panics — same
+// rule as RegisterMetrics.
+func RegisterHubMetrics(reg prometheus.Registerer) *HubMetrics {
+	if reg == nil {
+		panic("service.RegisterHubMetrics: reg must be non-nil; pass prometheus.NewRegistry() in tests")
+	}
+	m := &HubMetrics{
+		Connections: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "realtime_hub_connections",
+				Help: "Current number of WebSocket connections registered with the realtime Hub.",
+			},
+		),
+		Subscriptions: prometheus.NewGaugeVec(
+			prometheus.GaugeOpts{
+				Name: "realtime_hub_subscriptions",
+				Help: "Current number of active subscriptions, by topic.",
+			},
+			[]string{"topic"},
+		),
+		BroadcastsTotal: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "realtime_hub_broadcasts_total",
+				Help: "Total Hub.Broadcast invocations, by topic.",
+			},
+			[]string{"topic"},
+		),
+		BroadcastFanout: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "realtime_hub_broadcast_fanout_total",
+				Help: "Total conn.Send dispatches issued by Hub.Broadcast, by topic.",
+			},
+			[]string{"topic"},
+		),
+		SubscribeFailures: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "realtime_hub_subscribe_failures_total",
+				Help: "Total Subscribe rejections at the Hub, by topic and reason.",
+			},
+			[]string{"topic", "reason"},
+		),
+	}
+	reg.MustRegister(
+		m.Connections,
+		m.Subscriptions,
+		m.BroadcastsTotal,
+		m.BroadcastFanout,
+		m.SubscribeFailures,
+	)
+	return m
+}
+
+// observeConnect increments the Connections gauge. nil-tolerated.
+func (m *HubMetrics) observeConnect() {
+	if m == nil || m.Connections == nil {
+		return
+	}
+	m.Connections.Inc()
+}
+
+// observeDisconnect decrements the Connections gauge. nil-tolerated.
+func (m *HubMetrics) observeDisconnect() {
+	if m == nil || m.Connections == nil {
+		return
+	}
+	m.Connections.Dec()
+}
+
+// observeSubscribe increments the per-topic Subscriptions gauge.
+// nil-tolerated.
+func (m *HubMetrics) observeSubscribe(topic string) {
+	if m == nil || m.Subscriptions == nil {
+		return
+	}
+	m.Subscriptions.WithLabelValues(topic).Inc()
+}
+
+// observeUnsubscribe decrements the per-topic Subscriptions gauge.
+// nil-tolerated.
+func (m *HubMetrics) observeUnsubscribe(topic string) {
+	if m == nil || m.Subscriptions == nil {
+		return
+	}
+	m.Subscriptions.WithLabelValues(topic).Dec()
+}
+
+// observeBroadcast records a Hub.Broadcast invocation and the
+// resulting fan-out count. nil-tolerated.
+func (m *HubMetrics) observeBroadcast(topic string, fanout int) {
+	if m == nil {
+		return
+	}
+	if m.BroadcastsTotal != nil {
+		m.BroadcastsTotal.WithLabelValues(topic).Inc()
+	}
+	if m.BroadcastFanout != nil && fanout > 0 {
+		m.BroadcastFanout.WithLabelValues(topic).Add(float64(fanout))
+	}
+}
+
+// observeSubscribeFailure records a Subscribe rejection by the RBAC
+// matrix or the unknown-topic guard. nil-tolerated.
+func (m *HubMetrics) observeSubscribeFailure(topic, reason string) {
+	if m == nil || m.SubscribeFailures == nil {
+		return
+	}
+	m.SubscribeFailures.WithLabelValues(topic, reason).Inc()
+}

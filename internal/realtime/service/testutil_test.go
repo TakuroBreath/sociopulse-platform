@@ -273,3 +273,14 @@ func mustJSON(t *testing.T, v any) []byte {
 	require.NoError(t, err)
 	return b
 }
+
+// newTestHub builds a *Hub with nil metrics and a nop logger,
+// pre-wired with the canonical TopicRBAC. The Hub's Shutdown is
+// registered as t.Cleanup so a forgotten teardown still leaves no
+// dangling registrations across parallel tests.
+func newTestHub(t *testing.T) *service.Hub {
+	t.Helper()
+	hub := service.NewHub(nil, nil, service.NewTopicRBAC())
+	t.Cleanup(hub.Shutdown)
+	return hub
+}

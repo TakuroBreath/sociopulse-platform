@@ -50,6 +50,29 @@ type AuthValidator interface {
 // are logged and dropped. Task 3 wires the real callback.
 type HubCallback func(c *Connection, frame rtapi.Frame)
 
+// SubscribeFn is the Hub-side handler for direct (Connection.Subscribe)
+// subscription registration. Returns the assigned subID or an error
+// (RBAC denial / unknown topic). Plan 11 Task 3 wires the real fn at
+// Hub.Connect time; before then it is nil and Connection.Subscribe
+// returns ErrConnectionClosed.
+type SubscribeFn func(c *Connection, topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error)
+
+// UnsubscribeFn is the Hub-side handler for direct (Connection.Unsubscribe)
+// subscription removal. Plan 11 Task 3 wires the real fn at
+// Hub.Connect time; before then it is nil and Connection.Unsubscribe
+// is a silent no-op.
+type UnsubscribeFn func(c *Connection, subID string)
+
+// OnCloseFn is invoked exactly once when the Connection's idempotent
+// close path fires. The Hub wires this at Connect time so it can
+// drop the connection from its per-tenant + flat maps and clean up
+// any subscriptions registered by the reader goroutine.
+//
+// The callback runs synchronously inside Close — Hub-side code MUST
+// be lock-light and never call back into Connection.Close (would
+// deadlock the closeOnce).
+type OnCloseFn func(c *Connection)
+
 // Connection wraps a WSConn with the per-client lifecycle bundle:
 // reader / writer / pinger goroutines, a bounded send queue, an
 // atomic Claims pointer (swapped on token refresh), and idempotent
@@ -61,12 +84,15 @@ type HubCallback func(c *Connection, frame rtapi.Frame)
 // the rtapi.Connection interface returned by Hub.Connect (wired in
 // Task 3).
 type Connection struct {
-	id      string
-	wsConn  rtapi.WSConn
-	cfg     ConnectionConfig
-	auth    AuthValidator
-	onFrame HubCallback
-	metrics *Metrics
+	id          string
+	wsConn      rtapi.WSConn
+	cfg         ConnectionConfig
+	auth        AuthValidator
+	onFrame     HubCallback
+	subscribeFn SubscribeFn
+	unsubFn     UnsubscribeFn
+	onClose     OnCloseFn
+	metrics     *Metrics
 
 	// claims is swapped atomically on FrameRefresh. Writers (the
 	// reader goroutine on FrameRefresh, AuthHandshake on initial
@@ -156,10 +182,43 @@ func NewConnection(wsConn rtapi.WSConn, cfg ConnectionConfig) *Connection {
 // SetMetrics attaches a *Metrics. nil is allowed (default behaviour).
 func (c *Connection) SetMetrics(m *Metrics) { c.metrics = m }
 
+// SeedClaims marks the connection authenticated with the supplied
+// claims, bypassing the wire-side AuthHandshake. The HTTP handler
+// uses this when it has already validated the upgrade-time
+// Authorization header (cookie / bearer) and wants Hub.Connect to
+// register the connection without a second round-trip.
+//
+// Idempotent: a second call swaps claims atomically. Tests use this
+// to register a *Connection with the Hub without driving the wire
+// handshake through fakeWSConn.
+func (c *Connection) SeedClaims(claims rtapi.Claims) {
+	c.claims.Store(&claims)
+	c.authenticated.Store(true)
+}
+
 // SetHubCallback wires the Hub-side handler for inbound Subscribe /
 // Unsubscribe / non-control frames. Called once by Hub.Connect (Plan
 // 11 Task 3) immediately after AuthHandshake and before Run.
 func (c *Connection) SetHubCallback(cb HubCallback) { c.onFrame = cb }
+
+// setSubscribeFn wires the Hub-side handler for the direct
+// Connection.Subscribe path. Hub.Connect calls this once
+// post-registration; tests that want to bypass the Hub set it
+// directly via the package-internal helper newConnectionWithHooks.
+//
+// Package-private on purpose: production callers go through Hub.Connect
+// which sets this synchronously while holding hub.mu.
+func (c *Connection) setSubscribeFn(fn SubscribeFn) { c.subscribeFn = fn }
+
+// setUnsubscribeFn pairs with setSubscribeFn for the Unsubscribe path.
+func (c *Connection) setUnsubscribeFn(fn UnsubscribeFn) { c.unsubFn = fn }
+
+// setOnClose wires the Hub-side cleanup callback that fires once when
+// Close fires (idempotent — the closeOnce gate ensures the callback
+// runs at most once). Hub.Connect uses this to drop the conn from
+// the per-tenant + flat maps and clean up any registered
+// subscriptions.
+func (c *Connection) setOnClose(fn OnCloseFn) { c.onClose = fn }
 
 // ID returns the server-side connection ID. Stable for the connection
 // lifetime; used as the {conn_id} Prometheus label and as the Hub
@@ -181,26 +240,57 @@ func (c *Connection) Claims() rtapi.Claims {
 // the Metrics counter.
 func (c *Connection) DroppedFrames() uint64 { return c.droppedFrames.Load() }
 
-// Subscribe is a thin facade that defers to the Hub (Plan 11 Task 3).
-// Until the Hub is wired, Subscribe returns ErrConnectionClosed
-// (semantically: the Hub side of the connection isn't online yet).
-func (c *Connection) Subscribe(_ rtapi.Topic, _ rtapi.SubscriptionFilter) (string, error) {
+// DrainSendForTest non-blocking-pulls one frame off the send queue
+// without spawning runWriter. Returns nil if the queue is empty.
+//
+// Hub-level tests rely on this to assert delivery without driving the
+// full reader/writer/pinger triple — they only need to know the Hub
+// did call Send. Production code MUST never use this; it bypasses the
+// writer goroutine.
+func (c *Connection) DrainSendForTest() *rtapi.Frame {
+	select {
+	case frame := <-c.sendChan:
+		return &frame
+	default:
+		return nil
+	}
+}
+
+// IsClosedForTest reports whether Close has been invoked. Test helper
+// for Hub-level disconnect-by-user assertions; production code should
+// observe close state via the Run-returned-cleanly invariant.
+func (c *Connection) IsClosedForTest() bool { return c.closed.Load() }
+
+// Subscribe is a thin facade that defers to the Hub. Hub.Connect
+// wires subscribeFn at registration time; tests that construct a
+// *Connection without a Hub get the not-wired guard below so a
+// production-style assertion (Subscribe must succeed) fails loudly
+// instead of silently no-op'ing.
+func (c *Connection) Subscribe(topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error) {
 	if c.closed.Load() {
 		return "", ErrConnectionClosed
 	}
 	if !c.authenticated.Load() {
 		return "", ErrAuthRequired
 	}
-	// Hub wiring lands in Task 3; surface as not-yet-wired so a
-	// bug-report (someone called Subscribe before Task 3 lands)
-	// surfaces loudly.
-	return "", errors.New("realtime/service: Subscribe not wired (Plan 11 Task 3)")
+	if c.subscribeFn == nil {
+		return "", errors.New("realtime/service: Subscribe not wired (Hub.Connect not called)")
+	}
+	return c.subscribeFn(c, topic, filter)
 }
 
-// Unsubscribe removes the subscription with the given ID. Same
-// stub-pending-Task-3 status as Subscribe.
-func (c *Connection) Unsubscribe(_ string) {
-	// Stub until Task 3.
+// Unsubscribe removes the subscription with the given ID. Defers to
+// the Hub's wired UnsubscribeFn — silent no-op if the connection has
+// no Hub (e.g., a unit test that never called Hub.Connect) or has
+// already closed.
+func (c *Connection) Unsubscribe(subID string) {
+	if c.closed.Load() {
+		return
+	}
+	if c.unsubFn == nil {
+		return
+	}
+	c.unsubFn(c, subID)
 }
 
 // Send queues frame for delivery on the writer goroutine.
@@ -376,11 +466,19 @@ func (c *Connection) Run(ctx context.Context) error {
 // Close signals all goroutines to exit and returns immediately. The
 // final close-frame to the client is emitted by Run (which blocks
 // until close fires). Idempotent: repeated calls are no-ops.
+//
+// If the Hub wired an onClose callback at Connect time, it fires
+// here exactly once (gated by the same sync.Once that gates the
+// close-channel signal). The Hub uses this to drop the connection
+// from its per-tenant + flat maps and clean up subscriptions.
 func (c *Connection) Close(reason rtapi.CloseReason) {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.closeReason.Store(&reason)
 		close(c.closeChan)
+		if c.onClose != nil {
+			c.onClose(c)
+		}
 	})
 }
 
