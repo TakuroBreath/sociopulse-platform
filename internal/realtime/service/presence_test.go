@@ -471,7 +471,7 @@ func TestPresence_RegisterPresenceMetricsNilRegistererPanics(t *testing.T) {
 	})
 }
 
-// TestPresence_TouchOnConnectSequenceKeepsTTL is a regression guard
+// TestPresence_TouchDoesNotResurrectMissingKey is a regression guard
 // for the "Touch must not silently re-create a missing key" rule. The
 // Hub flow is OnConnect → many Touch calls; if Touch ever called SET
 // instead of EXPIRE, a stale TTL bug could mask a session that should
@@ -561,11 +561,14 @@ func TestPresence_OnlineUsersIgnoresStrayKeys(t *testing.T) {
 	// SplitN(_, ":", 4) yields ["presence", "tenant-A", "user",
 	// "weird:extra:bits"] — userID is "weird:extra:bits", which the
 	// guard accepts (parts[3] is non-empty and parts[2]=="user").
-	// We assert alice is present plus the stray key surfaces (the
-	// parser is forgiving by design — operators see the stray and
-	// fix it). The point of this test is to lock in non-panic
-	// behaviour.
+	// The parser is forgiving by design: operators see the stray ID
+	// in dashboards and fix the upstream wiring. The point of this
+	// test is to lock in non-panic behaviour AND the documented
+	// forgiving-parse contract — both alice and the stray must
+	// surface in the result so a future tightening of the parser
+	// produces a visible diff in this test.
 	assert.Contains(t, users, "alice")
+	assert.Contains(t, users, "weird:extra:bits")
 }
 
 // TestPresence_OnlineUsersScansAcrossManyKeys verifies the SCAN loop
