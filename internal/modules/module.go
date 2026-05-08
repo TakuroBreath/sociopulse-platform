@@ -11,6 +11,7 @@ import (
 	"context"
 
 	"github.com/gin-gonic/gin"
+	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
@@ -25,10 +26,20 @@ import (
 // Modules must NOT reach beyond Deps for shared infrastructure — adding a
 // new field here is intentional and reviewed.
 type Deps struct {
-	Ctx        context.Context
-	Logger     *zap.Logger
-	Config     *config.Config
-	Pool       *postgres.Pool
+	Ctx    context.Context
+	Logger *zap.Logger
+	Config *config.Config
+	Pool   *postgres.Pool
+	// Redis is the project-wide Redis client used for refresh-token
+	// whitelisting, session revocation, login rate-limiting, and account
+	// lockout. Plan 05 Task 8/9 introduced this field; cmd/api wires a
+	// real *redis.Client once the host environment exposes one — until
+	// then individual modules guard nil and skip features that depend
+	// on Redis. The redis.UniversalClient interface is used (rather
+	// than *redis.Client) so the same wiring works against
+	// *redis.ClusterClient, miniredis, and Sentinel backends without
+	// reshuffling Deps.
+	Redis      redis.UniversalClient
 	EventBus   eventbus.Publisher
 	Subscriber eventbus.Subscriber
 	HTTPRouter *gin.Engine
