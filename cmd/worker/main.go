@@ -221,7 +221,9 @@ func run(ctx context.Context, configDir string) error {
 		return nil
 	})
 	for _, runner := range recordingRunners {
-		runner := runner // capture per-iteration; redundant on Go 1.22+ but explicit is cheaper than a re-trip through the spec
+		// Per-iteration loop-var capture is automatic on Go 1.22+ (the
+		// project pins 1.26.3 in CI). The closure below captures
+		// `runner` without an explicit `runner := runner` shadow.
 		g.Go(func() error {
 			if err := runner.run(gctx); err != nil && !errors.Is(err, context.Canceled) {
 				return fmt.Errorf("%s: %w", runner.name, err)
