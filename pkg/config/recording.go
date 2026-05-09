@@ -2,8 +2,47 @@ package config
 
 import "time"
 
-// RecordingConfig — Plan 12 owns the pipeline; we only plumb settings here.
+// RecordingConfig — Plan 12 owns the pipeline; this struct plumbs
+// settings into both the local recorder (cmd/recording-uploader, future)
+// AND the cmd/api gRPC façade defined in Plan 12.1 Task 5.
+//
+// The RecordingService gRPC fields (Enabled, GRPCListenAddr, TLS*,
+// MaxRecvBytes, Timeout) are consumed by internal/recording.Module —
+// when Enabled=false the module skips the listener entirely and
+// recording remains accessible via the in-process locator only. This
+// is the default in dev/test where the cert material isn't
+// provisioned.
 type RecordingConfig struct {
+	// Enabled gates the gRPC façade. False (default) means the
+	// listener is not started; the in-process RecordingService is
+	// still registered in the locator for HTTP transports.
+	Enabled bool `mapstructure:"enabled"`
+
+	// GRPCListenAddr is the host:port the gRPC server binds to.
+	// Default ":9091" (mirrors GRPCConfig.Bind, but recording lives
+	// on its own listener so cmd/api's existing gRPC config can be
+	// repurposed for non-recording RPCs in the future).
+	GRPCListenAddr string `mapstructure:"grpc_listen_addr"`
+
+	// TLS material. mTLS is mandatory in production —
+	// internal/recording/grpcserver requires all three to be set or
+	// it refuses to construct the server. Empty paths disable the
+	// listener with a WARN log, not a hard failure.
+	TLSCertFile string `mapstructure:"tls_cert_file"`
+	TLSKeyFile  string `mapstructure:"tls_key_file"`
+	TLSCAFile   string `mapstructure:"tls_ca_file"`
+
+	// MaxRecvBytes caps the per-message size; 0 falls back to the
+	// gRPC server's default (4 MiB).
+	MaxRecvBytes int `mapstructure:"max_recv_bytes"`
+
+	// Timeout caps the per-call wall time; 0 falls back to the
+	// server's default (30s).
+	Timeout time.Duration `mapstructure:"timeout"`
+
+	// Pipeline / uploader knobs. Owned by Plan 12 future tasks;
+	// listed here so the YAML structure stays stable as the module
+	// grows. Empty values are valid in dev.
 	LocalBufferPath string             `mapstructure:"local_buffer_path"`
 	StagingPath     string             `mapstructure:"staging_path"`
 	FFmpeg          RecordingFFmpeg    `mapstructure:"ffmpeg"`

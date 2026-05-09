@@ -37,6 +37,7 @@ import (
 	"github.com/sociopulse/platform/internal/realtime"
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	rtevents "github.com/sociopulse/platform/internal/realtime/events"
+	"github.com/sociopulse/platform/internal/recording"
 	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/eventbus"
@@ -273,9 +274,19 @@ func run(ctx context.Context, configDir string) error {
 	//    and is strictly safer than no check.
 	dialerModule := &dialer.Module{}
 	realtimeModule := realtime.New(realtime.Config{Registerer: metrics.Registry})
+	// Plan 12.1 Task 5 — recording module. Has no upstream module
+	// deps (just Pool + Logger + Locator) so it joins the providers
+	// walk. The gRPC façade is gated by cfg.Recording.Enabled — when
+	// false (the dev default) the module registers RecordingService
+	// in the locator but skips the listener.
+	recordingModule := recording.New(recording.Config{
+		Registerer: metrics.Registry,
+		GRPCConfig: recordingGRPCConfig(cfg.Recording),
+	})
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
+		recordingModule,
 	}}
 	if err := registerModules(providers, deps, logger, redisErr); err != nil {
 		return err
@@ -290,6 +301,11 @@ func run(ctx context.Context, configDir string) error {
 	defer func() {
 		if err := dialerModule.Stop(); err != nil {
 			logger.Warn("dialer module Stop failed", zap.Error(err))
+		}
+	}()
+	defer func() {
+		if err := recordingModule.Stop(); err != nil {
+			logger.Warn("recording module Stop failed", zap.Error(err))
 		}
 	}()
 
@@ -416,6 +432,17 @@ func run(ctx context.Context, configDir string) error {
 			return nil
 		})
 	}
+	// Plan 12.1 Task 5 — recording.Module.Start blocks on gctx whether
+	// or not the gRPC listener was configured. When disabled it just
+	// waits on shutdown (tracking the goroutine in the errgroup); when
+	// enabled it runs the listener and surfaces Serve errors back to
+	// the group so a TLS listener crash trips a clean shutdown.
+	g.Go(func() error {
+		if err := recordingModule.Start(gctx); err != nil {
+			return fmt.Errorf("recording listener: %w", err)
+		}
+		return nil
+	})
 
 	// 12. Wait for shutdown signal — either ctx.Done (SIGTERM) or one of the
 	//     errgroup goroutines failing.

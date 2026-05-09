@@ -126,6 +126,16 @@ telephony:
     default_strategy: least_cost_with_fallback
 
 recording:
+  # Plan 12.1 Task 5 — gRPC façade. Disabled in dev because the cert
+  # material isn't provisioned; cmd/api still registers
+  # RecordingService in the locator so HTTP transports work.
+  enabled: false
+  grpc_listen_addr: ":9091"
+  tls_cert_file: ""
+  tls_key_file: ""
+  tls_ca_file: ""
+  max_recv_bytes: 4194304   # 4 MiB
+  timeout: 30s
   local_buffer_path: /var/spool/sociopulse
   staging_path: /var/spool/sociopulse/.staging
   ffmpeg:
