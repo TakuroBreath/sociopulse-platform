@@ -27,6 +27,12 @@ const (
 // cardinality label values for the metrics collectors. Constants keep
 // the call-sites typo-resistant.
 const (
+	// leaderPassRetention is the value of the LeaderActive gauge's
+	// `pass` label for the retention sweep — distinct from
+	// passLabelColdMove / passLabelDelete (those are sweep-internal
+	// pass names, leaderPassRetention is the daemon name).
+	leaderPassRetention = "retention"
+
 	passLabelColdMove = "cold_move"
 	passLabelDelete   = "delete"
 
@@ -187,6 +193,10 @@ func NewRetentionPass(cfg RetentionConfig) (*RetentionPass, error) {
 // SweepOnce. On ctx cancellation the loop terminates cleanly — any
 // held lock is Released so a peer takes over without waiting for TCP
 // keepalive timeouts.
+//
+// Call Run once per process; running multiple instances against the
+// same lock key is safe (the advisory lock serialises) but wastes
+// goroutines and metric churn.
 func (p *RetentionPass) Run(ctx context.Context) error {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -204,6 +214,9 @@ func (p *RetentionPass) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Clear the leader gauge before Release so dashboards see
+			// the handoff happen in the right order.
+			p.metrics.SetLeaderActive(leaderPassRetention, false)
 			//nolint:contextcheck // intentional: release lock even when caller ctx is done.
 			p.leader.Release(context.Background())
 			p.log.Info("recording retention pass stopped", zap.Error(ctx.Err()))
@@ -223,8 +236,10 @@ func (p *RetentionPass) tick(ctx context.Context) {
 		p.log.Warn("retention leader acquire failed; skipping tick",
 			zap.Error(err),
 		)
+		p.metrics.SetLeaderActive(leaderPassRetention, false)
 		return
 	}
+	p.metrics.SetLeaderActive(leaderPassRetention, leading)
 	if !leading {
 		p.log.Debug("retention leader held by peer; skipping tick")
 		return
@@ -294,6 +309,7 @@ func (p *RetentionPass) handleColdMove(ctx context.Context, row rapi.LifecycleRo
 			"recording_id":     row.ID,
 			"call_id":          row.CallID,
 			"audio_object_key": row.AudioObjectKey,
+			"sha256":           row.SHA256Hex, // chain-of-custody parity with the commit-audit row.
 			"cold_at":          row.ColdAt,
 			"prev_status":      row.Status,
 		}
@@ -370,6 +386,11 @@ func (p *RetentionPass) handleDelete(ctx context.Context, row rapi.LifecycleRow,
 	if delErr := p.objects.Delete(ctx, row.S3Bucket, row.AudioObjectKey); delErr != nil {
 		switch {
 		case errors.Is(delErr, storage.ErrObjectNotFound):
+			// Defensive against S3-backed implementations that surface
+			// NotFound on Delete: the in-tree FsObjectStore returns nil
+			// for an absent object, but a future S3 backend may report
+			// 404 (e.g. delete-already-applied by ops). Keep DB and
+			// object store reconciled either way.
 			orphaned = true
 			p.log.Debug("retention delete Phase A: object already gone (orphaned)",
 				zap.String("recording_id", row.ID.String()),
@@ -403,6 +424,7 @@ func (p *RetentionPass) handleDelete(ctx context.Context, row rapi.LifecycleRow,
 			"recording_id":     row.ID,
 			"call_id":          row.CallID,
 			"audio_object_key": row.AudioObjectKey,
+			"sha256":           row.SHA256Hex, // chain-of-custody parity with the commit-audit row.
 			"prev_status":      row.Status,
 			"orphaned":         orphaned,
 			"reason":           deleteReasonRetention,

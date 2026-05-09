@@ -4,6 +4,7 @@ package worker_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"os"
@@ -353,6 +354,13 @@ func TestRetentionPass_ColdMove_HappyPath(t *testing.T) {
 		"exactly one cold_moved audit row")
 	require.Empty(t, f.out.snapshot(), "cold-move must NOT emit an outbox event")
 	require.Equal(t, 0, f.objs.deleteCount(), "cold-move must NOT call ObjectStore.Delete")
+
+	// Metric label assertions: silent regressions in the label set
+	// (e.g. accidentally sending "stale" instead of "ok") fail loudly here.
+	tenantLabel := tenantID.String()
+	require.InDelta(t, 1.0,
+		counterValue(t, f.mtr.RetentionActionsTotal, tenantLabel, "cold_moved", "ok"),
+		0, "RetentionActionsTotal{cold_moved,ok} must tick exactly once")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -401,6 +409,25 @@ func TestRetentionPass_Delete_HappyPath(t *testing.T) {
 	require.Equal(t, rapi.SubjectRecordingCallDeletedFor(tenantID), ev.Subject)
 	require.NotNil(t, ev.TenantID)
 	require.Equal(t, tenantID, *ev.TenantID)
+
+	// Unmarshal the outbox payload and assert every field — guards
+	// against JSON-tag drift on RecordingCallDeletedEvent that would
+	// silently break downstream subscribers.
+	var payload rapi.RecordingCallDeletedEvent
+	require.NoError(t, json.Unmarshal(ev.Payload, &payload), "payload must round-trip")
+	require.Equal(t, row.ID, payload.RecordingID, "payload.recording_id must equal row.ID")
+	require.Equal(t, callID, payload.CallID, "payload.call_id must equal seeded call")
+	require.Equal(t, tenantID, payload.TenantID, "payload.tenant_id must equal seeded tenant")
+	require.Equal(t, "retention", payload.Reason,
+		"payload.reason must be 'retention' for worker-driven deletes")
+	require.Greater(t, payload.DeletedAt, int64(0),
+		"payload.deleted_at must be a non-zero unix timestamp")
+
+	// Metric label assertions.
+	tenantLabel := tenantID.String()
+	require.InDelta(t, 1.0,
+		counterValue(t, f.mtr.RetentionActionsTotal, tenantLabel, "deleted", "ok"),
+		0, "RetentionActionsTotal{deleted,ok} must tick exactly once on happy-path")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -439,6 +466,17 @@ func TestRetentionPass_Delete_ObjectAlreadyGone(t *testing.T) {
 		"orphan path must still flip status — DB and S3 reconciled")
 	require.Equal(t, 1, auditCount(t, f.pool, tenantID, rapi.AuditActionDeleted))
 	require.Len(t, f.out.snapshot(), 1, "outbox event still emitted on orphan path")
+
+	// Metric label assertion: the orphan branch must record under the
+	// dedicated "orphaned" result label so dashboards distinguish
+	// reconciliation events from clean deletes.
+	tenantLabel := tenantID.String()
+	require.InDelta(t, 1.0,
+		counterValue(t, f.mtr.RetentionActionsTotal, tenantLabel, "deleted", "orphaned"),
+		0, "RetentionActionsTotal{deleted,orphaned} must tick on the orphan branch")
+	require.InDelta(t, 0.0,
+		counterValue(t, f.mtr.RetentionActionsTotal, tenantLabel, "deleted", "ok"),
+		0, "the 'ok' label must NOT also tick — orphan path is mutually exclusive")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -477,4 +515,12 @@ func TestRetentionPass_Delete_ObjectStoreError(t *testing.T) {
 	require.Equal(t, 0, auditCount(t, f.pool, tenantID, rapi.AuditActionDeleted),
 		"no audit row when Phase A failed")
 	require.Empty(t, f.out.snapshot(), "no outbox event when Phase A failed")
+
+	// Metric label assertion: a generic Phase A error MUST land on the
+	// "error" result label (not "stale" or "orphaned"). This is the
+	// signal operators alert on for transient S3 outages.
+	tenantLabel := tenantID.String()
+	require.InDelta(t, 1.0,
+		counterValue(t, f.mtr.RetentionActionsTotal, tenantLabel, "deleted", "error"),
+		0, "RetentionActionsTotal{deleted,error} must tick on Phase A failure")
 }

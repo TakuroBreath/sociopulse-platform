@@ -37,5 +37,7 @@ func TestRecordingMetrics_NilReceiverNoOp(t *testing.T) {
 		m.ObserveIntegrityPass("ok", 0.1)
 		m.IncIntegrityAction("t", "ok")
 		m.IncIntegrityFailure("t")
+		m.SetLeaderActive("retention", true)
+		m.SetLeaderActive("integrity", false)
 	})
 }

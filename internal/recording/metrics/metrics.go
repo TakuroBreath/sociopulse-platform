@@ -40,10 +40,12 @@ type RecordingMetrics struct {
 	RetentionActionsTotal *prometheus.CounterVec
 
 	// IntegrityPassDuration measures one full integrity sweep. Result is
-	// "ok" (sweep completed; per-row errors are tracked separately on
-	// IntegrityActionsTotal) or "error" (the SampleForVerify query itself
-	// failed). Buckets cover 100ms .. ~17min to track verify load against
-	// SLOs.
+	// "ok" (sweep completed with at least one row processed; per-row
+	// errors are tracked separately on IntegrityActionsTotal), "empty"
+	// (SampleForVerify returned zero rows — distinct from "ok" so a hung
+	// daemon doesn't look identical to a genuinely empty queue), or
+	// "error" (the SampleForVerify query itself failed). Buckets cover
+	// 100ms .. ~17min to track verify load against SLOs.
 	IntegrityPassDuration *prometheus.HistogramVec
 
 	// IntegrityActionsTotal counts per-row outcomes inside an integrity
@@ -67,6 +69,16 @@ type RecordingMetrics struct {
 	// dedicated alert pane on the failure metric without filtering
 	// labels.
 	IntegrityFailuresTotal *prometheus.CounterVec
+
+	// LeaderActive is 1 on the replica currently holding the advisory
+	// lock for a given pass and 0 elsewhere. Exactly one replica should
+	// report 1 per pass at a time across the cluster — operators see
+	// from metrics alone which replica is leading the sweeps. Mirrors
+	// internal/dialer/retry/Metrics.LeaderActive but split by pass so
+	// the retention and integrity slots are independent.
+	//
+	// Label "pass" values: "retention" | "integrity".
+	LeaderActive *prometheus.GaugeVec
 }
 
 // RegisterRecordingMetrics constructs and registers all collectors with reg.
@@ -148,6 +160,13 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 			Name:      "integrity_failures_total",
 			Help:      "Confirmed checksum mismatches per tenant (master spec §15.5).",
 		}, []string{"tenant_id"}),
+
+		LeaderActive: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "leader_active",
+			Help:      "1 when this replica holds the lifecycle-pass advisory lock; 0 otherwise. Label pass={retention|integrity}.",
+		}, []string{"pass"}),
 	}
 
 	if reg == nil {
@@ -159,6 +178,7 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 		m.AccessTotal, m.AccessDuration,
 		m.RetentionPassDuration, m.RetentionActionsTotal,
 		m.IntegrityPassDuration, m.IntegrityActionsTotal, m.IntegrityFailuresTotal,
+		m.LeaderActive,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("recording metrics: register: %w", err)
@@ -214,10 +234,12 @@ func (m *RecordingMetrics) IncRetentionAction(tenantID, action, result string) {
 }
 
 // ObserveIntegrityPass records one integrity sweep's wall-clock
-// duration. Safe on a nil receiver. result is "ok" | "error" — the
-// SampleForVerify query failure case is the only "error" outcome at
-// the pass level (per-row VerifyChecksum errors are bucketed onto
-// IntegrityActionsTotal instead).
+// duration. Safe on a nil receiver. result is "ok" | "empty" | "error":
+// "empty" marks zero-row sweeps so a hung daemon doesn't look
+// identical to a genuinely empty queue. The SampleForVerify query
+// failure case is the only "error" outcome at the pass level (per-row
+// VerifyChecksum errors are bucketed onto IntegrityActionsTotal
+// instead).
 func (m *RecordingMetrics) ObserveIntegrityPass(result string, durSec float64) {
 	if m == nil {
 		return
@@ -243,4 +265,19 @@ func (m *RecordingMetrics) IncIntegrityFailure(tenantID string) {
 		return
 	}
 	m.IntegrityFailuresTotal.WithLabelValues(tenantID).Inc()
+}
+
+// SetLeaderActive writes the per-pass leader gauge. Safe on a nil
+// receiver. pass is "retention" | "integrity"; active=true on a
+// successful Acquire, false after Release / failed Acquire so peers'
+// dashboards stay consistent.
+func (m *RecordingMetrics) SetLeaderActive(pass string, active bool) {
+	if m == nil {
+		return
+	}
+	v := 0.0
+	if active {
+		v = 1.0
+	}
+	m.LeaderActive.WithLabelValues(pass).Set(v)
 }

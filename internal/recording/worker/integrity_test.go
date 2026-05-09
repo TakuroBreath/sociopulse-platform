@@ -11,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/prometheus/client_golang/prometheus"
-	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
@@ -29,25 +28,16 @@ import (
 // fakeIntegrityLeader is an always-leading Leader keyed on
 // IntegrityLockKey. Mirrors fakeLeader from retention_test.go but uses
 // the integrity slot so the two test files can run in the same package
-// without aliasing the type.
-type fakeIntegrityLeader struct {
-	mu       sync.Mutex
-	acquired int
-	released int
-}
+// without aliasing the type. Stateless: SweepOnce-driven tests don't
+// need acquire/release counters; if a future test exercises Run, add
+// them then.
+type fakeIntegrityLeader struct{}
 
 func (f *fakeIntegrityLeader) Acquire(_ context.Context) (bool, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.acquired++
 	return true, nil
 }
 
-func (f *fakeIntegrityLeader) Release(_ context.Context) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.released++
-}
+func (f *fakeIntegrityLeader) Release(_ context.Context) {}
 
 func (f *fakeIntegrityLeader) Key() int64 { return worker.IntegrityLockKey }
 
@@ -127,31 +117,10 @@ func (f *fakeRecordingService) VerifyChecksum(_ context.Context, _, callID uuid.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Test helpers
+//
+// counterValue + histogramSampleCount are shared with retention_test.go
+// — see metrics_helpers_test.go.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// counterValue reads the current value of a tenant-scoped result-label
-// CounterVec cell. Returns 0 when the cell hasn't been touched yet.
-func counterValue(t *testing.T, vec *prometheus.CounterVec, labelValues ...string) float64 {
-	t.Helper()
-	c, err := vec.GetMetricWithLabelValues(labelValues...)
-	require.NoError(t, err)
-	var m dto.Metric
-	require.NoError(t, c.Write(&m))
-	return m.GetCounter().GetValue()
-}
-
-// histogramSampleCount reads the total sample count of a one-label
-// HistogramVec cell. Returns 0 when the cell hasn't been touched yet.
-func histogramSampleCount(t *testing.T, vec *prometheus.HistogramVec, labelValues ...string) uint64 {
-	t.Helper()
-	obs, err := vec.GetMetricWithLabelValues(labelValues...)
-	require.NoError(t, err)
-	pm, ok := obs.(prometheus.Metric)
-	require.True(t, ok, "histogram observer must satisfy prometheus.Metric")
-	var m dto.Metric
-	require.NoError(t, pm.Write(&m))
-	return m.GetHistogram().GetSampleCount()
-}
 
 // readVerifyColumns fetches verified_at + integrity_ok directly via the
 // store API. Both are nullable in the schema; callers assert nil-ness.
@@ -254,12 +223,18 @@ func TestIntegrityPass_HappyPath_OK(t *testing.T) {
 		DurationMS:   42,
 	})
 
+	// Capture before-time for the verified_at round-trip assertion: a
+	// regression that swapped UpdateVerifyResultTx to use SQL now() must
+	// not pass.
+	before := time.Now().UTC()
 	require.NoError(t, f.pass.SweepOnce(t.Context()))
 
 	require.Equal(t, 1, f.svc.verifyCallCount(), "VerifyChecksum called once")
 
 	verifiedAt, ok := readVerifyColumns(t, f.store, tenantID, callID)
 	require.NotNil(t, verifiedAt, "verified_at must be set after happy-path sweep")
+	require.WithinDuration(t, before, *verifiedAt, 5*time.Second,
+		"verified_at must come from the caller's time.Now() — not SQL now()")
 	require.NotNil(t, ok)
 	require.True(t, *ok, "integrity_ok must be true on OK result")
 
@@ -299,10 +274,15 @@ func TestIntegrityPass_HappyPath_Mismatch(t *testing.T) {
 		DurationMS:   42,
 	})
 
+	// Capture before-time for the verified_at round-trip assertion (see
+	// TestIntegrityPass_HappyPath_OK for the rationale).
+	before := time.Now().UTC()
 	require.NoError(t, f.pass.SweepOnce(t.Context()))
 
 	verifiedAt, ok := readVerifyColumns(t, f.store, tenantID, callID)
 	require.NotNil(t, verifiedAt, "verified_at must be set on mismatch — chain-of-custody record")
+	require.WithinDuration(t, before, *verifiedAt, 5*time.Second,
+		"verified_at must come from the caller's time.Now() — not SQL now()")
 	require.NotNil(t, ok)
 	require.False(t, *ok, "integrity_ok must be false on sha mismatch")
 
@@ -354,9 +334,10 @@ func TestIntegrityPass_TransportError_NoUpdate(t *testing.T) {
 
 // TestIntegrityPass_EmptySample_NoOp seeds NO rows. SampleForVerify must
 // return an empty slice, the sweep must complete cleanly without calling
-// VerifyChecksum, and the pass-duration histogram must still record one
-// "ok" sample (so an alert on absent metric activity surfaces a hung
-// daemon, not an empty queue).
+// VerifyChecksum, and the pass-duration histogram must record exactly
+// one "empty" sample (distinct from "ok" so a hung daemon —
+// no histogram samples at all — vs. a working-but-quiet daemon are
+// distinguishable on dashboards).
 func TestIntegrityPass_EmptySample_NoOp(t *testing.T) {
 	t.Parallel()
 	f := newIntegrityFixture(t)
@@ -365,6 +346,54 @@ func TestIntegrityPass_EmptySample_NoOp(t *testing.T) {
 
 	require.Equal(t, 0, f.svc.verifyCallCount(),
 		"VerifyChecksum must NOT be called on an empty sample")
-	require.Equal(t, uint64(1), histogramSampleCount(t, f.mtr.IntegrityPassDuration, "ok"),
-		"pass-duration histogram must tick once even on empty sample")
+	require.Equal(t, uint64(1), histogramSampleCount(t, f.mtr.IntegrityPassDuration, "empty"),
+		"pass-duration histogram must record one 'empty' sample on zero-row sweep")
+	require.Equal(t, uint64(0), histogramSampleCount(t, f.mtr.IntegrityPassDuration, "ok"),
+		"empty-sweep must NOT tick the 'ok' label — operators rely on the distinction")
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constructor: SamplePercent range validation
+// ─────────────────────────────────────────────────────────────────────────────
+
+// TestNewIntegrityPass_RejectsBadSamplePercent asserts that
+// NewIntegrityPass returns an error for SamplePercent values outside
+// the [0.01, 100.0] range that Postgres TABLESAMPLE BERNOULLI accepts.
+// Without this the misconfiguration would be silently clamped inside
+// SampleForVerify — surfacing it at construction makes cmd/worker boot
+// fail loudly with a clear message instead.
+//
+// Negative / zero values are intentionally NOT in this table because
+// the constructor floors them to defaultIntegritySamplePercent (1.0)
+// before the range check; that path is the existing default-floor
+// behaviour and is covered by the happy-path fixture.
+func TestNewIntegrityPass_RejectsBadSamplePercent(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	st := store.NewPostgresStore(pool)
+
+	cases := []struct {
+		name string
+		pct  float64
+	}{
+		{name: "TooLow", pct: 0.005},
+		{name: "TooHigh", pct: 100.5},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := worker.NewIntegrityPass(worker.IntegrityConfig{
+				Pool:          pool,
+				Leader:        &fakeIntegrityLeader{},
+				Store:         st,
+				Service:       newFakeRecordingService(),
+				SamplePercent: tc.pct,
+			})
+			require.Error(t, err, "SamplePercent=%v must be rejected", tc.pct)
+			require.Contains(t, err.Error(), "SamplePercent",
+				"error message must mention the offending field name")
+			require.Contains(t, err.Error(), "out of range",
+				"error message must explain why")
+		})
+	}
 }

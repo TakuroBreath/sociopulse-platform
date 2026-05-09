@@ -52,7 +52,16 @@ const (
 	// worker) between SampleForVerify and the WithTenant Tx. Skip the audit
 	// row (would dangle to a non-existent recording target) and bail out.
 	integrityResultStale = "stale"
+	// integrityResultEmpty marks a sweep where SampleForVerify returned
+	// zero rows. Distinct from "ok" so dashboards can tell a hung daemon
+	// (no histogram samples at all) apart from a genuinely empty queue
+	// (stream of "empty" samples).
+	integrityResultEmpty = "empty"
 )
+
+// leaderPassIntegrity is the value of the LeaderActive gauge's `pass`
+// label for the integrity sweep — daemon name, not result.
+const leaderPassIntegrity = "integrity"
 
 // IntegrityConfig wires the dependencies and tunables for an
 // IntegrityPass. Required fields are validated by NewIntegrityPass;
@@ -160,6 +169,15 @@ func NewIntegrityPass(cfg IntegrityConfig) (*IntegrityPass, error) {
 	if samplePct <= 0 {
 		samplePct = defaultIntegritySamplePercent
 	}
+	// Range-check at construction so misconfiguration surfaces on
+	// cmd/worker boot rather than buried in the SampleForVerify SQL
+	// clamp. Postgres TABLESAMPLE BERNOULLI is defined for (0, 100].
+	if samplePct < 0.01 || samplePct > 100.0 {
+		return nil, fmt.Errorf(
+			"worker.NewIntegrityPass: SamplePercent %.4f out of range [0.01, 100.0]",
+			samplePct,
+		)
+	}
 	return &IntegrityPass{
 		pool:      cfg.Pool,
 		leader:    cfg.Leader,
@@ -177,6 +195,10 @@ func NewIntegrityPass(cfg IntegrityConfig) (*IntegrityPass, error) {
 // SweepOnce. On ctx cancellation the loop terminates cleanly — any held
 // lock is Released so a peer takes over without waiting for TCP
 // keepalive timeouts.
+//
+// Call Run once per process; running multiple instances against the
+// same lock key is safe (the advisory lock serialises) but wastes
+// goroutines and metric churn.
 func (p *IntegrityPass) Run(ctx context.Context) error {
 	ticker := time.NewTicker(p.interval)
 	defer ticker.Stop()
@@ -195,6 +217,9 @@ func (p *IntegrityPass) Run(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
+			// Clear the leader gauge before Release so dashboards see
+			// the handoff happen in the right order.
+			p.metrics.SetLeaderActive(leaderPassIntegrity, false)
 			//nolint:contextcheck // intentional: release lock even when caller ctx is done.
 			p.leader.Release(context.Background())
 			p.log.Info("recording integrity pass stopped", zap.Error(ctx.Err()))
@@ -214,8 +239,10 @@ func (p *IntegrityPass) tick(ctx context.Context) {
 		p.log.Warn("integrity leader acquire failed; skipping tick",
 			zap.Error(err),
 		)
+		p.metrics.SetLeaderActive(leaderPassIntegrity, false)
 		return
 	}
+	p.metrics.SetLeaderActive(leaderPassIntegrity, leading)
 	if !leading {
 		p.log.Debug("integrity leader held by peer; skipping tick")
 		return
@@ -244,7 +271,10 @@ func (p *IntegrityPass) SweepOnce(ctx context.Context) error {
 		return fmt.Errorf("integrity.sample: %w", err)
 	}
 	if len(rows) == 0 {
-		p.metrics.ObserveIntegrityPass(integrityResultOK, time.Since(start).Seconds())
+		// "empty" — distinct from "ok" so dashboards can tell a hung
+		// daemon (no histogram samples at all) apart from a queue that
+		// is genuinely caught up (steady stream of "empty" samples).
+		p.metrics.ObserveIntegrityPass(integrityResultEmpty, time.Since(start).Seconds())
 		p.log.Debug("integrity sweep: no rows")
 		return nil
 	}
