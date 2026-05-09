@@ -38,7 +38,7 @@ func recordingPorts(cfg config.RecordingConfig, logger *zap.Logger) (crypto.DEKU
 			return nil, nil, fmt.Errorf("recording: decode local KEK %q: %w", keyID, err)
 		}
 		if len(kek) != 32 {
-			return nil, nil, fmt.Errorf("recording: local KEK %q must be 32 bytes (got %d)", keyID, len(kek))
+			return nil, nil, fmt.Errorf("recording: local KEK %q must be 32 bytes for AES-256 (got %d)", keyID, len(kek))
 		}
 		keks[keyID] = kek
 	}

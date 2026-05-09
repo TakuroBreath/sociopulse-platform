@@ -31,7 +31,7 @@ func TestRecordingPorts_HexDecodeAndLengthValidation(t *testing.T) {
 		{"valid_32_bytes", hex.EncodeToString(make([]byte, 32)), true},
 		{"too_short", hex.EncodeToString(make([]byte, 16)), false},
 		{"too_long", hex.EncodeToString(make([]byte, 64)), false},
-		{"odd_hex", "0123456789abcdef0123456789abcde", false}, // 31 hex chars — fails decode
+		{"odd_hex", "0123456789abcdef0123456789abcde", false}, // odd-length hex string — hex.DecodeString rejects non-even length
 		{"non_hex", "z" + hex.EncodeToString(make([]byte, 32))[1:], false},
 	}
 	for _, tc := range cases {
