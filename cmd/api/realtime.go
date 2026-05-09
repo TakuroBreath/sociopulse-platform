@@ -208,6 +208,16 @@ func (a *projectResolverAdapter) Get(ctx context.Context, projectID string) (rta
 	return rtapi.ResolvedTenant{TenantID: proj.TenantID.String()}, nil
 }
 
+// Compile-time interface checks for the resolver adapters. Mirrors
+// the pattern used by noopPublisher / noopSubscriber in eventbus.go;
+// surfaces a port-signature drift here at cmd/api rather than far
+// away at the realtime.Module.Register call site (Plan 11.2 Task 5
+// review NIT M-1).
+var (
+	_ rtapi.UserResolver    = (*userResolverAdapter)(nil)
+	_ rtapi.ProjectResolver = (*projectResolverAdapter)(nil)
+)
+
 // registerRealtimeResolvers wires the realtime cross-tenant resolvers
 // into the locator BEFORE realtime.Module.Register runs. The realtime
 // module looks up rtapi.LocatorUserResolver / LocatorProjectResolver
