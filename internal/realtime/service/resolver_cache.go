@@ -9,10 +9,14 @@
 // concurrent miss for the same (user_id, project_id) pair. Without
 // coalescing the inner resolver fields N parallel DB hits.
 //
-// Cache invalidation: there is none. Stale entries TTL out within
-// 60s; a deleted user's stale TenantID still validates the in-flight
-// JWT (which itself expires within minutes), so the security
-// envelope is bounded by the JWT lifetime + cache TTL.
+// Cache invalidation: Invalidate(id) drops a specific entry
+// immediately; see CachedUserResolver.Invalidate and
+// CachedProjectResolver.Invalidate. Without an explicit Invalidate
+// call (e.g., when the events-package cache invalidator from Plan
+// 11.3 Task 3 isn't wired), stale entries TTL out within 60s; a
+// deleted user's stale TenantID still validates an in-flight JWT
+// (which itself expires within minutes), so the security envelope
+// is bounded by the JWT lifetime + cache TTL.
 package service
 
 import (
@@ -166,6 +170,14 @@ func (c *CachedUserResolver) Get(ctx context.Context, userID string) (rtapi.Reso
 //     leader's result is from BEFORE the Invalidate call, but
 //     that's the closest-to-current state available; Invalidate
 //     guarantees the NEXT post-Forget Get sees the fresh state.
+//
+// Edge case: if an in-flight closure completes AFTER Forget but
+// BEFORE the next Get, it re-populates the cache with the leader's
+// pre-Invalidate result via cache.Store inside the closure. The
+// entry ages out within ttl; for the NATS-invalidation use case
+// (Plan 11.3 Task 3) this is acceptable because the resolver
+// result does not change across crm.project.status_changed events
+// (TenantID is immutable on the project lifecycle).
 func (c *CachedUserResolver) Invalidate(userID string) {
 	c.cache.Delete(userID)
 	c.group.Forget(userID)
@@ -257,8 +269,10 @@ func (c *CachedProjectResolver) Get(ctx context.Context, projectID string) (rtap
 	}
 }
 
-// Invalidate drops the cached entry for projectID. Mirror of
-// CachedUserResolver.Invalidate.
+// Invalidate drops the cached entry for projectID. Idempotent — no
+// error if the key was never cached. Used by the events-package
+// cache invalidator (Plan 11.3 Task 3). See
+// CachedUserResolver.Invalidate for the full concurrency contract.
 func (c *CachedProjectResolver) Invalidate(projectID string) {
 	c.cache.Delete(projectID)
 	c.group.Forget(projectID)

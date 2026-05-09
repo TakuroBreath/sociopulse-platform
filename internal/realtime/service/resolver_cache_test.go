@@ -374,6 +374,12 @@ func TestCachedUserResolver_InvalidateUnknownIDIsNoop(t *testing.T) {
 	require.NotPanics(t, func() {
 		cached.Invalidate("never-cached")
 	})
+
+	// Invalidate must not touch the inner resolver — Forget on a
+	// missing singleflight key is a no-op, Delete on a missing
+	// sync.Map key is a no-op.
+	assert.EqualValues(t, 0, stub.Calls(),
+		"Invalidate on unknown ID must not call inner resolver")
 }
 
 // TestCachedProjectResolver_InvalidateDropsCachedEntry mirrors
