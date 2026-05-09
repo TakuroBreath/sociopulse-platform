@@ -31,8 +31,12 @@ const (
 	passLabelColdMove = "cold_move"
 	passLabelDelete   = "delete"
 
-	actionLabelColdMove = "cold_move"
-	actionLabelDelete   = "delete"
+	// actionLabel* are past-participle to match the audit-action constants
+	// (rapi.AuditActionColdMoved / rapi.AuditActionDeleted) and the plan
+	// spec. Operations dashboards joining audit_log.action and the metric
+	// `action` label benefit from consistent verb tense.
+	actionLabelColdMove = "cold_moved"
+	actionLabelDelete   = "deleted"
 
 	resultLabelOK       = "ok"
 	resultLabelStale    = "stale"
