@@ -420,7 +420,7 @@ func TestRetentionPass_Delete_HappyPath(t *testing.T) {
 	require.Equal(t, tenantID, payload.TenantID, "payload.tenant_id must equal seeded tenant")
 	require.Equal(t, "retention", payload.Reason,
 		"payload.reason must be 'retention' for worker-driven deletes")
-	require.Greater(t, payload.DeletedAt, int64(0),
+	require.Positive(t, payload.DeletedAt,
 		"payload.deleted_at must be a non-zero unix timestamp")
 
 	// Metric label assertions.
