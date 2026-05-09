@@ -8,11 +8,19 @@ import (
 
 // Package api — auth module events.
 //
-// auth does not publish events on its own subjects. Instead, every successful
-// login, logout, TOTP enrolment, session revocation, and refresh-token replay
-// is mirrored to the audit module via the canonical
-// `tenant.<t>.audit.event` subject (see internal/audit/api). The Action
-// constants below are the action labels written into audit.Event.Action.
+// auth mirrors authentication-flow events (login, logout, TOTP enrolment,
+// session revocation, refresh-token replay) to the audit module via the
+// canonical `tenant.<t>.audit.event` subject (see internal/audit/api).
+// The AuditAction* constants below are the labels written into
+// audit.Event.Action.
+//
+// In addition to audit-mirroring, auth publishes user-lifecycle events on
+// its OWN subjects (`tenant.<t>.auth.user.<verb>`) via the outbox pattern
+// — these are events downstream services need to react to (cache
+// invalidation, BI fan-out), not audit trail entries. Plan 11.4
+// introduced the first such subject (`SubjectUserDeleted` below); future
+// auth lifecycle events (user.created, user.role_changed, ...) will live
+// on sibling subjects.
 const (
 	// AuditActionLogin is the audit Event.Action set on a successful login.
 	AuditActionLogin = "auth.login"

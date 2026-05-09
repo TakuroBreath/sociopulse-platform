@@ -502,7 +502,7 @@ func TestUserService_UpdateRole_HappyPath(t *testing.T) {
 func TestUserService_Archive_Idempotent(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit, _ := newSvc(t)
+	svc, store, audit, outboxFake := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "ar", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "ar")]
@@ -514,6 +514,15 @@ func TestUserService_Archive_Idempotent(t *testing.T) {
 	require.Len(t, events, 2, "every archive call still emits an audit row")
 	require.Equal(t, "user.archived", events[0].Action)
 	require.Equal(t, "user.archived", events[1].Action)
+
+	// Plan 11.4 Task 1 contract pin: every archive emits a fresh outbox
+	// row alongside the audit row. The cache invalidator (Plan 11.4 Task 6)
+	// is idempotent on user_id, so duplicate publications are harmless;
+	// a future refactor that adds a didReplay short-circuit (mirroring
+	// recording.Commit) would silently change THIS contract without
+	// breaking any other test.
+	require.Len(t, outboxFake.appended(), 2,
+		"every archive emits a fresh outbox row; downstream invalidator dedup is idempotent")
 }
 
 // TestUserService_Archive_PublishesOutboxEvent verifies that Archive
