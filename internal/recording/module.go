@@ -170,7 +170,7 @@ func (m *Module) Register(d modules.Deps) error {
 		rhttp.Mount(apiGroup, rhttp.Deps{
 			Service:   svc,
 			Validator: lookupClaimsValidator(d.Locator, logger),
-			RBAC:      lookupRBACChecker(d.Locator, logger),
+			RBAC:      lookupRBACChecker(d.Locator),
 			Logger:    logger,
 		})
 		logger.Info("recording HTTP routes mounted under /api")
@@ -297,7 +297,7 @@ func lookupClaimsValidator(loc modules.ServiceLocator, logger *zap.Logger) autha
 // lookupRBACChecker returns the auth RBACChecker from the locator, or nil
 // if absent. Plan 12.3 transport currently uses transport-level requireRole
 // only; this is wired for future fine-grained checks. nil is acceptable.
-func lookupRBACChecker(loc modules.ServiceLocator, logger *zap.Logger) authapi.RBACChecker {
+func lookupRBACChecker(loc modules.ServiceLocator) authapi.RBACChecker {
 	if loc == nil {
 		return nil
 	}
