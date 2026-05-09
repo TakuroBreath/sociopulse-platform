@@ -33,9 +33,11 @@ type ConnectionConfig struct {
 	// WriteTimeout bounds a single Frame write. Zero -> 5s.
 	WriteTimeout time.Duration
 
-	// WriteBufferSize is the per-connection sendChan capacity. A full
-	// buffer triggers drop-oldest replacement on the next Send.
-	// Zero -> 256.
+	// WriteBufferSize is the per-connection telemetryCh capacity. A
+	// full buffer triggers drop-oldest replacement on the next Send
+	// for FrameClassTelemetry frames. Critical-class frames go on a
+	// separate fixed-size queue (criticalQueueSize) and overflow to a
+	// connection close. Zero -> 256.
 	WriteBufferSize int
 
 	// ReadFrameLimit caps inbound frame size in bytes. Zero -> 65 536.

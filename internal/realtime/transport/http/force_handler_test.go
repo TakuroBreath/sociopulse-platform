@@ -112,7 +112,7 @@ func newForceFixture(t *testing.T) (*forceFixture, *fakeClaimsValidator) {
 
 // stubWS is a minimal rtapi.WSConn that swallows Reads / Writes /
 // Closes. Used as a Hub-attach target when the test only cares about
-// the per-conn sendChan delivery (Drain-for-test).
+// the per-conn send-queue delivery (Drain-for-test).
 type stubWS struct{}
 
 func (stubWS) ReadFrame(ctx context.Context) ([]byte, error) {

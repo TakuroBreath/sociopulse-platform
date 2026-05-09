@@ -16,17 +16,27 @@
 //	|      writer       |<-----+--------------+
 //	+-------------------+      ^
 //	   ^                       |
-//	   |                       sendChan
+//	   |                       criticalCh / telemetryCh
 //	+-------------------+      |
 //	|     pinger        |------+
 //	+-------------------+
 //
 // The writer is the SOLE owner of conn.WriteFrame. Hub-side callers
-// MUST go through Connection.Send, which is non-blocking: a full
-// sendChan triggers a drop-oldest replacement strategy because slow
-// consumers care about the latest state more than a stale event
-// (operator state, queue depth, etc.). Each drop ticks the
-// realtime_dropped_frames_total{conn_id} counter.
+// MUST go through Connection.Send, which routes by FrameClass
+// (Plan 11.2):
+//
+//   - FrameClassCritical (call.events, op.commands) → criticalCh
+//     (fixed depth = 32). Overflow closes the connection with
+//     CloseRateLimited so the client reconnects + re-fetches via
+//     REST. Silent drop is unacceptable here — billing UI must
+//     observe every Hangup; force-commands must reach the operator.
+//   - FrameClassTelemetry (operators.state, dialer.queue,
+//     trunks.health, notifications) and control frames (auth.ok,
+//     refresh.ok, ping/pong, subscribe.ok) → telemetryCh
+//     (cfg.WriteBufferSize). Drop-oldest replacement on overflow —
+//     slow consumers care about the latest state more than a stale
+//     event. Each drop ticks the
+//     realtime_dropped_frames_total{conn_id} counter.
 //
 // # Auth handshake
 //
@@ -53,8 +63,9 @@
 //
 // Following Plan 10's dialer transport (the established repo-wide
 // baseline): 30s ping period, 60s pong-grace. The pinger goroutine
-// enqueues a FramePing every PingPeriod via the sendChan; the writer
-// flushes it. The reader records every inbound FramePong into
+// enqueues a FramePing every PingPeriod (routed to telemetryCh via
+// the empty-Topic control-frame path); the writer flushes it. The
+// reader records every inbound FramePong into
 // lastPongAt (atomic.Pointer[time.Time]). When the pinger observes
 // lastPongAt drifting past PongTimeout it signals the close channel
 // with CloseRateLimited / "no pong" — the conn is presumed dead and

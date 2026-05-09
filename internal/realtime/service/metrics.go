@@ -11,9 +11,10 @@ import (
 // rule.
 type Metrics struct {
 	// DroppedFrames counts frames dropped by Connection.Send because
-	// the per-connection sendChan was full. The {conn_id} label is
-	// bounded by the lifetime of the connection (one connection
-	// disappears -> Prometheus eventually GCs the series).
+	// the per-connection telemetryCh was full (drop-oldest path).
+	// The {conn_id} label is bounded by the lifetime of the
+	// connection (one connection disappears -> Prometheus eventually
+	// GCs the series).
 	DroppedFrames *prometheus.CounterVec
 
 	// AuthFailures counts auth-handshake failures, partitioned by
@@ -32,6 +33,19 @@ type Metrics struct {
 	// dashboards can separate "client was misbehaving" from "client
 	// was disconnected".
 	RateLimitClosures prometheus.Counter
+
+	// criticalOverflows counts connections closed due to
+	// criticalCh overflow (Plan 11.2 dual-queue routing). The
+	// {conn_id} label disappears from Prometheus once the connection
+	// goes away — bounded cardinality.
+	criticalOverflows *prometheus.CounterVec
+
+	// unknownTopicClasses counts Connection.Send invocations with a
+	// topic missing from rtapi.TopicClass. {topic} label is bounded
+	// because the wiring path validates against AllTopics — an
+	// unbounded payload-string-as-topic surfaces as a closed
+	// connection (CloseProtocolErr), not unbounded series.
+	unknownTopicClasses *prometheus.CounterVec
 }
 
 // RegisterMetrics builds a fresh *Metrics and registers every
@@ -50,7 +64,7 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 		DroppedFrames: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "realtime_dropped_frames_total",
-				Help: "Total realtime frames dropped due to slow consumer (sendChan full).",
+				Help: "Total realtime frames dropped due to slow consumer (telemetryCh full, drop-oldest).",
 			},
 			[]string{"conn_id"},
 		),
@@ -73,12 +87,22 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 				Help: "Total connections closed for exceeding inbound frame-rate budget.",
 			},
 		),
+		criticalOverflows: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "realtime_critical_overflows_total",
+			Help: "Number of WS connections closed due to critical-queue overflow.",
+		}, []string{"conn_id"}),
+		unknownTopicClasses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "realtime_unknown_topic_classes_total",
+			Help: "Number of Send() calls with a topic missing FrameClass mapping (wiring bug indicator).",
+		}, []string{"topic"}),
 	}
 	reg.MustRegister(
 		m.DroppedFrames,
 		m.AuthFailures,
 		m.PongMisses,
 		m.RateLimitClosures,
+		m.criticalOverflows,
+		m.unknownTopicClasses,
 	)
 	return m
 }
@@ -115,6 +139,27 @@ func (m *Metrics) observeRateLimitClosure() {
 		return
 	}
 	m.RateLimitClosures.Inc()
+}
+
+// observeCriticalOverflow ticks when a critical frame can't fit on
+// criticalCh and the connection is closed as a result. nil-safe.
+func (m *Metrics) observeCriticalOverflow(connID string) {
+	if m == nil || m.criticalOverflows == nil {
+		return
+	}
+	m.criticalOverflows.WithLabelValues(connID).Inc()
+}
+
+// observeUnknownTopicClass ticks when Connection.Send is called with
+// a topic that has no FrameClass mapping. Cardinality bounded by the
+// `topic` label which is checked against AllTopics in the wiring
+// path; an unbounded payload-string-as-topic would surface as the
+// connection being closed with CloseProtocolErr — see Send.
+func (m *Metrics) observeUnknownTopicClass(topic string) {
+	if m == nil || m.unknownTopicClasses == nil {
+		return
+	}
+	m.unknownTopicClasses.WithLabelValues(topic).Inc()
 }
 
 // HubMetrics groups the Prometheus collectors emitted by the Hub. The

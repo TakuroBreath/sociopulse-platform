@@ -26,6 +26,12 @@ var (
 	ErrSlowConsumer     = rtapi.ErrSlowConsumer
 )
 
+// criticalQueueSize is the bounded depth for the critical lane.
+// Smaller than the telemetry buffer because critical frames overflow
+// to a connection close (CloseRateLimited) — we don't want a runaway
+// publisher to amass minutes of buffered work before noticing.
+const criticalQueueSize = 32
+
 // AuthValidator validates a JWT access token and returns the decoded
 // realtime Claims. Production wiring adapts auth.Authenticator (whose
 // Claims type carries uuid.UUID fields and Role enum) into the
@@ -100,10 +106,19 @@ type Connection struct {
 	// Load. Never nil after AuthHandshake completes.
 	claims atomic.Pointer[rtapi.Claims]
 
-	// sendChan is the writer's source of frames. Bounded by
-	// cfg.WriteBufferSize. Send is non-blocking: a full buffer
-	// triggers drop-oldest replacement.
-	sendChan chan rtapi.Frame
+	// criticalCh routes FrameClassCritical frames onto a small
+	// bounded queue (criticalQueueSize=32). Overflow closes the
+	// connection with CloseRateLimited so the client reconnects and
+	// re-fetches via REST — silent drop on critical frames would
+	// leave the operator UI in a stale state (e.g., showing an
+	// active call after the Hangup).
+	criticalCh chan rtapi.Frame
+
+	// telemetryCh is the drop-oldest lane carrying every other
+	// frame. Bounded by cfg.WriteBufferSize. A full buffer triggers
+	// the same drop-oldest replacement Plan 11 Task 2 shipped — the
+	// next tick supersedes the discarded one.
+	telemetryCh chan rtapi.Frame
 
 	// closeOnce gates the actual close path so a double-Close from
 	// competing goroutines (writer error + Hub-initiated
@@ -162,12 +177,13 @@ var _ rtapi.Connection = (*Connection)(nil)
 func NewConnection(wsConn rtapi.WSConn, cfg ConnectionConfig) *Connection {
 	cfg.defaults()
 	c := &Connection{
-		id:        uuid.NewString(),
-		wsConn:    wsConn,
-		cfg:       cfg,
-		metrics:   nil,
-		sendChan:  make(chan rtapi.Frame, cfg.WriteBufferSize),
-		closeChan: make(chan struct{}),
+		id:          uuid.NewString(),
+		wsConn:      wsConn,
+		cfg:         cfg,
+		metrics:     nil,
+		criticalCh:  make(chan rtapi.Frame, criticalQueueSize),
+		telemetryCh: make(chan rtapi.Frame, cfg.WriteBufferSize),
+		closeChan:   make(chan struct{}),
 		inboundLimiter: newTokenBucket(
 			float64(cfg.RateLimitPerSec),
 			float64(cfg.RateLimitBurst),
@@ -240,8 +256,9 @@ func (c *Connection) Claims() rtapi.Claims {
 // the Metrics counter.
 func (c *Connection) DroppedFrames() uint64 { return c.droppedFrames.Load() }
 
-// DrainSendForTest non-blocking-pulls one frame off the send queue
-// without spawning runWriter. Returns nil if the queue is empty.
+// DrainSendForTest non-blocking-pulls one frame off the send queues
+// without spawning runWriter. Returns nil if both queues are empty.
+// Critical lane drained first (priority semantic match).
 //
 // Hub-level tests rely on this to assert delivery without driving the
 // full reader/writer/pinger triple — they only need to know the Hub
@@ -249,7 +266,12 @@ func (c *Connection) DroppedFrames() uint64 { return c.droppedFrames.Load() }
 // writer goroutine.
 func (c *Connection) DrainSendForTest() *rtapi.Frame {
 	select {
-	case frame := <-c.sendChan:
+	case frame := <-c.criticalCh:
+		return &frame
+	default:
+	}
+	select {
+	case frame := <-c.telemetryCh:
 		return &frame
 	default:
 		return nil
@@ -293,43 +315,100 @@ func (c *Connection) Unsubscribe(subID string) {
 	c.unsubFn(c, subID)
 }
 
-// Send queues frame for delivery on the writer goroutine.
-// Non-blocking: if sendChan is full, drop the OLDEST queued frame
-// (channel-receive then channel-send the new frame) and increment
-// the dropped_frames metric.
+// Send queues frame for delivery on the writer goroutine. Frame
+// routing is determined by rtapi.TopicClass(frame.Topic):
 //
-// Drop-oldest preferred over drop-newest because a slow consumer is
-// interested in the LATEST state; a stale event is more useless than
-// missing one (operator-state transitions, queue depth, etc.).
+//   - FrameClassCritical: enqueued on criticalCh. If full, the
+//     connection is closed with CloseRateLimited and Send returns —
+//     silent drop is unacceptable for billing/admin frames.
+//   - FrameClassTelemetry: enqueued on telemetryCh with drop-oldest
+//     replacement (Plan 11 Task 2 behaviour preserved).
+//   - FrameClassUnknown: a contract-violating topic (not in the
+//     explicit switch in api.TopicClass). Closes with CloseProtocolErr
+//     so the wiring bug surfaces immediately rather than the frame
+//     getting silently misrouted.
 //
 // Send on a closed connection is a no-op — callers race the close
-// path during teardown and shouldn't crash.
+// path during teardown and shouldn't crash. Control frames
+// (FramePing/FramePong/FrameAuthOK/FrameRefreshOK/FrameSubscribeOK/
+// FrameSubscribeErr/FrameAuthError) carry an empty Topic — these
+// frames bypass the classifier and route to telemetryCh
+// (drop-oldest), matching the prior Plan 11 Task 2 semantics for
+// non-Topic'd frames.
 func (c *Connection) Send(frame rtapi.Frame) {
 	if c.closed.Load() {
 		return
 	}
+	// Control frames (auth.ok / refresh.ok / ping / pong / subscribe.ok /
+	// subscribe.error / auth.error) carry an empty Topic. Route them via
+	// the telemetry lane to preserve Plan 11 Task 2 drop-oldest
+	// semantics for non-event traffic.
+	if frame.Topic == "" {
+		c.sendTelemetry(frame)
+		return
+	}
+
+	switch rtapi.TopicClass(frame.Topic) {
+	case rtapi.FrameClassCritical:
+		c.sendCritical(frame)
+	case rtapi.FrameClassTelemetry:
+		c.sendTelemetry(frame)
+	default:
+		// FrameClassUnknown — wiring bug. Fail loud rather than
+		// route to the wrong lane.
+		c.cfg.Logger.Error("realtime: send frame with unclassified topic; closing",
+			zap.String("conn_id", c.id),
+			zap.String("topic", string(frame.Topic)),
+		)
+		c.metrics.observeUnknownTopicClass(string(frame.Topic))
+		c.Close(rtapi.CloseProtocolErr)
+	}
+}
+
+// sendCritical enqueues frame on criticalCh. On a full queue the
+// connection is closed — see Send for the rationale.
+func (c *Connection) sendCritical(frame rtapi.Frame) {
+	select {
+	case c.criticalCh <- frame:
+		return
+	default:
+	}
+	// criticalQueueSize is full → close the connection so the
+	// client reconnects and re-fetches via REST. metric tick before
+	// Close so the observability path stays intact even on a fast
+	// teardown.
+	c.metrics.observeCriticalOverflow(c.id)
+	c.cfg.Logger.Warn("realtime: critical-queue overflow; closing",
+		zap.String("conn_id", c.id),
+	)
+	c.Close(rtapi.CloseRateLimited)
+}
+
+// sendTelemetry enqueues frame on telemetryCh with drop-oldest
+// replacement (Plan 11 Task 2 behaviour).
+func (c *Connection) sendTelemetry(frame rtapi.Frame) {
 	// Fast path: room in buffer.
 	select {
-	case c.sendChan <- frame:
+	case c.telemetryCh <- frame:
 		return
 	default:
 	}
 	// Slow consumer — drop oldest.
 	select {
-	case <-c.sendChan:
+	case <-c.telemetryCh:
 		c.droppedFrames.Add(1)
 		c.metrics.observeDrop(c.id)
 	default:
-		// Channel went from full -> drained between selects.
-		// Fall through and try to enqueue.
+		// Channel went from full → drained between selects. Fall
+		// through and try to enqueue.
 	}
 	select {
-	case c.sendChan <- frame:
+	case c.telemetryCh <- frame:
 	default:
-		// Channel went from full -> empty -> full between selects.
-		// (Receiver was draining at the same time.) Drop the new
-		// frame; the receiver is still consuming so the remaining
-		// queue is fresh.
+		// Channel went from full → empty → full between selects
+		// (receiver was draining concurrently). Drop the new frame;
+		// the receiver is still consuming so the remaining queue is
+		// fresh.
 		c.droppedFrames.Add(1)
 		c.metrics.observeDrop(c.id)
 	}
@@ -611,35 +690,79 @@ func (c *Connection) handleRefresh(ctx context.Context, frame rtapi.Frame) {
 }
 
 // runWriter is the SOLE owner of conn.WriteFrame. It pulls frames
-// off sendChan and writes them with a per-frame WriteTimeout. On
-// write error it signals close and exits.
+// off criticalCh (priority lane) and telemetryCh (drop-oldest lane)
+// and writes them with a per-frame WriteTimeout.
+//
+// Priority discipline: an outer non-blocking receive on criticalCh
+// drains every pending critical frame before falling through to a
+// blocking select that waits on either channel. This ensures a
+// telemetry storm cannot starve critical frames AND that an idle
+// writer parks on a single select rather than busy-spinning.
+//
+// On write error the writer signals close and exits.
 func (c *Connection) runWriter(ctx context.Context) {
 	for {
+		// Priority drain: serve critical frames before telemetry
+		// when both are ready. Non-blocking; no busy-loop because
+		// the default arm falls through to the blocking select
+		// below.
 		select {
 		case <-c.closeChan:
 			return
 		case <-ctx.Done():
 			c.Close(rtapi.CloseGoingAway)
 			return
-		case frame := <-c.sendChan:
-			wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteTimeout)
-			err := c.writeFrameSync(wctx, frame)
-			cancel()
-			if err != nil {
-				c.cfg.Logger.Warn("realtime: write failed",
-					zap.String("conn_id", c.id),
-					zap.Error(err),
-				)
-				c.Close(rtapi.CloseGoingAway)
+		case frame := <-c.criticalCh:
+			if !c.writeOne(ctx, frame) {
+				return
+			}
+			continue
+		default:
+		}
+
+		// Both queues empty (or only telemetry has work). Park on a
+		// blocking select that wakes for either lane OR
+		// shutdown/ctx-cancel.
+		select {
+		case <-c.closeChan:
+			return
+		case <-ctx.Done():
+			c.Close(rtapi.CloseGoingAway)
+			return
+		case frame := <-c.criticalCh:
+			if !c.writeOne(ctx, frame) {
+				return
+			}
+		case frame := <-c.telemetryCh:
+			if !c.writeOne(ctx, frame) {
 				return
 			}
 		}
 	}
 }
 
-// runPinger emits a FramePing every PingPeriod via sendChan and
-// monitors lastPongAt. If the gap between now and lastPongAt grows
-// past PongTimeout, we declare the connection dead and close it.
+// writeOne writes a single frame with the configured WriteTimeout and
+// returns true on success / false on error (caller exits the writer
+// loop). Pulled out of runWriter so the priority + blocking selects
+// don't duplicate the marshal-and-write boilerplate.
+func (c *Connection) writeOne(ctx context.Context, frame rtapi.Frame) bool {
+	wctx, cancel := context.WithTimeout(ctx, c.cfg.WriteTimeout)
+	defer cancel()
+	if err := c.writeFrameSync(wctx, frame); err != nil {
+		c.cfg.Logger.Warn("realtime: write failed",
+			zap.String("conn_id", c.id),
+			zap.Error(err),
+		)
+		c.Close(rtapi.CloseGoingAway)
+		return false
+	}
+	return true
+}
+
+// runPinger emits a FramePing every PingPeriod via the telemetry
+// lane (Send routes empty-Topic frames there) and monitors
+// lastPongAt. If the gap between now and lastPongAt grows past
+// PongTimeout, we declare the connection dead and close it.
 //
 // time.NewTicker (not time.After in a select-loop) per Plan 09/10
 // carry-forward.

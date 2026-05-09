@@ -15,8 +15,9 @@
 //     Hub.Connect path uses, only without driving an actual WSConn
 //     handshake.
 //   - Tests never call conn.Run, so the writer goroutine never
-//     drains sendChan. Assertions read fakeWSConn.Writes() directly.
-//     This keeps tests deterministic and goleak-clean.
+//     drains the per-conn send queues. Assertions read
+//     fakeWSConn.Writes() or DrainSendForTest directly. This keeps
+//     tests deterministic and goleak-clean.
 package service_test
 
 import (
@@ -65,9 +66,10 @@ func TestHub_BroadcastIsolatesByTenant(t *testing.T) {
 	)
 	require.Equal(t, 1, count)
 
-	// connA's writer is not running, so the frame sits in sendChan.
-	// We can detect delivery by peeking the conn's drained state via
-	// a synchronous Send-equivalent: drain manually or assert via the
+	// connA's writer is not running, so the frame sits in the conn's
+	// telemetryCh (operators.state classifies as telemetry). We can
+	// detect delivery by peeking the conn's drained state via a
+	// synchronous Send-equivalent: drain manually or assert via the
 	// channel. Use a small goroutine that drains the writer queue.
 	require.Eventually(t, func() bool {
 		return drainOneFrame(t, connA) != nil

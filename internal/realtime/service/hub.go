@@ -21,9 +21,10 @@ import (
 // paths (Broadcast lookup, Stats) take RLock; mutate paths (Connect /
 // Subscribe / Unsubscribe / Disconnect) take Lock. The connection's
 // Send is called while holding RLock in Broadcast — Send is
-// non-blocking by contract (drop-oldest semantics on a full
-// sendChan), so a slow consumer doesn't extend lock-hold beyond a
-// memory write + channel-send.
+// non-blocking by contract (drop-oldest on a full telemetryCh,
+// close-connection on a full criticalCh per Plan 11.2), so a slow
+// consumer doesn't extend lock-hold beyond a memory write +
+// channel-send.
 //
 // Lifecycle:
 //
@@ -328,9 +329,10 @@ func (h *Hub) onConnClose(c *Connection) {
 //     fields on either side mean "no constraint on that dimension".
 //
 // Returns the count of conn.Send invocations (after RBAC + filter
-// passes). Drops on the connection's sendChan are tracked separately
-// via the Connection's dropped_frames metric — Hub counts dispatches,
-// not deliveries.
+// passes). Drops on the connection's telemetryCh are tracked
+// separately via the Connection's dropped_frames metric;
+// critical-overflow closures via critical_overflows_total. Hub
+// counts dispatches, not deliveries.
 //
 // Locking: holds RLock for the entire iteration. conn.Send is
 // non-blocking by contract, so the lock is held only for the

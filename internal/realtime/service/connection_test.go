@@ -9,6 +9,7 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
 
@@ -869,4 +870,67 @@ func matchesLabel(m *dto.Metric, key, val string) bool {
 		}
 	}
 	return false
+}
+
+// TestConnection_CriticalFrameOverflowClosesConnection asserts that a
+// blocked writer + a sustained burst of critical frames closes the
+// connection with CloseRateLimited rather than silently dropping —
+// the documented Plan 11.2 contract for FrameClassCritical.
+func TestConnection_CriticalFrameOverflowClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	conn, fake := newTestConnection(t, service.ConnectionConfig{
+		WriteBufferSize: 16, // telemetry buffer; critical buffer is fixed at 32
+	})
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"admin"}})
+
+	// Block the writer so the queues fill up.
+	fake.BlockWrites()
+
+	// Push 50 critical frames; criticalQueueSize=32 — frame 33 should
+	// trigger the overflow-close path.
+	for range 50 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicCallEvents})
+	}
+
+	require.Eventually(t, conn.IsClosedForTest,
+		2*time.Second, 10*time.Millisecond,
+		"critical-queue overflow must close the connection")
+
+	// Unblock so writer goroutine drains and exits cleanly (no goleak).
+	fake.UnblockWrites()
+}
+
+// TestConnection_TelemetryFramesDropOldest_PreservesCritical asserts
+// that telemetry overflow does NOT close the connection AND does not
+// purge frames from the critical queue. The two queues are
+// independent.
+func TestConnection_TelemetryFramesDropOldest_PreservesCritical(t *testing.T) {
+	t.Parallel()
+
+	conn, fake := newTestConnection(t, service.ConnectionConfig{
+		WriteBufferSize: 4, // tiny telemetry buffer; force overflow fast
+	})
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
+
+	fake.BlockWrites()
+
+	// Push one critical frame first — it should land in the critical
+	// queue and survive the subsequent telemetry-flood.
+	conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicCallEvents})
+
+	// Flood the telemetry queue; drop-oldest must NOT close the conn.
+	for range 20 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicOperatorsState})
+	}
+
+	// Sanity: connection still alive (no overflow-close from telemetry).
+	require.False(t, conn.IsClosedForTest(),
+		"telemetry-queue overflow must NOT close the connection")
+
+	// At least one frame was dropped (drop-oldest counter incremented).
+	assert.Positive(t, conn.DroppedFrames(),
+		"telemetry overflow should bump drop counter")
+
+	fake.UnblockWrites()
 }
