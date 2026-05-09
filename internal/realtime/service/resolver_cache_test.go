@@ -10,7 +10,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/zap/zaptest"
 
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	"github.com/sociopulse/platform/internal/realtime/service"
@@ -52,9 +51,9 @@ func TestCachedUserResolver_HitServesFromCache(t *testing.T) {
 	t.Parallel()
 
 	stub := newStubUserResolver(map[string]string{"u1": "t1"})
-	cached := service.NewCachedUserResolver(stub, 60*time.Second, zaptest.NewLogger(t))
+	cached := service.NewCachedUserResolver(stub, 60*time.Second)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		got, err := cached.Get(t.Context(), "u1")
 		require.NoError(t, err)
 		assert.Equal(t, "t1", got.TenantID)
@@ -70,7 +69,7 @@ func TestCachedUserResolver_ExpiryReFetches(t *testing.T) {
 
 	stub := newStubUserResolver(map[string]string{"u1": "t1"})
 	// 50ms TTL so the test is fast.
-	cached := service.NewCachedUserResolver(stub, 50*time.Millisecond, zaptest.NewLogger(t))
+	cached := service.NewCachedUserResolver(stub, 50*time.Millisecond)
 
 	_, err := cached.Get(t.Context(), "u1")
 	require.NoError(t, err)
@@ -113,17 +112,15 @@ func TestCachedUserResolver_SingleflightCoalescesConcurrentMisses(t *testing.T) 
 	// callers reliably overlap.
 	stub := newStubUserResolver(map[string]string{"u1": "t1"})
 	slowStub := &slowResolver{inner: stub, delay: 50 * time.Millisecond}
-	cached := service.NewCachedUserResolver(slowStub, 60*time.Second, zaptest.NewLogger(t))
+	cached := service.NewCachedUserResolver(slowStub, 60*time.Second)
 
 	var wg sync.WaitGroup
-	for i := 0; i < N; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range N {
+		wg.Go(func() {
 			got, err := cached.Get(t.Context(), "u1")
 			assert.NoError(t, err)
 			assert.Equal(t, "t1", got.TenantID)
-		}()
+		})
 	}
 	wg.Wait()
 
@@ -137,11 +134,18 @@ func TestCachedUserResolver_SingleflightCoalescesConcurrentMisses(t *testing.T) 
 func TestCachedUserResolver_CtxCancelPropagates(t *testing.T) {
 	t.Parallel()
 
+	// Slow inner is short (200ms) so the in-flight closure finishes
+	// well before TestMain's goleak.VerifyTestMain runs, even when
+	// only the resolver subset of tests is selected. The closure no
+	// longer inherits the leader's ctx (Plan 11.2 Task 3 review I-1
+	// fix), so the closure runs to completion regardless of the
+	// pre-cancelled leader; we only need a delay long enough to
+	// guarantee the leader's pre-cancelled ctx wins the outer select.
 	stub := &slowResolver{
 		inner: newStubUserResolver(map[string]string{"u1": "t1"}),
-		delay: 5 * time.Second,
+		delay: 200 * time.Millisecond,
 	}
-	cached := service.NewCachedUserResolver(stub, 60*time.Second, zaptest.NewLogger(t))
+	cached := service.NewCachedUserResolver(stub, 60*time.Second)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel() // cancel before call
@@ -149,6 +153,12 @@ func TestCachedUserResolver_CtxCancelPropagates(t *testing.T) {
 	_, err := cached.Get(ctx, "u1")
 	require.Error(t, err)
 	assert.ErrorIs(t, err, context.Canceled)
+
+	// Wait for the in-flight closure to drain before the test's
+	// cleanup so goleak doesn't flag the still-running slowResolver.
+	// The inner finishes at most `delay` after launch; double it for
+	// scheduling slack.
+	time.Sleep(400 * time.Millisecond)
 }
 
 // TestCachedUserResolver_NewWithNilInnerPanics is the wiring guard.
@@ -158,8 +168,117 @@ func TestCachedUserResolver_NewWithNilInnerPanics(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"service.NewCachedUserResolver: inner must be non-nil",
 		func() {
-			_ = service.NewCachedUserResolver(nil, 60*time.Second, zaptest.NewLogger(t))
+			_ = service.NewCachedUserResolver(nil, 60*time.Second)
 		})
+}
+
+// TestCachedUserResolver_LeaderCtxCancelDoesNotPoisonDuplicates is the
+// regression guard for the Plan 11.2 Task 3 review IMPORTANT I-1:
+// without context.WithoutCancel inside the singleflight closure, a
+// leader whose ctx cancels mid-flight would poison every concurrent
+// duplicate waiter (singleflight delivers the closure's outcome to
+// every chans waiter). Real-world impact: a reconnect storm where
+// the first arriving caller's WS drops → every other concurrent
+// caller for the same user_id sees context.Canceled.
+//
+// The fix detaches the closure's ctx from the leader's via
+// context.WithoutCancel + a bounded timeout. The outer select on
+// ctx.Done() still bounds the leader; the closure survives for the
+// duplicates.
+func TestCachedUserResolver_LeaderCtxCancelDoesNotPoisonDuplicates(t *testing.T) {
+	t.Parallel()
+
+	// Slow inner so the leader's cancel and the duplicate's join
+	// reliably overlap.
+	stub := newStubUserResolver(map[string]string{"u1": "t1"})
+	slow := &slowResolver{inner: stub, delay: 200 * time.Millisecond}
+	cached := service.NewCachedUserResolver(slow, 60*time.Second)
+
+	leaderCtx, cancelLeader := context.WithCancel(t.Context())
+	type result struct {
+		tenant rtapi.ResolvedTenant
+		err    error
+	}
+	leaderRes := make(chan result, 1)
+	dupRes := make(chan result, 1)
+
+	// Leader fires first; we wait briefly so the singleflight key is
+	// in-flight before the duplicate joins.
+	go func() {
+		got, err := cached.Get(leaderCtx, "u1")
+		leaderRes <- result{got, err}
+	}()
+	time.Sleep(50 * time.Millisecond)
+
+	// Duplicate joins the in-flight singleflight.
+	go func() {
+		got, err := cached.Get(t.Context(), "u1") // never-cancelled ctx
+		dupRes <- result{got, err}
+	}()
+
+	// Cancel ONLY the leader. The duplicate's ctx stays alive.
+	time.Sleep(20 * time.Millisecond)
+	cancelLeader()
+
+	// Leader observes its own cancellation.
+	select {
+	case res := <-leaderRes:
+		require.ErrorIs(t, res.err, context.Canceled,
+			"leader must observe its own context.Canceled")
+	case <-time.After(2 * time.Second):
+		t.Fatal("leader did not unwind on ctx cancel")
+	}
+
+	// CRITICAL: duplicate must get the real result, not the leader's
+	// cancelled-ctx error.
+	select {
+	case res := <-dupRes:
+		require.NoError(t, res.err,
+			"duplicate waiter must NOT inherit leader's ctx.Canceled")
+		assert.Equal(t, "t1", res.tenant.TenantID)
+	case <-time.After(2 * time.Second):
+		t.Fatal("duplicate did not unwind")
+	}
+
+	// Inner was called exactly once (singleflight de-dup preserved).
+	assert.EqualValues(t, 1, stub.Calls(),
+		"singleflight must coalesce despite leader cancellation")
+}
+
+// TestCachedUserResolver_InnerErrorPropagates verifies that when the
+// inner resolver returns an error (DB down, RPC timeout, etc.), the
+// wrapper does NOT cache the error and propagates it unwrapped to
+// the caller. Subsequent calls re-query (no negative caching).
+func TestCachedUserResolver_InnerErrorPropagates(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubUserResolver(map[string]string{"u1": "t1"})
+	stub.err = errors.New("inner: db down")
+	cached := service.NewCachedUserResolver(stub, 60*time.Second)
+
+	// First call surfaces the inner error.
+	_, err := cached.Get(t.Context(), "u1")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "db down")
+
+	// Subsequent call re-queries (no negative caching).
+	_, err = cached.Get(t.Context(), "u1")
+	require.Error(t, err)
+	assert.EqualValues(t, 2, stub.Calls(),
+		"inner errors must NOT be cached; second call must re-query")
+
+	// Clear the error and verify the cache works on success.
+	stub.err = nil
+	got, err := cached.Get(t.Context(), "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "t1", got.TenantID)
+	assert.EqualValues(t, 3, stub.Calls())
+
+	// Now the success result is cached.
+	got, err = cached.Get(t.Context(), "u1")
+	require.NoError(t, err)
+	assert.Equal(t, "t1", got.TenantID)
+	assert.EqualValues(t, 3, stub.Calls(), "post-success calls hit cache")
 }
 
 // stubProjectResolver mirrors stubUserResolver for ProjectResolver.
@@ -192,9 +311,9 @@ func TestCachedProjectResolver_HitServesFromCache(t *testing.T) {
 	t.Parallel()
 
 	stub := newStubProjectResolver(map[string]string{"p1": "t1"})
-	cached := service.NewCachedProjectResolver(stub, 60*time.Second, zaptest.NewLogger(t))
+	cached := service.NewCachedProjectResolver(stub, 60*time.Second)
 
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		got, err := cached.Get(t.Context(), "p1")
 		require.NoError(t, err)
 		assert.Equal(t, "t1", got.TenantID)
@@ -209,6 +328,6 @@ func TestCachedProjectResolver_NewWithNilInnerPanics(t *testing.T) {
 	assert.PanicsWithValue(t,
 		"service.NewCachedProjectResolver: inner must be non-nil",
 		func() {
-			_ = service.NewCachedProjectResolver(nil, 60*time.Second, zaptest.NewLogger(t))
+			_ = service.NewCachedProjectResolver(nil, 60*time.Second)
 		})
 }

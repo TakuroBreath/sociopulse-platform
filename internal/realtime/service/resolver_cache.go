@@ -20,7 +20,6 @@ import (
 	"sync"
 	"time"
 
-	"go.uber.org/zap"
 	"golang.org/x/sync/singleflight"
 
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
@@ -30,6 +29,14 @@ import (
 // short-lived JWT (default 15min) re-validates at most 15 times,
 // keeping the inner resolver load bounded under reconnect storms.
 const defaultResolverTTL = 60 * time.Second
+
+// resolverInnerTimeout caps the singleflight closure's inner call so
+// a slow inner resolver cannot pin the singleflight key forever.
+// Picked at 5s to comfortably cover a healthy DB roundtrip plus a
+// retry; longer than handshake/subscribe deadline so a slow inner
+// resolver surfaces as the leader's ctx-deadline (the duplicate
+// waiters' bound) rather than as a closure timeout.
+const resolverInnerTimeout = 5 * time.Second
 
 // cachedResolverEntry is the cache value: the resolved TenantID + an
 // expiry deadline checked lazily on read.
@@ -45,30 +52,29 @@ type cachedResolverEntry struct {
 // inner panics at construction time so the wiring bug surfaces at
 // boot rather than first subscribe.
 type CachedUserResolver struct {
-	inner  rtapi.UserResolver
-	ttl    time.Duration
-	logger *zap.Logger
+	inner rtapi.UserResolver
+	ttl   time.Duration
 
 	cache sync.Map // userID string → *cachedResolverEntry
 	group singleflight.Group
 }
 
 // NewCachedUserResolver wires a CachedUserResolver. ttl ≤ 0 falls
-// back to defaultResolverTTL (60s). logger nil-safe.
-func NewCachedUserResolver(inner rtapi.UserResolver, ttl time.Duration, logger *zap.Logger) *CachedUserResolver {
+// back to defaultResolverTTL (60s) — there is intentionally NO
+// zero-cache mode; the wrapper exists to bound inner-resolver load.
+// A caller wanting to bypass the cache should pass the inner
+// resolver directly. nil inner panics at construction time so the
+// wiring bug surfaces at boot rather than first subscribe.
+func NewCachedUserResolver(inner rtapi.UserResolver, ttl time.Duration) *CachedUserResolver {
 	if inner == nil {
 		panic("service.NewCachedUserResolver: inner must be non-nil")
 	}
 	if ttl <= 0 {
 		ttl = defaultResolverTTL
 	}
-	if logger == nil {
-		logger = zap.NewNop()
-	}
 	return &CachedUserResolver{
-		inner:  inner,
-		ttl:    ttl,
-		logger: logger,
+		inner: inner,
+		ttl:   ttl,
 	}
 }
 
@@ -93,9 +99,24 @@ func (c *CachedUserResolver) Get(ctx context.Context, userID string) (rtapi.Reso
 	// same userID via singleflight.DoChan + select on ctx so a slow
 	// inner resolver doesn't pin the caller.
 	ch := c.group.DoChan(userID, func() (any, error) {
-		// singleflight invokes this once per key; subsequent
-		// concurrent callers wait on the result.
-		got, err := c.inner.Get(ctx, userID)
+		// Detach: leader's ctx cancellation must not poison duplicate
+		// waiters joining the in-flight call. The outer select on
+		// ctx.Done() still bounds *this* caller (returns ctx.Err()
+		// immediately to the leader); the closure runs against a
+		// detached ctx with a sane upper-bound timeout so duplicate
+		// waiters get the real result.
+		//
+		// singleflight.doCall delivers the closure's outcome to every
+		// waiter on c.chans — without WithoutCancel, a leader whose
+		// WS connection blips would force every concurrent reconnect
+		// for the same user_id to see context.Canceled and fail their
+		// RBAC checks (Plan 11.2 Task 3 review IMPORTANT I-1).
+		inner, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			resolverInnerTimeout,
+		)
+		defer cancel()
+		got, err := c.inner.Get(inner, userID)
 		if err != nil {
 			return rtapi.ResolvedTenant{}, err
 		}
@@ -130,30 +151,29 @@ func (c *CachedUserResolver) Get(ctx context.Context, userID string) (rtapi.Reso
 // Behaviour identical; separate type so the resolver-port type
 // safety is preserved at call sites.
 type CachedProjectResolver struct {
-	inner  rtapi.ProjectResolver
-	ttl    time.Duration
-	logger *zap.Logger
+	inner rtapi.ProjectResolver
+	ttl   time.Duration
 
 	cache sync.Map
 	group singleflight.Group
 }
 
-// NewCachedProjectResolver wires a CachedProjectResolver. Same
-// invariants as NewCachedUserResolver.
-func NewCachedProjectResolver(inner rtapi.ProjectResolver, ttl time.Duration, logger *zap.Logger) *CachedProjectResolver {
+// NewCachedProjectResolver wires a CachedProjectResolver. ttl ≤ 0
+// falls back to defaultResolverTTL (60s) — there is intentionally
+// NO zero-cache mode; the wrapper exists to bound inner-resolver
+// load. A caller wanting to bypass the cache should pass the inner
+// resolver directly. nil inner panics at construction time so the
+// wiring bug surfaces at boot rather than first subscribe.
+func NewCachedProjectResolver(inner rtapi.ProjectResolver, ttl time.Duration) *CachedProjectResolver {
 	if inner == nil {
 		panic("service.NewCachedProjectResolver: inner must be non-nil")
 	}
 	if ttl <= 0 {
 		ttl = defaultResolverTTL
 	}
-	if logger == nil {
-		logger = zap.NewNop()
-	}
 	return &CachedProjectResolver{
-		inner:  inner,
-		ttl:    ttl,
-		logger: logger,
+		inner: inner,
+		ttl:   ttl,
 	}
 }
 
@@ -169,7 +189,24 @@ func (c *CachedProjectResolver) Get(ctx context.Context, projectID string) (rtap
 		}
 	}
 	ch := c.group.DoChan(projectID, func() (any, error) {
-		got, err := c.inner.Get(ctx, projectID)
+		// Detach: leader's ctx cancellation must not poison duplicate
+		// waiters joining the in-flight call. The outer select on
+		// ctx.Done() still bounds *this* caller (returns ctx.Err()
+		// immediately to the leader); the closure runs against a
+		// detached ctx with a sane upper-bound timeout so duplicate
+		// waiters get the real result.
+		//
+		// singleflight.doCall delivers the closure's outcome to every
+		// waiter on c.chans — without WithoutCancel, a leader whose
+		// WS connection blips would force every concurrent reconnect
+		// for the same project_id to see context.Canceled and fail
+		// their RBAC checks (Plan 11.2 Task 3 review IMPORTANT I-1).
+		inner, cancel := context.WithTimeout(
+			context.WithoutCancel(ctx),
+			resolverInnerTimeout,
+		)
+		defer cancel()
+		got, err := c.inner.Get(inner, projectID)
 		if err != nil {
 			return rtapi.ResolvedTenant{}, err
 		}
