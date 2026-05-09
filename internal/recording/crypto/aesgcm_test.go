@@ -46,6 +46,15 @@ func TestAESGCMDecryptor_AADMismatchYieldsErrAuth(t *testing.T) {
 	_, err = d.Decrypt(ctx, key, bytes.NewReader(ct), int64(len(ct)), []byte("tenant-B"))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, crypto.ErrAuth), "expected ErrAuth, got %v", err)
+
+	// Locks in the spec's "never expose tampering details" contract:
+	// the inner encryption.ErrAuth and crypto/cipher's text MUST NOT
+	// be reachable through the returned error chain. Plan 12.3's HTTP
+	// handler relies on this scrub when mapping ErrAuth → 502.
+	require.False(t, errors.Is(err, encryption.ErrAuth),
+		"encryption.ErrAuth must not leak through the fold")
+	require.NotContains(t, err.Error(), "cipher",
+		"underlying cipher error text must not appear in the message; got %q", err.Error())
 }
 
 func TestAESGCMDecryptor_TamperedCiphertextYieldsErrAuth(t *testing.T) {

@@ -64,7 +64,14 @@ func (d *AESGCMDecryptor) Decrypt(ctx context.Context, key []byte, ciphertext io
 	plain, err := encryption.Decrypt(key, buf.Bytes(), aad)
 	if err != nil {
 		if errors.Is(err, encryption.ErrAuth) {
-			return nil, fmt.Errorf("%w: %s", ErrAuth, err.Error())
+			// Surface ONLY the recording-module sentinel — the underlying
+			// `cipher: message authentication failed` text from crypto/cipher
+			// is a tampering-detail signal that the spec instructs us not to
+			// expose. Server logs that capture zap.Error(err) will see the
+			// full chain via the wrapped err return below; this scrub
+			// applies to error.Error() string consumers (e.g. accidentally
+			// leaked through to a 502 body by an HTTP handler).
+			return nil, fmt.Errorf("%w", ErrAuth)
 		}
 		return nil, fmt.Errorf("recording.crypto: decrypt: %w", err)
 	}
