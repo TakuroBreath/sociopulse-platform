@@ -64,7 +64,11 @@ func TestTopicClass_AllTopicsCovered(t *testing.T) {
 // rather than silently route to the wrong queue.
 func TestTopicClass_ZeroValueIsUnknown(t *testing.T) {
 	t.Parallel()
-
-	assert.Equal(t, rtapi.FrameClassUnknown, rtapi.TopicClass(""))
-	assert.Equal(t, rtapi.FrameClassUnknown, rtapi.TopicClass("not.a.real.topic"))
+	cases := []rtapi.Topic{"", "not.a.real.topic"}
+	for _, topic := range cases {
+		t.Run(string(topic), func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, rtapi.FrameClassUnknown, rtapi.TopicClass(topic))
+		})
+	}
 }

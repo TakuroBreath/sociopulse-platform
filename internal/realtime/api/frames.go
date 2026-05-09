@@ -8,6 +8,8 @@
 // exhaustive test in frames_test.go enforces this.
 package api
 
+import "fmt"
+
 // FrameClass is the per-frame priority class consulted by
 // Connection.Send to decide queue routing + overflow policy.
 //
@@ -37,6 +39,23 @@ const (
 	// routes these onto cfg.WriteBufferSize-deep telemetryCh.
 	FrameClassTelemetry
 )
+
+// String returns the human-readable name of the FrameClass for logs
+// and test-failure messages. An out-of-range value falls back to a
+// "FrameClass(N)" rendering so debugging an unknown enum value is
+// trivial.
+func (c FrameClass) String() string {
+	switch c {
+	case FrameClassUnknown:
+		return "FrameClassUnknown"
+	case FrameClassCritical:
+		return "FrameClassCritical"
+	case FrameClassTelemetry:
+		return "FrameClassTelemetry"
+	default:
+		return fmt.Sprintf("FrameClass(%d)", int(c))
+	}
+}
 
 // TopicClass returns the priority class for the supplied Topic.
 //
