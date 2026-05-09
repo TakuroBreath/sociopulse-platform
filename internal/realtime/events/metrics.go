@@ -105,3 +105,55 @@ func (m *Metrics) observeFanout(count int) {
 	}
 	m.FanoutSize.Observe(float64(count))
 }
+
+// CacheInvalidatorMetrics is the per-handler counter set surfaced
+// on /metrics for *CacheInvalidator (Plan 11.3 Task 3). Nil-tolerated
+// — observe is a no-op on a nil receiver, matching the rest of the
+// realtime metrics types.
+//
+// Separated from *Metrics so a future invalidator that doesn't share
+// the dispatcher's lifecycle can be wired/un-wired independently
+// (e.g. a degraded boot that opts out of the JetStream subscriber
+// would still need the rest of *Metrics).
+type CacheInvalidatorMetrics struct {
+	// invalidations counts dispatched invalidation messages,
+	// labelled by outcome ∈ {"ok", "parse_error", "empty_project_id"}.
+	// Bounded label set — every code path in CacheInvalidator.handle
+	// maps to exactly one of these strings.
+	invalidations *prometheus.CounterVec
+}
+
+// RegisterCacheInvalidatorMetrics builds a fresh
+// *CacheInvalidatorMetrics and registers its counter on reg. The
+// caller owns the registerer's lifetime — cmd/api wires
+// pkg/observability.Metrics.Registry; tests pass
+// prometheus.NewRegistry().
+//
+// reg must be non-nil; a nil registerer is a wiring bug and panics
+// here so failure surfaces at boot, not at first metric emission
+// (mirrors RegisterMetrics' contract above).
+func RegisterCacheInvalidatorMetrics(reg prometheus.Registerer) *CacheInvalidatorMetrics {
+	if reg == nil {
+		panic("events.RegisterCacheInvalidatorMetrics: reg must be non-nil; pass prometheus.NewRegistry() in tests")
+	}
+	m := &CacheInvalidatorMetrics{
+		invalidations: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "realtime_cache_invalidations_total",
+				Help: "Number of resolver-cache invalidations dispatched, labelled by outcome (ok / parse_error / empty_project_id).",
+			},
+			[]string{"result"},
+		),
+	}
+	reg.MustRegister(m.invalidations)
+	return m
+}
+
+// observe ticks the result-labelled counter. nil-safe so callers
+// with no metrics wired (tests / degraded boot) keep working.
+func (m *CacheInvalidatorMetrics) observe(result string) {
+	if m == nil || m.invalidations == nil {
+		return
+	}
+	m.invalidations.WithLabelValues(result).Inc()
+}

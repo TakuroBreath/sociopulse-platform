@@ -42,6 +42,7 @@
 package realtime
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sync"
@@ -53,6 +54,7 @@ import (
 	authapi "github.com/sociopulse/platform/internal/auth/api"
 	"github.com/sociopulse/platform/internal/modules"
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
+	"github.com/sociopulse/platform/internal/realtime/events"
 	"github.com/sociopulse/platform/internal/realtime/service"
 	transporthttp "github.com/sociopulse/platform/internal/realtime/transport/http"
 )
@@ -92,13 +94,25 @@ type Module struct {
 
 	// mu guards lifecycle bookkeeping — registered, stopped, and the
 	// Hub reference Stop reads back to call Shutdown.
-	mu         sync.Mutex
-	logger     *zap.Logger
-	hub        *service.Hub
-	presence   *service.RedisPresenceTracker
-	replicaID  string
-	registered bool
-	stopped    bool
+	mu       sync.Mutex
+	logger   *zap.Logger
+	hub      *service.Hub
+	presence *service.RedisPresenceTracker
+	// cachedProjects is retained as a Module field so the
+	// NATS-driven cache invalidator (Plan 11.3 Task 3) can bind its
+	// Invalidate method as the project-side eviction callback. Built
+	// in Register, never mutated after.
+	cachedProjects *service.CachedProjectResolver
+	// cacheInvalidator is the NATS subscription that evicts stale
+	// project entries from cachedProjects on
+	// tenant.*.crm.project.status_changed events. nil when
+	// d.Subscriber wasn't supplied OR when the underlying Subscribe
+	// failed (we WARN + fall back to TTL-only invalidation rather
+	// than failing module Register). Plan 11.3 Task 3.
+	cacheInvalidator *events.CacheInvalidator
+	replicaID        string
+	registered       bool
+	stopped          bool
 }
 
 // Compile-time assertion that *Module satisfies the modules.Module
@@ -177,6 +191,10 @@ func (m *Module) Register(d modules.Deps) error {
 	rawUsers, rawProjects := resolveResolversFromLocator(d.Locator, logger)
 	cachedUsers := service.NewCachedUserResolver(rawUsers, 0)
 	cachedProjects := service.NewCachedProjectResolver(rawProjects, 0)
+	// Retain cachedProjects as a Module field so the NATS-driven
+	// cache invalidator wired below can bind .Invalidate as the
+	// project-side eviction callback (Plan 11.3 Task 3).
+	m.cachedProjects = cachedProjects
 	rbac := service.NewTopicRBACWithResolvers(cachedUsers, cachedProjects)
 
 	// Hub-level metrics + per-connection metrics. Both are registered
@@ -231,11 +249,50 @@ func (m *Module) Register(d modules.Deps) error {
 		return err
 	}
 
+	// Plan 11.3 Task 3: NATS-driven cache invalidator. Subscribes
+	// to tenant.*.crm.project.status_changed and routes ProjectIDs
+	// to cachedProjects.Invalidate so a project archive doesn't
+	// leave 60s of stale cross-tenant approvals in the resolver
+	// cache. Only wired when d.Subscriber is supplied — degraded
+	// boots without a bus rely on the resolver's TTL alone.
+	//
+	// Subscribe failure is logged WARN, not fatal: the cache still
+	// times out within ttl (defaultResolverTTL = 60s) so the
+	// security envelope is bounded by JWT lifetime + 60s either way.
+	if d.Subscriber != nil {
+		cacheInvalidatorMetrics := events.RegisterCacheInvalidatorMetrics(reg)
+		invalidator := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
+			Subscriber:        d.Subscriber,
+			ProjectInvalidate: cachedProjects.Invalidate,
+			Metrics:           cacheInvalidatorMetrics,
+			Logger:            logger.Named("cache_invalidator"),
+		})
+		// Use context.Background here because the invalidator's
+		// subscription lifetime is tied to the bus's own Close
+		// lifecycle (cmd/api Closes the eventbus on shutdown,
+		// draining every consumer). Tying it to a request- or
+		// Register-scoped ctx would prematurely cancel the
+		// subscription the moment Register returns.
+		if err := invalidator.Start(context.Background()); err != nil {
+			logger.Warn("realtime: cache invalidator start failed; cross-tenant cache will rely on TTL-only invalidation",
+				zap.Error(err),
+			)
+			// Leave m.cacheInvalidator nil so Stop is a no-op for
+			// this component — the rest of Register stays clean.
+		} else {
+			m.cacheInvalidator = invalidator
+			logger.Info("realtime: cache invalidator started",
+				zap.String("subject", "tenant.*.crm.project.status_changed"),
+			)
+		}
+	}
+
 	m.registered = true
 
 	logger.Info("realtime module registered (Plan 11 Task 4c+5)",
 		zap.Bool("subscriber_wired", d.Subscriber != nil),
 		zap.Bool("presence_wired", d.Redis != nil),
+		zap.Bool("cache_invalidator_wired", m.cacheInvalidator != nil),
 	)
 	return nil
 }
@@ -258,8 +315,17 @@ func (m *Module) Stop() error {
 	m.stopped = true
 	hub := m.hub
 	logger := m.logger
+	cacheInvalidator := m.cacheInvalidator
 	m.mu.Unlock()
 
+	// Tear down the cache invalidator first so it stops processing
+	// status_changed events before the Hub closes connections —
+	// avoids a race where a late-delivered Invalidate hits a
+	// half-shutdown resolver. Stop is idempotent and safe even
+	// when the underlying ctx has already cancelled.
+	if cacheInvalidator != nil {
+		cacheInvalidator.Stop()
+	}
 	if hub != nil {
 		hub.Shutdown()
 	}
