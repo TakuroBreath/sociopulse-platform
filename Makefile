@@ -184,9 +184,24 @@ migrate-create: ## Create a new migration pair: NAME=add_users_table
 	echo "Created migrations/$${next}_$(NAME).down.sql"
 
 # ──────────────────────────── proto codegen ───────────────────────────────────
+# Plugins are pinned via go.mod `tool` directive (Go 1.24+). `go tool` resolves
+# the binary from the module cache without installing anything globally — the
+# trampoline shims below adapt protoc's plugin protocol to that resolver.
+PROTOC_TOOL_BIN := .protoc-tools
+
+$(PROTOC_TOOL_BIN)/protoc-gen-go:
+	@mkdir -p $(PROTOC_TOOL_BIN)
+	@printf '#!/usr/bin/env bash\nexec $(GO) tool protoc-gen-go "$$@"\n' > $@
+	@chmod +x $@
+
+$(PROTOC_TOOL_BIN)/protoc-gen-go-grpc:
+	@mkdir -p $(PROTOC_TOOL_BIN)
+	@printf '#!/usr/bin/env bash\nexec $(GO) tool protoc-gen-go-grpc "$$@"\n' > $@
+	@chmod +x $@
+
 .PHONY: proto-recording
-proto-recording: ## Generate Go bindings for the RecordingService proto.
-	PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+proto-recording: $(PROTOC_TOOL_BIN)/protoc-gen-go $(PROTOC_TOOL_BIN)/protoc-gen-go-grpc ## Generate Go bindings for the RecordingService proto.
+	PATH="$(CURDIR)/$(PROTOC_TOOL_BIN):$$PATH" protoc \
 	  -I=docs/api \
 	  --go_out=. \
 	  --go_opt=module=github.com/sociopulse/platform \

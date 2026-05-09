@@ -42,3 +42,8 @@ coverage.html
 /tmp/
 *.bak
 /api
+
+# protoc plugin trampolines generated on demand by `make proto-*` targets.
+# The actual binaries resolve via `go tool` (Go 1.24+ tool directive); the
+# tiny shell scripts under this dir only adapt protoc's $PATH-lookup contract.
+/.protoc-tools/
