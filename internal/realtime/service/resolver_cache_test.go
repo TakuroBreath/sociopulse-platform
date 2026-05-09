@@ -331,3 +331,67 @@ func TestCachedProjectResolver_NewWithNilInnerPanics(t *testing.T) {
 			_ = service.NewCachedProjectResolver(nil, 60*time.Second)
 		})
 }
+
+// TestCachedUserResolver_InvalidateDropsCachedEntry verifies that
+// Invalidate(id) drops the cached entry: the next Get re-queries
+// the inner resolver, even within the TTL window.
+func TestCachedUserResolver_InvalidateDropsCachedEntry(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubUserResolver(map[string]string{"u1": "t1"})
+	cached := service.NewCachedUserResolver(stub, 60*time.Second)
+
+	// First Get caches the entry.
+	_, err := cached.Get(t.Context(), "u1")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, stub.Calls())
+
+	// Second Get hits the cache (no new inner call).
+	_, err = cached.Get(t.Context(), "u1")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, stub.Calls())
+
+	// Invalidate the entry.
+	cached.Invalidate("u1")
+
+	// Next Get must re-query the inner resolver.
+	_, err = cached.Get(t.Context(), "u1")
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, stub.Calls(),
+		"Get after Invalidate must re-query the inner resolver")
+}
+
+// TestCachedUserResolver_InvalidateUnknownIDIsNoop verifies that
+// Invalidate on an ID that was never cached is a silent no-op.
+// (The singleflight.Forget on a missing key is also a no-op per
+// the upstream documentation; the test locks in the contract.)
+func TestCachedUserResolver_InvalidateUnknownIDIsNoop(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubUserResolver(map[string]string{})
+	cached := service.NewCachedUserResolver(stub, 60*time.Second)
+
+	require.NotPanics(t, func() {
+		cached.Invalidate("never-cached")
+	})
+}
+
+// TestCachedProjectResolver_InvalidateDropsCachedEntry mirrors
+// the user equivalent for the project port.
+func TestCachedProjectResolver_InvalidateDropsCachedEntry(t *testing.T) {
+	t.Parallel()
+
+	stub := newStubProjectResolver(map[string]string{"p1": "t1"})
+	cached := service.NewCachedProjectResolver(stub, 60*time.Second)
+
+	_, err := cached.Get(t.Context(), "p1")
+	require.NoError(t, err)
+	assert.EqualValues(t, 1, stub.Calls())
+
+	cached.Invalidate("p1")
+
+	_, err = cached.Get(t.Context(), "p1")
+	require.NoError(t, err)
+	assert.EqualValues(t, 2, stub.Calls(),
+		"Get after Invalidate must re-query the inner resolver")
+}

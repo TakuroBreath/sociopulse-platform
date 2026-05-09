@@ -147,6 +147,30 @@ func (c *CachedUserResolver) Get(ctx context.Context, userID string) (rtapi.Reso
 	}
 }
 
+// Invalidate drops the cached entry for userID. Idempotent — no
+// error if the key was never cached. Calls singleflight.Forget so
+// any in-flight inner call (the leader) is uncached for future
+// joiners — they re-query rather than inheriting the leader's
+// (possibly stale) result. Used by the events-package cache
+// invalidator (Plan 11.3 Task 3) to drop entries on NATS-side
+// lifecycle events.
+//
+// Concurrency: safe for concurrent use with Get and other
+// Invalidate calls. sync.Map.Delete + singleflight.Forget are
+// independently safe; their composition is correct because the
+// next Get either:
+//   - finds the cache empty (Load miss) → enters singleflight,
+//     gets a fresh result; OR
+//   - finds an in-flight singleflight (a concurrent Get just past
+//     the cache miss) → joins it, gets the leader's result. The
+//     leader's result is from BEFORE the Invalidate call, but
+//     that's the closest-to-current state available; Invalidate
+//     guarantees the NEXT post-Forget Get sees the fresh state.
+func (c *CachedUserResolver) Invalidate(userID string) {
+	c.cache.Delete(userID)
+	c.group.Forget(userID)
+}
+
 // CachedProjectResolver mirrors CachedUserResolver for project IDs.
 // Behaviour identical; separate type so the resolver-port type
 // safety is preserved at call sites.
@@ -231,6 +255,13 @@ func (c *CachedProjectResolver) Get(ctx context.Context, projectID string) (rtap
 		c.group.Forget(projectID)
 		return rtapi.ResolvedTenant{}, ctx.Err()
 	}
+}
+
+// Invalidate drops the cached entry for projectID. Mirror of
+// CachedUserResolver.Invalidate.
+func (c *CachedProjectResolver) Invalidate(projectID string) {
+	c.cache.Delete(projectID)
+	c.group.Forget(projectID)
 }
 
 // Compile-time interface checks. Keeping these next to the
