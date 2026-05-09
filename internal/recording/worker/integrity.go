@@ -47,6 +47,11 @@ const (
 	integrityResultOK       = "ok"
 	integrityResultMismatch = "mismatch"
 	integrityResultError    = "error"
+	// integrityResultStale fires when UpdateVerifyResultTx reports
+	// rowsAffected=0 — the row was concurrently deleted (admin or retention
+	// worker) between SampleForVerify and the WithTenant Tx. Skip the audit
+	// row (would dangle to a non-existent recording target) and bail out.
+	integrityResultStale = "stale"
 )
 
 // IntegrityConfig wires the dependencies and tunables for an
@@ -276,8 +281,16 @@ func (p *IntegrityPass) handleVerify(ctx context.Context, row rapi.LifecycleRow,
 	}
 
 	persistErr := p.pool.WithTenant(ctx, row.TenantID, func(tx postgres.Tx) error {
-		if _, uErr := p.store.UpdateVerifyResultTx(ctx, tx, row.ID, now, result.OK); uErr != nil {
+		n, uErr := p.store.UpdateVerifyResultTx(ctx, tx, row.ID, now, result.OK)
+		if uErr != nil {
 			return fmt.Errorf("update verify result: %w", uErr)
+		}
+		if n == 0 {
+			// Concurrent state change — row was deleted between
+			// SampleForVerify and this Tx. Skip audit (it would dangle to a
+			// non-existent recording target) and surface the stale skip via
+			// errStaleSkip; caller bumps the "stale" metric.
+			return errStaleSkip
 		}
 		payload := map[string]any{
 			"recording_id":  row.ID,
@@ -292,7 +305,15 @@ func (p *IntegrityPass) handleVerify(ctx context.Context, row rapi.LifecycleRow,
 		}
 		return nil
 	})
-	if persistErr != nil {
+	switch {
+	case errors.Is(persistErr, errStaleSkip):
+		p.metrics.IncIntegrityAction(tenantLabel, integrityResultStale)
+		p.log.Debug("integrity verify skipped — row concurrently deleted",
+			zap.String("recording_id", row.ID.String()),
+			zap.String("tenant_id", tenantLabel),
+		)
+		return
+	case persistErr != nil:
 		p.metrics.IncIntegrityAction(tenantLabel, integrityResultError)
 		p.log.Warn("integrity persist failed; will retry next sweep",
 			zap.String("recording_id", row.ID.String()),
