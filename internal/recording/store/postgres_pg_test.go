@@ -106,6 +106,29 @@ func TestPostgresStore_GetByCallID_Found(t *testing.T) {
 	require.Equal(t, row.SHA256Hex, got.SHA256Hex)
 }
 
+// TestPostgresStore_GetByCallID_NullDeleteAt locks in the *time.Time round-trip
+// for the nullable delete_at column. Without the pointer type, scanning a NULL
+// delete_at would panic. Plan 12.1 callers always supply a non-nil DeleteAt
+// (Commit validation rejects zero), but the schema permits NULL for legal-hold
+// scenarios that future plans may expose, so the round-trip must hold.
+func TestPostgresStore_GetByCallID_NullDeleteAt(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callID := seedCall(t, pool)
+
+	s := store.NewPostgresStore(pool)
+	row := newRow(t, tenantID, callID)
+	row.DeleteAt = nil // simulate "no scheduled deletion" / legal hold
+	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
+		_, _, err := s.InsertRecordingIdempotent(t.Context(), tx, row)
+		return err
+	}))
+
+	got, err := s.GetByCallID(t.Context(), tenantID, callID)
+	require.NoError(t, err)
+	require.Nil(t, got.DeleteAt, "NULL delete_at must round-trip as a nil pointer")
+}
+
 func TestPostgresStore_GetByCallID_NotFound(t *testing.T) {
 	t.Parallel()
 	pool := startPGContainer(t)
@@ -237,6 +260,7 @@ func seedCall(t *testing.T, pool *postgres.Pool) (tenantID, callID uuid.UUID) {
 func newRow(t *testing.T, tenantID, callID uuid.UUID) store.RecordingRow {
 	t.Helper()
 	now := time.Now().UTC().Truncate(time.Microsecond)
+	deleteAt := now.Add(730 * 24 * time.Hour)
 	return store.RecordingRow{
 		ID:             uuid.Must(uuid.NewV7()),
 		CallID:         callID,
@@ -252,7 +276,7 @@ func newRow(t *testing.T, tenantID, callID uuid.UUID) store.RecordingRow {
 		SampleRate:     48000,
 		Status:         "stored",
 		CommittedAt:    now,
-		DeleteAt:       now.Add(730 * 24 * time.Hour),
+		DeleteAt:       &deleteAt,
 		ColdAt:         now.Add(365 * 24 * time.Hour),
 		RecordedAt:     now.Add(-1 * time.Hour),
 		IngestAgentID:  "agent-test",

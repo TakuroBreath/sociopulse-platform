@@ -31,7 +31,12 @@ type RecordingRow struct {
 	SampleRate     int32
 	Status         string
 	CommittedAt    time.Time
-	DeleteAt       time.Time
+	// DeleteAt is nullable in the schema (NULL = "no scheduled deletion") so a
+	// pointer type lets pgx round-trip NULL via a nil. Plan 12.1 callers always
+	// supply a non-nil value (Commit validation rejects zero), but the column
+	// can carry NULL for legal-hold/eternal-retention scenarios introduced
+	// later.
+	DeleteAt       *time.Time
 	ColdAt         time.Time
 	RecordedAt     time.Time
 	VerifiedAt     *time.Time

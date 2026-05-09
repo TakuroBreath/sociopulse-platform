@@ -95,6 +95,7 @@ func (s *PostgresStore) InsertRecordingIdempotent(ctx context.Context, tx postgr
 		r.KMSKeyID, r.EncryptedDEK, r.BytesSize, r.DurationMS, r.SHA256Hex,
 		r.Codec, r.SampleRate, r.Status, r.CommittedAt, r.DeleteAt, r.ColdAt,
 		r.RecordedAt, r.IngestAgentID,
+		// $16 r.DeleteAt is *time.Time — pgx sends NULL for nil, value for non-nil.
 	).Scan(&id, &committedAt, &replay); err != nil {
 		// Defence-in-depth: if a different goroutine deleted the parent
 		// `calls` row between our exists-check and the INSERT, we'd hit
