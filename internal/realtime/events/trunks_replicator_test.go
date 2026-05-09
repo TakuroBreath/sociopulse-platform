@@ -15,6 +15,7 @@ package events_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 
@@ -121,7 +122,11 @@ func TestTrunksReplicator_ConstructorPanicsOnNilHub(t *testing.T) {
 	t.Parallel()
 
 	defer func() {
-		require.NotNil(t, recover(), "nil hub must panic at construction")
+		r := recover()
+		require.NotNil(t, r, "nil hub must panic at construction")
+		// The panic message is part of the contract — it's the
+		// operator's only debugging hint at boot. Lock the substring.
+		require.Contains(t, fmt.Sprint(r), "hub must be non-nil")
 	}()
 	lister := &fakeTenantLister{}
 	_ = events.NewTrunksReplicator(nil, lister, nil, nil)
@@ -131,7 +136,9 @@ func TestTrunksReplicator_ConstructorPanicsOnNilLister(t *testing.T) {
 	t.Parallel()
 
 	defer func() {
-		require.NotNil(t, recover(), "nil lister must panic at construction")
+		r := recover()
+		require.NotNil(t, r, "nil lister must panic at construction")
+		require.Contains(t, fmt.Sprint(r), "lister must be non-nil")
 	}()
 	hub := &hubBroadcastRecorder{}
 	_ = events.NewTrunksReplicator(hub, nil, nil, nil)

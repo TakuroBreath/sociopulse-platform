@@ -43,11 +43,14 @@ func WithReplicaID(id string) Option {
 }
 
 // WithTrunksReplicator opts the dispatcher into the global
-// `trunks.health` subject. When supplied, Start adds a sixth
+// `trunks.health` subject. When supplied, Start adds an additional
 // Subscribe registration that delegates to *TrunksReplicator.Dispatch
-// for cross-tenant fan-out (Plan 11.1 Task 2). When nil/absent, the
-// subject stays unwired — backward-compatible with the Plan 11 baseline
-// and useful for tests/local boots that lack a TenantLister.
+// for cross-tenant fan-out (Plan 11.1 Task 2). The registration shares
+// the per-replica queue group with the other patterns so every replica
+// receives every trunks.health event (queue-group degeneration per Q2).
+// When nil/absent, the subject stays unwired — backward-compatible
+// with the Plan 11 baseline and useful for tests/local boots that
+// lack a TenantLister.
 func WithTrunksReplicator(r *TrunksReplicator) Option {
 	return func(o *subscriberOptions) { o.trunks = r }
 }
