@@ -1090,3 +1090,46 @@ git commit -m "feat(telephony/nats_bridge): Plan 11.1 Task 4 — real cmd subscr
 - `go test -race -count=1` clean.
 - `goleak.VerifyTestMain` present (or inherited via existing TestMain).
 - 2-stage review (spec compliance + code quality) before commit.
+
+---
+
+## Lessons learned (Plan 11.1 close-out)
+
+These bullets were populated when `v0.0.13-realtime-followups` shipped. Future plans inherit them.
+
+### Pipeline & review
+
+1. **2-stage review caught 4 IMPORTANTs across 4 tasks** (Plan 11 caught 2 across 7 tasks; Plan 10 caught 1 critical + 4 important across 10 tasks). The IMPORTANTs surface either ctx-budget gaps, lock-held-across-network calls, or doc-vs-impl drift. ALL fixable inline; never required a re-implementation.
+
+2. **The IMPORTANTs in Plan 11.1 fell into three categories:**
+   - **Lock-during-network** (Task 3): `*NATSPubSub.Start` held `mu.Lock` across `bus.Subscribe` (JetStream consumer-create RPC). Fix: brief lock for flag flip → drop lock → network call → re-acquire on rollback. Pattern is now: any Start that does network I/O must release locks before the call.
+   - **Missing ctx deadline** (Task 4): `cmdSubscriber.handle` used `context.WithCancel(context.Background())` with only manual cancel. A wedged Redis or ESL pool call would pin the bus handler goroutine. Fix: `context.WithTimeout(handleTimeout)` bounded by carry-forward sized 5s.
+   - **Doc-vs-impl drift** (Task 4): `Bridge.Drain(ctx)` ignored its `ctx` parameter; doc claimed "within ctx deadline." Fix: race Stop in goroutine against ctx.Done.
+
+### Architecture decisions
+
+3. **Single subject pattern for cross-system fan-out (Task 3 + Task 2):** publishing dialer snapshots on `tenant.<tenantID>.dialer.op.<operatorID>.state` reaches both the dialer's `*NATSPubSub` (cross-replica) AND every realtime WS client subscribed to `operators.state` via the realtime dispatcher's existing `tenant.*.dialer.op.*.state` pattern. ONE publish covers BOTH paths — DRY at the wire level. Future tasks should look for the same opportunity (e.g., `tenant.<t>.dialer.queue` for queue-depth events).
+
+4. **TenantLister port (Task 2)** is the right shape for "global subject → per-tenant fan-out". Future cross-tenant signals (alerting, SLO breaches) should reuse the same pattern: keep a port narrow on `ListActiveTenantIDs`, let cmd/api wire the tenancy adapter.
+
+5. **Per-pod refcount > shared-key when modelling per-(tenant, user) presence with multiple connections.** Plan 11 Task 7 chose this for the WS handler; Plan 11.1 inherits the pattern. The PresenceTracker stays simple; multi-conn semantics are handler-local.
+
+### Subagent prompts
+
+6. **Each implementer prompt MUST include the canonical plan section path.** Plan 11.1 prompts pointed to `docs/superpowers/plans/2026-05-09-11-1-realtime-followups.md` Task N — implementers read this AND the plan's reading list AND the linked references docs. This produces self-contained prompts where the subagent doesn't need session history.
+
+7. **Strict-TDD prompts work even for compositional/non-test-friendly tasks** (Task 1 middleware, Task 4 bridge orchestration). Keys to success: (a) define the API surface up-front in the prompt; (b) give 3-5 concrete test signatures (red-spec); (c) let the implementer fill in the bodies. Implementers consistently produced 5-12 cases per task with ≥90% coverage.
+
+### Carry-overs from prior plans (closed in Plan 11.1)
+
+- **`internal/telephony/nats_bridge`** (Plan 09 carry-over → Plan 11 carry-over → CLOSED here).
+- **Dialer SnapshotPubSub → NATS swap** (Plan 11 carry-over → CLOSED).
+- **Dialer RefreshPresence middleware wiring** (Plan 10 → Plan 11 carry-over → CLOSED).
+- **trunks.health cross-tenant fan-out** (Plan 11 events.NATSSubscriber TODO → CLOSED).
+
+### Carry-overs deferred to Plan 11.2
+
+- **Frame classification (critical/telemetry queues)** — requires `rtapi.Frame.FrameClass` extension + 4 new Topics in `AllTopics`. Out of Plan 11.1 scope (cohesive refactor of Connection's send queue).
+- **RBAC tenant cross-check** — requires User/Project/Call resolvers from auth/crm/telephony with 60s LRU cache and NATS-driven invalidation. Cross-cutting work; deserves its own plan.
+- **Listen-in cleanup hooks + janitor** — blocked on Plan 08 (Listen-in service itself is deferred to FreeSWITCH cluster).
+- **Per-call SIP credentials manager** — same Plan 08 dependency (`mod_xml_curl` callback to `cmd/api`'s `/internal/freeswitch/directory`).
