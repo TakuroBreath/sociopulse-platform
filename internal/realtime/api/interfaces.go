@@ -112,3 +112,20 @@ type ProjectResolver interface {
 	// error when the project is not resolvable.
 	Get(ctx context.Context, projectID string) (ResolvedTenant, error)
 }
+
+// CallResolver maps a call_id to its tenant. Used by TopicRBAC.Allow
+// to reject `call.events` subscriptions whose filter.CallID belongs to
+// a different tenant than the subscriber's claims.
+//
+// Same not-found semantics as UserResolver / ProjectResolver — the
+// realtime layer folds not-found into cross-tenant rejection so the
+// wire response is identical and the client cannot probe call
+// existence cross-tenant.
+//
+// Plan 11.4 Task 4 introduces the recording-side CallTenantLookup
+// port; cmd/api adapts that to CallResolver in Plan 11.4 Task 7.
+type CallResolver interface {
+	// Get resolves call_id to its owning tenant. Returns an error
+	// when the call is not resolvable.
+	Get(ctx context.Context, callID string) (ResolvedTenant, error)
+}

@@ -44,4 +44,10 @@ const (
 	// ProjectResolver. cmd/api adapts crm.ProjectService → ProjectResolver
 	// and registers it under this key BEFORE realtime.Module.Register.
 	LocatorProjectResolver = "realtime.ProjectResolver"
+
+	// LocatorCallResolver is the locator key for the realtime
+	// CallResolver. cmd/api adapts a recording-side
+	// CallTenantLookup → CallResolver and registers it under this key
+	// BEFORE realtime.Module.Register. Plan 11.4 Task 7 wires this in.
+	LocatorCallResolver = "realtime.CallResolver"
 )
