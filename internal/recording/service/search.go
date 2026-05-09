@@ -130,10 +130,7 @@ func (s *svc) Search(ctx context.Context, tenantID uuid.UUID, q rapi.SearchQuery
 	// never sees Limit > 200 (it rejects such values). At limit==200 we forgo
 	// the peek — HasMore will be false even if a 201st row exists, which is an
 	// acceptable trade-off at the API's maximum page size.
-	peekLimit := limit + 1
-	if peekLimit > maxSearchLimit {
-		peekLimit = maxSearchLimit
-	}
+	peekLimit := min(limit+1, maxSearchLimit)
 	storeQ := store.SearchQ{
 		ProjectID:  q.ProjectID,
 		OperatorID: q.OperatorID,
