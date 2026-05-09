@@ -185,15 +185,14 @@ UPDATE call_recordings
 	return rowsAffected, nil
 }
 
-// clampSamplePct normalises the BERNOULLI sample percent to (0, 100]. A
-// value of 0 disables sampling (the SQL would error with
-// "TABLESAMPLE parameter must be a value between 0 and 100"), and values
-// above 100 are clamped to 100 (= scan the entire table).
+// clampSamplePct normalises the BERNOULLI sample percent to [0.01, 100].
+// A value at or below the floor is raised to 0.01 (the spec contract's
+// minimum — small enough for a billion-row table while staying well above
+// BERNOULLI's "must be between 0 and 100" error), and values above 100
+// are clamped to 100 (= scan the entire table).
 func clampSamplePct(pct float64) float64 {
-	// Smallest meaningful sample for a billion-row table is well below 1%
-	// but the BERNOULLI module errors on exactly 0; pick a tiny floor.
-	if pct <= 0 {
-		return 0.0001
+	if pct < 0.01 {
+		return 0.01
 	}
 	if pct > 100 {
 		return 100
@@ -258,8 +257,13 @@ SELECT cr.id, cr.tenant_id, cr.call_id, cr.s3_bucket, cr.audio_object_key, cr.sh
 }
 
 // UpdateVerifyResult implements rapi.LifecycleStore. It writes
-// verified_at=now() and integrity_ok=ok unconditionally — re-applying with
-// the same (id, ok) is a benign overwrite.
+// verified_at=verifiedAt and integrity_ok=ok unconditionally — re-applying
+// with the same (id, verifiedAt, ok) is a benign overwrite.
+//
+// verifiedAt is supplied by the caller (rather than via SQL now()) so the
+// integrity worker can compute time.Now() once and apply the same instant
+// to both this row's verified_at column and the paired audit-log row's ts
+// column, preserving the chain-of-custody coherence contract.
 //
 // The method does NOT distinguish "row not found" from "row updated": the
 // integrity verifier always operates on rows it just selected via
@@ -267,15 +271,15 @@ SELECT cr.id, cr.tenant_id, cr.call_id, cr.s3_bucket, cr.audio_object_key, cr.sh
 // (concurrent admin delete) and surfacing it as an error here would
 // trigger spurious worker alerts. The caller asserting "I just selected
 // this id" is the contract.
-func (s *PostgresStore) UpdateVerifyResult(ctx context.Context, id uuid.UUID, ok bool) error {
+func (s *PostgresStore) UpdateVerifyResult(ctx context.Context, id uuid.UUID, verifiedAt time.Time, ok bool) error {
 	const q = `
 UPDATE call_recordings
-   SET verified_at = now(),
-       integrity_ok = $2
+   SET verified_at = $2,
+       integrity_ok = $3
  WHERE id = $1
 `
 	return s.pool.BypassRLS(ctx, func(tx postgres.Tx) error {
-		if _, err := tx.Exec(ctx, q, id, ok); err != nil {
+		if _, err := tx.Exec(ctx, q, id, verifiedAt, ok); err != nil {
 			return fmt.Errorf("recording.store: update verify result %s: %w", id, err)
 		}
 		return nil

@@ -92,8 +92,12 @@ type LifecycleStore interface {
 	// evenly across the verify window.
 	SampleForVerify(ctx context.Context, samplePct float64, limit int) ([]LifecycleRow, error)
 
-	// UpdateVerifyResult writes verified_at=now() and integrity_ok=ok for
-	// the given recording id. Idempotent: re-applying with the same
-	// (id, ok) is a benign overwrite of verified_at.
-	UpdateVerifyResult(ctx context.Context, id uuid.UUID, ok bool) error
+	// UpdateVerifyResult writes verified_at=verifiedAt and integrity_ok=ok
+	// for the given recording id. The caller supplies verifiedAt so that
+	// it can be applied to both this row and a paired audit-log entry from
+	// the same time.Now() reading — the chain-of-custody contract requires
+	// the recording's verified_at column and the audit row's ts column to
+	// agree to the microsecond. Idempotent: re-applying with the same
+	// (id, verifiedAt, ok) is a benign overwrite.
+	UpdateVerifyResult(ctx context.Context, id uuid.UUID, verifiedAt time.Time, ok bool) error
 }

@@ -545,11 +545,15 @@ func TestLifecycle_UpdateVerifyResult_WritesVerifiedAtAndOK(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, true))
+	verifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, verifiedAt, true))
 
 	got, err := st.GetByCallID(t.Context(), tenantID, callID)
 	require.NoError(t, err)
 	require.NotNil(t, got.VerifiedAt, "verified_at must be set after UpdateVerifyResult")
+	require.True(t, got.VerifiedAt.Equal(verifiedAt),
+		"verified_at must equal the caller-supplied timestamp (got %v, want %v)",
+		got.VerifiedAt, verifiedAt)
 	require.NotNil(t, got.IntegrityOK)
 	require.True(t, *got.IntegrityOK)
 }
@@ -569,7 +573,8 @@ func TestLifecycle_UpdateVerifyResult_RecordsFailure(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, false))
+	verifiedAt := time.Now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, verifiedAt, false))
 
 	got, err := st.GetByCallID(t.Context(), tenantID, callID)
 	require.NoError(t, err)
@@ -593,7 +598,8 @@ func TestLifecycle_UpdateVerifyResult_Idempotent(t *testing.T) {
 		return err
 	}))
 
-	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, true))
+	firstAt := time.Now().UTC().Truncate(time.Microsecond)
+	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, firstAt, true))
 
 	first, err := st.GetByCallID(t.Context(), tenantID, callID)
 	require.NoError(t, err)
@@ -601,9 +607,10 @@ func TestLifecycle_UpdateVerifyResult_Idempotent(t *testing.T) {
 	require.NotNil(t, first.IntegrityOK)
 	require.True(t, *first.IntegrityOK)
 
-	// Second call with ok=false — the row's integrity flag flips and
-	// verified_at advances (or stays equal).
-	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, false))
+	// Second call with ok=false at a strictly-later timestamp — the row's
+	// integrity flag flips and verified_at advances.
+	secondAt := firstAt.Add(time.Second)
+	require.NoError(t, st.UpdateVerifyResult(t.Context(), row.ID, secondAt, false))
 
 	second, err := st.GetByCallID(t.Context(), tenantID, callID)
 	require.NoError(t, err)
