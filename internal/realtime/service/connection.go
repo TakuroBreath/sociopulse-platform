@@ -299,9 +299,14 @@ func (c *Connection) Subscribe(topic rtapi.Topic, filter rtapi.SubscriptionFilte
 	if c.subscribeFn == nil {
 		return "", errors.New("realtime/service: Subscribe not wired (Hub.Connect not called)")
 	}
-	// Use a Background-derived ctx scoped to the connection's
-	// lifetime. The Hub-side SubscribeFn applies its own per-call
-	// deadline for the resolver lookups (Plan 11.2 Task 4).
+	// Use context.Background() — the production-wired cached
+	// resolver enforces its own resolverInnerTimeout=5s ceiling on
+	// the inner DB call (see resolver_cache.go), so a slow resolver
+	// cannot pin this Subscribe path even though the connection's
+	// run-ctx is not threaded through. An uncached resolver wired
+	// without a per-call deadline is a wiring bug — surface it via
+	// the cmd/api composition root, not here. (Plan 11.2 Task 4
+	// review NIT — clarified ctx semantics.)
 	return c.subscribeFn(context.Background(), c, topic, filter)
 }
 
