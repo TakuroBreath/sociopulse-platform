@@ -104,6 +104,28 @@ const (
 	// live in adapters.go.
 )
 
+// pubsubLifecycle is the unified Stop() seam shared by both PubSub
+// backends. Plan 11.1 Task 3 introduced *NATSPubSub which exposes
+// Stop() error; the existing in-memory *PubSub keeps Close() with no
+// error return. Module.Stop calls a single method through this seam,
+// so a future third backend just needs to satisfy the interface
+// without re-plumbing the lifecycle code.
+type pubsubLifecycle interface {
+	Stop() error
+}
+
+// inMemPubSubAdapter wraps the legacy in-memory PubSub.Close() so it
+// satisfies pubsubLifecycle. Returning a typed nil keeps Module.Stop's
+// error path identical for both backends.
+type inMemPubSubAdapter struct{ *PubSub }
+
+// Stop closes the underlying in-memory PubSub. Always returns nil —
+// Close has no failure mode (it just closes channels and flips a flag).
+func (a inMemPubSubAdapter) Stop() error {
+	a.PubSub.Close()
+	return nil
+}
+
 // Module is the top-level registration handle for the dialer module.
 // Holds the lifecycle-owned components built in Register; Stop()
 // releases them. Safe to construct as a zero value.
@@ -113,10 +135,21 @@ type Module struct {
 	mu sync.Mutex
 
 	// Lifecycle-owned components — Stop() shuts them down.
-	pubsub        *PubSub
+	//
+	// pubsub holds whichever Snapshot fan-out backend Register chose:
+	// a NATS-backed *NATSPubSub when (Deps.EventBus, Deps.Subscriber)
+	// are present, otherwise the in-memory *PubSub wrapped in the
+	// inMemPubSubAdapter (for Redis-less / NATS-less test setups).
+	pubsub        pubsubLifecycle
 	heartbeatStop func()
 	heartbeatWG   sync.WaitGroup
 	stopped       bool
+
+	// replicaID identifies this pod in the dialer-pubsub queue group
+	// and pairs with the realtime module's replicaID-named scheme so
+	// observability (consumer lists, presence map) line up across
+	// modules. Default is uuid.NewString() at first Register.
+	replicaID string
 
 	// Built but not started here — cmd/worker calls Run on this. The
 	// field is exposed via the locator under LocatorRetryOrchestrator.
@@ -161,8 +194,38 @@ func (m *Module) Register(d modules.Deps) error {
 	}
 
 	// 2. PubSub — built BEFORE the FSM so the FSM can see it via
-	//    Publisher.
-	m.pubsub = NewPubSub()
+	//    Publisher. Plan 11.1 Task 3 added the NATS-backed adapter:
+	//    when (Deps.EventBus, Deps.Subscriber) are both present we
+	//    wire NATSPubSub so a snapshot published on pod A reaches WS
+	//    subscribers on pod B (cross-replica fan-out). Otherwise we
+	//    fall back to the in-memory PubSub for Redis-less / NATS-less
+	//    test setups — keeping the existing dialer test suite green
+	//    without forcing every module test to embed JetStream.
+	if m.replicaID == "" {
+		m.replicaID = uuid.NewString()
+	}
+	var (
+		fsmPublisher   Publisher
+		snapshotPubsub transporthttp.SnapshotPubSub
+	)
+	if d.EventBus != nil && d.Subscriber != nil {
+		natsPS := NewNATSPubSub(d.EventBus, d.Subscriber, m.replicaID, logger.Named("dialer.pubsub"))
+		startCtx := d.Ctx
+		if startCtx == nil {
+			startCtx = context.Background()
+		}
+		if err := natsPS.Start(startCtx); err != nil {
+			return fmt.Errorf("dialer: start nats pubsub: %w", err)
+		}
+		m.pubsub = natsPS
+		fsmPublisher = natsPS
+		snapshotPubsub = natsPS
+	} else {
+		inMem := NewPubSub()
+		m.pubsub = inMemPubSubAdapter{inMem}
+		fsmPublisher = inMem
+		snapshotPubsub = inMem
+	}
 
 	// 3. FSM Machine. d.Redis is the broader UniversalClient; the FSM
 	//    needs *redis.Client (single-node connection for Lua scripts).
@@ -173,7 +236,7 @@ func (m *Module) Register(d modules.Deps) error {
 		PG:        d.Pool,
 		Outbox:    outbox.NewPostgresWriter(),
 		Logger:    logger.Named("fsm"),
-		Publisher: m.pubsub,
+		Publisher: fsmPublisher,
 	})
 	if err != nil {
 		return fmt.Errorf("dialer: build fsm: %w", err)
@@ -322,7 +385,7 @@ func (m *Module) Register(d modules.Deps) error {
 	if d.HTTPRouter != nil {
 		if dialerRouter == nil {
 			logger.Warn("dialer: HTTP transport not mounted (router missing)")
-		} else if err := m.mountHTTP(d, machine, dialerRouter, q, checker, tracker, rdb); err != nil {
+		} else if err := m.mountHTTP(d, machine, dialerRouter, q, checker, tracker, rdb, snapshotPubsub); err != nil {
 			logger.Warn("dialer: HTTP transport not mounted", zap.Error(err))
 		}
 	} else {
@@ -341,7 +404,7 @@ func (m *Module) Register(d modules.Deps) error {
 		d.Locator.Register(LocatorRDDGenerator, dialerapi.RDDGenerator(rddGen))
 	}
 	d.Locator.Register(LocatorRetryOrchestrator, dialerapi.RetryOrchestrator(retryOrch))
-	d.Locator.Register(LocatorSnapshotPubSub, transporthttp.SnapshotPubSub(m.pubsub))
+	d.Locator.Register(LocatorSnapshotPubSub, snapshotPubsub)
 
 	logger.Info("dialer module registered (Plan 10 Task 10)",
 		zap.Bool("http_mounted", d.HTTPRouter != nil && dialerRouter != nil),
@@ -352,8 +415,10 @@ func (m *Module) Register(d modules.Deps) error {
 }
 
 // Stop releases the module's lifecycle-owned components: cancels the
-// heartbeat watchdog, waits for it to drain, and closes the PubSub.
-// Safe to call multiple times — second invocation is a no-op.
+// heartbeat watchdog, waits for it to drain, and closes the PubSub
+// (whichever backend Register chose). Safe to call multiple times —
+// the second invocation is a no-op for the module shell, and each
+// backend's Stop is itself idempotent.
 func (m *Module) Stop() error {
 	m.mu.Lock()
 	if m.stopped {
@@ -370,7 +435,14 @@ func (m *Module) Stop() error {
 	}
 	m.heartbeatWG.Wait()
 	if pubsub != nil {
-		pubsub.Close()
+		// Both backends' Stop is idempotent + nil-safe; we surface the
+		// error for the NATSPubSub variant (currently always nil but
+		// reserved for future drain failures) but do NOT abort: the
+		// heartbeat goroutine has already wound down and there's no
+		// recovery action a caller could take.
+		if err := pubsub.Stop(); err != nil && m.logger != nil {
+			m.logger.Warn("dialer: pubsub stop returned error", zap.Error(err))
+		}
 	}
 	if m.logger != nil {
 		m.logger.Info("dialer module stopped")
@@ -382,6 +454,11 @@ func (m *Module) Stop() error {
 // handlers under /api. Auth deps come from the locator (registered
 // earlier by the auth module); when missing we return a clean error
 // so the caller surfaces a warning rather than panicking.
+//
+// snapshotPubsub is whichever backend Register selected (NATSPubSub
+// when the bus is wired, in-memory PubSub otherwise) — passed in
+// rather than re-derived from m.pubsub so this function works
+// against the lifecycle interface without an extra type assertion.
 func (m *Module) mountHTTP(
 	d modules.Deps,
 	machine *fsm.Machine,
@@ -390,6 +467,7 @@ func (m *Module) mountHTTP(
 	checker *hours.Checker,
 	tracker *capacity.Tracker,
 	rdb *redis.Client,
+	snapshotPubsub transporthttp.SnapshotPubSub,
 ) error {
 	rbac, ok := lookupRBACChecker(d.Locator, m.logger)
 	if !ok {
@@ -422,7 +500,7 @@ func (m *Module) mountHTTP(
 		Validator:       validator,
 		RBAC:            rbac,
 		Logger:          m.logger.Named("http"),
-		SnapshotPubSub:  m.pubsub,
+		SnapshotPubSub:  snapshotPubsub,
 		RefreshPresence: refresh,
 	})
 	m.logger.Info("dialer HTTP transport mounted under /api")
