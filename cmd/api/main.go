@@ -38,6 +38,9 @@ import (
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	rtevents "github.com/sociopulse/platform/internal/realtime/events"
 	"github.com/sociopulse/platform/internal/recording"
+	"github.com/sociopulse/platform/internal/recording/crypto"
+	"github.com/sociopulse/platform/internal/recording/storage"
+	recwire "github.com/sociopulse/platform/internal/recording/wire"
 	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/eventbus"
@@ -281,19 +284,31 @@ func run(ctx context.Context, configDir string) error {
 	// in the locator but skips the listener.
 	//
 	// Plan 12.2 Task 5 — wire Local* ports for DEK unwrap + object
-	// storage. recordingPorts hex-decodes the KEK map from config and
+	// storage. wire.LocalPorts hex-decodes the KEK map from config and
 	// fails boot fast on bad hex or wrong key length. An empty KEK
-	// map is non-fatal — OpenAudioStream will fail at the KMS step
-	// until Plan 01 wires the real Yandex adapter.
-	recordingDEK, recordingObjects, err := recordingPorts(cfg.Recording, logger.Named("recording"))
+	// map yields a nil Ports + WARN — OpenAudioStream then returns
+	// ErrInvalidInput "not wired" until Plan 01 wires the real Yandex
+	// adapter.
+	//
+	// Plan 12.4 Task 5: helper relocated to internal/recording/wire so
+	// cmd/worker can share the same construction path.
+	recordingPorts, err := recwire.LocalPorts(cfg.Recording, logger.Named("recording"))
 	if err != nil {
 		return fmt.Errorf("recording ports: %w", err)
+	}
+	var (
+		recordingDEK     crypto.DEKUnwrapper
+		recordingObjects storage.ObjectStore
+	)
+	if recordingPorts != nil {
+		recordingDEK = recordingPorts.DEK
+		recordingObjects = recordingPorts.Objects
 	}
 	recordingModule := recording.New(recording.Config{
 		Registerer:   metrics.Registry,
 		GRPCConfig:   recordingGRPCConfig(cfg.Recording),
-		DEKUnwrapper: recordingDEK,     // NEW
-		ObjectStore:  recordingObjects, // NEW
+		DEKUnwrapper: recordingDEK,
+		ObjectStore:  recordingObjects,
 	})
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},

@@ -39,7 +39,7 @@ import (
 func TestRunHappyPathStartsAndStops(t *testing.T) { //nolint:paralleltest // sequential is intentional
 	pgDSN := startPostgres(t)
 	redisAddr := startRedis(t)
-	configDir := writeIntegrationConfig(t, pgDSN, redisAddr)
+	configDir := writeIntegrationConfig(t, pgDSN, redisAddr, false)
 
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -64,6 +64,65 @@ func TestRunHappyPathStartsAndStops(t *testing.T) { //nolint:paralleltest // seq
 		require.NoError(t, err, "run() should exit cleanly on context cancel")
 	case <-time.After(10 * time.Second):
 		t.Fatal("run() did not exit within 10s of cancel")
+	}
+}
+
+// TestWorker_BootsWithoutRecording — Plan 12.4 Task 5. With
+// recording.enabled=false (the dev default), buildRecordingWorkers
+// returns an empty runner slice and the dialer retry orchestrator is
+// the only registered Run-loop. Verifies `run` returns cleanly when
+// the parent ctx cancels.
+func TestWorker_BootsWithoutRecording(t *testing.T) { //nolint:paralleltest // testcontainers contention
+	pgDSN := startPostgres(t)
+	redisAddr := startRedis(t)
+	configDir := writeIntegrationConfig(t, pgDSN, redisAddr, false /* recordingEnabled */)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- run(ctx, configDir) }()
+
+	// Give the worker a tick to register every goroutine. Short pause
+	// is enough — boot is fast against a real container.
+	time.Sleep(500 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err, "run() should return cleanly on ctx cancel without recording")
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not exit within 10s of cancel")
+	}
+}
+
+// TestWorker_BootsWithRecording_Enabled — Plan 12.4 Task 5. With
+// recording.enabled=true and a 64-hex-char local_keks entry, both the
+// retention + integrity passes register against their respective
+// advisory locks alongside the dialer retry orchestrator. Verifies all
+// three goroutines drain on ctx cancel without leaks; the goleak
+// VerifyTestMain in main_test.go enforces zero stuck goroutines.
+func TestWorker_BootsWithRecording_Enabled(t *testing.T) { //nolint:paralleltest // testcontainers contention
+	pgDSN := startPostgres(t)
+	redisAddr := startRedis(t)
+	configDir := writeIntegrationConfig(t, pgDSN, redisAddr, true /* recordingEnabled */)
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	errCh := make(chan error, 1)
+	go func() { errCh <- run(ctx, configDir) }()
+
+	// Boot completion: each of the three Run-loops triggers an
+	// immediate first sweep. 750ms is plenty for the registrations to
+	// land but well under the retention 5min / integrity 1h tick so we
+	// don't wait for a real sweep round.
+	time.Sleep(750 * time.Millisecond)
+	cancel()
+
+	select {
+	case err := <-errCh:
+		require.NoError(t, err, "run() should return cleanly on ctx cancel with recording workers enabled")
+	case <-time.After(10 * time.Second):
+		t.Fatal("run() did not exit within 10s of cancel (recording workers stuck?)")
 	}
 }
 
@@ -137,10 +196,31 @@ func repoMigrationsURL(t *testing.T) string {
 }
 
 // writeIntegrationConfig writes a config.yaml that points cmd/worker
-// at the supplied Postgres + Redis addresses.
-func writeIntegrationConfig(t *testing.T, pgDSN, redisAddr string) string {
+// at the supplied Postgres + Redis addresses. recordingEnabled toggles
+// the recording.enabled + local_keks block so a single helper drives
+// both the no-recording (Plan 10) and recording-on (Plan 12.4 Task 5)
+// boot paths.
+func writeIntegrationConfig(t *testing.T, pgDSN, redisAddr string, recordingEnabled bool) string {
 	t.Helper()
 	dir := t.TempDir()
+	// 64-hex-char (32-byte) AES-256 KEK — fixed dev seed so the boot is
+	// deterministic. Production deploys configure this via the YAML
+	// secret-manager path.
+	const devKEK = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20"
+	recordingBlock := ""
+	if recordingEnabled {
+		recordingBlock = `recording:
+  enabled: true
+  local_keks:
+    kek-it: "` + devKEK + `"
+  workers:
+    retention_interval: 5m
+    retention_batch: 100
+    integrity_interval: 1h
+    integrity_batch: 10
+    integrity_sample_percent: 1.0
+`
+	}
 	yaml := `service:
   env: development
   log_level: info
@@ -201,7 +281,7 @@ outbox:
   batch_size: 50
   tick: 500ms
   max_retry: 5
-`
+` + recordingBlock
 	path := filepath.Join(dir, "config.yaml")
 	require.NoError(t, os.WriteFile(path, []byte(yaml), 0o600))
 	return dir

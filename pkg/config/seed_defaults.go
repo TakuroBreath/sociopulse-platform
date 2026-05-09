@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 // viperDefaulter is the minimal subset of *viper.Viper that seedDefaults uses.
 // Stated as an interface so tests can stub it without spinning up a Viper.
 type viperDefaulter interface {
@@ -10,8 +12,9 @@ type viperDefaulter interface {
 // We seed every field that Validate requires (and a few quality-of-life
 // extras like log_level / metrics namespace) so Load can succeed against an
 // empty directory and fall through to DefaultDev. Sub-trees with no
-// validation (S3, KMS, recording, telephony, dialer, reports) are
-// intentionally left for the YAML to populate.
+// validation (S3, KMS, telephony, dialer, reports) are intentionally left
+// for the YAML to populate; the recording.workers block IS seeded because
+// cmd/worker's boot reads them eagerly (Plan 12.4 Task 5).
 func seedDefaults(v viperDefaulter, c Config) {
 	// service
 	v.SetDefault("service.env", c.Service.Env)
@@ -78,4 +81,13 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("kms.endpoint", c.KMS.Endpoint)
 	v.SetDefault("kms.folder_id", c.KMS.FolderID)
 	v.SetDefault("kms.service_account_key_path", c.KMS.ServiceAccountKeyPath)
+	// recording.workers — cmd/worker's retention + integrity daemons.
+	// Defaults match Plan 12.4 §8.5 + §9.4 so an operator with an
+	// empty recording.workers block in YAML still gets the intended
+	// cadence + batch size.
+	v.SetDefault("recording.workers.retention_interval", 5*time.Minute)
+	v.SetDefault("recording.workers.retention_batch", 100)
+	v.SetDefault("recording.workers.integrity_interval", 1*time.Hour)
+	v.SetDefault("recording.workers.integrity_batch", 10)
+	v.SetDefault("recording.workers.integrity_sample_percent", 1.0)
 }

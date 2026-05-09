@@ -49,6 +49,16 @@ type RecordingConfig struct {
 	Upload          RecordingUpload    `mapstructure:"upload"`
 	Retention       RecordingRetention `mapstructure:"retention"`
 
+	// Workers tunes the cmd/worker daemons that operate on call_recordings:
+	// the retention pass (cold-move + hard-delete) and the integrity pass
+	// (1% BERNOULLI sha256 verify). Both run only when Enabled=true AND
+	// LocalKEKs validates — empty / invalid KEKs WARN + skip.
+	//
+	// Defaults match Plan 12.4 §8.5 + §9.4: 5min retention tick, 100-row
+	// batch; 1h integrity tick, 10-row batch, 1% sample. Production
+	// overrides only when ops dashboards justify a change.
+	Workers RecordingWorkersConfig `mapstructure:"workers"`
+
 	// LocalKEKs is a map of kms_key_id → hex-encoded 32-byte KEK plaintext.
 	// Used by the Local DEKUnwrapper for dev/test environments without
 	// access to Yandex Cloud KMS. Production deployments either build with
@@ -86,4 +96,33 @@ type RecordingRetention struct {
 	DefaultHotDays   int    `mapstructure:"default_hot_days"`
 	DefaultColdDays  int    `mapstructure:"default_cold_days"`
 	ColdStorageClass string `mapstructure:"cold_storage_class"`
+}
+
+// RecordingWorkersConfig wires cmd/worker's recording daemons.
+//
+// All five fields are nil-tolerant — zero values fall back to the
+// in-package defaults (defaultRetentionInterval = 5m, etc.). The viper
+// SetDefault calls in seed_defaults.go ensure operators see the
+// intended values rather than relying on the worker package's
+// implicit fallback.
+type RecordingWorkersConfig struct {
+	// RetentionInterval is the retention sweep cadence. 0 → 5m
+	// (defaultRetentionInterval, set via seedDefaults).
+	RetentionInterval time.Duration `mapstructure:"retention_interval"`
+
+	// RetentionBatch caps the per-tick row count for cold-moves AND
+	// deletes. 0 → 100.
+	RetentionBatch int `mapstructure:"retention_batch"`
+
+	// IntegrityInterval is the integrity sweep cadence. 0 → 1h.
+	IntegrityInterval time.Duration `mapstructure:"integrity_interval"`
+
+	// IntegrityBatch caps the per-tick row count fed to the BERNOULLI
+	// sample. 0 → 10.
+	IntegrityBatch int `mapstructure:"integrity_batch"`
+
+	// IntegritySamplePercent is the BERNOULLI sample rate (0, 100].
+	// 0 → 1.0 (1% — verifies a 7-day rotating window when paired with
+	// the SQL-side `verified_at < now() - interval '7 days'` filter).
+	IntegritySamplePercent float64 `mapstructure:"integrity_sample_percent"`
 }

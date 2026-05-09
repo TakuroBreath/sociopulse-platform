@@ -1,8 +1,15 @@
 // Package main is the entrypoint for cmd/worker — the СоциоПульс
-// background worker process. Today (Plan 10 Task 10) it owns the
-// dialer retry orchestrator's leader-election loop; future plans will
-// add scheduled aggregations, cold-tier archival, and asynq workers
-// for asynchronous CRM imports.
+// background worker process. Today it owns three errgroup-driven
+// daemons:
+//
+//   - dialer.retry.Orchestrator (Plan 10 Task 10) — leader-elected
+//     retry pipeline that drains failed dialer calls back into the queue.
+//   - recording.RetentionPass (Plan 12.4 Task 2 + Task 5) — leader-
+//     elected sweep that flips committed → cold and cold → deleted on
+//     the per-tenant retention schedule.
+//   - recording.IntegrityPass (Plan 12.4 Task 3 + Task 5) — leader-
+//     elected sweep that 1%-samples committed recordings and recomputes
+//     sha256 against ciphertext to catch silent corruption.
 //
 // Composition root:
 //
@@ -14,11 +21,20 @@
 //     needs the retry pipeline and pulling the rest of the dialer
 //     stack would also start the heartbeat watchdog (a cmd/api
 //     responsibility). Building inline keeps the lifecycle obvious.
-//  5. errgroup orchestrate:
+//  5. Build the recording retention + integrity passes when
+//     recording.enabled=true AND wire.LocalPorts validates. Empty /
+//     invalid LocalKEKs WARN + skip — the dialer retry orchestrator
+//     keeps running. Each pass gets its own *retry.PgLeader against a
+//     distinct advisory-lock key (worker.RetentionLockKey /
+//     IntegrityLockKey) so retention and integrity can lead
+//     simultaneously.
+//  6. errgroup orchestrate:
 //     - retry.Orchestrator.Run
+//     - recording.RetentionPass.Run (when enabled)
+//     - recording.IntegrityPass.Run (when enabled)
 //     - /healthz HTTP listener for k8s readiness
 //     - SIGINT/SIGTERM signal handler that cancels the parent ctx.
-//  6. Block until ctx done; tear down.
+//  7. Block until ctx done; tear down.
 package main
 
 import (
@@ -32,13 +48,21 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sociopulse/platform/internal/dialer/queue"
 	"github.com/sociopulse/platform/internal/dialer/retry"
+	rmetrics "github.com/sociopulse/platform/internal/recording/metrics"
+	"github.com/sociopulse/platform/internal/recording/service"
+	"github.com/sociopulse/platform/internal/recording/store"
+	"github.com/sociopulse/platform/internal/recording/wire"
+	"github.com/sociopulse/platform/internal/recording/worker"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/observability"
+	"github.com/sociopulse/platform/pkg/outbox"
+	"github.com/sociopulse/platform/pkg/postgres"
 )
 
 const (
@@ -91,7 +115,7 @@ func parseConfigDir(args []string) string {
 // error otherwise. ctx is cancelled by SIGINT/SIGTERM in production
 // and by the test driver in cmd/worker/main_test.go.
 //
-//nolint:gocognit // composition root is intentionally linear
+//nolint:gocognit,gocyclo // composition root is intentionally linear
 func run(ctx context.Context, configDir string) error {
 	// 1. Load configuration. Hot-reload is disabled in the worker —
 	//    nothing in the orchestrator path consumes hot-reloaded values
@@ -169,6 +193,16 @@ func run(ctx context.Context, configDir string) error {
 		return fmt.Errorf("build retry orchestrator: %w", err)
 	}
 
+	// 4b. Recording workers — Plan 12.4 Task 5. Built only when the
+	//     recording module is enabled AND wire.LocalPorts validates.
+	//     Empty / invalid KEKs WARN + skip; the dialer retry pipeline
+	//     keeps running. Returned runners are appended to the errgroup
+	//     below alongside the dialer Orchestrator.Run.
+	recordingRunners, err := buildRecordingWorkers(cfg, pool, logger)
+	if err != nil {
+		return fmt.Errorf("build recording workers: %w", err)
+	}
+
 	// 5. /healthz listener. k8s readiness probes hit this; we keep
 	//    the surface tiny (just liveness) because the orchestrator's
 	//    own metrics dashboard is the readiness source of truth for
@@ -186,6 +220,15 @@ func run(ctx context.Context, configDir string) error {
 		}
 		return nil
 	})
+	for _, runner := range recordingRunners {
+		runner := runner // capture per-iteration; redundant on Go 1.22+ but explicit is cheaper than a re-trip through the spec
+		g.Go(func() error {
+			if err := runner.run(gctx); err != nil && !errors.Is(err, context.Canceled) {
+				return fmt.Errorf("%s: %w", runner.name, err)
+			}
+			return nil
+		})
+	}
 	g.Go(func() error {
 		logger.Info("/healthz listener up", zap.String("bind", healthSrv.Addr))
 		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -212,6 +255,137 @@ func run(ctx context.Context, configDir string) error {
 	}
 	logger.Info("cmd/worker shutdown complete")
 	return nil
+}
+
+// recordingRunner pairs a Run-method with a name so the errgroup wrap
+// can log a meaningful identifier when the runner errors. The struct
+// stays unexported because every consumer lives inside cmd/worker.
+type recordingRunner struct {
+	name string
+	run  func(context.Context) error
+}
+
+// buildRecordingWorkers wires the retention + integrity passes when
+// recording.enabled=true. Returns an empty slice (no error) when
+// disabled OR when LocalKEKs validates to nil — in those modes
+// cmd/worker keeps running the dialer retry orchestrator only.
+//
+// A non-nil error is reserved for explicit configuration mistakes
+// (bad hex, wrong KEK length, validation failures from the worker
+// constructors). Boot fails-fast on those rather than silently
+// degrading: the operator should fix the config rather than wonder why
+// the integrity pass never logs a sweep.
+//
+// The Prometheus collectors register against a fresh
+// prometheus.NewRegistry — cmd/worker has no /metrics endpoint today
+// (Plan 12 Task 6 will add one), so the registry is private and only
+// the gauge-set's correctness is exercised. When the metrics endpoint
+// lands, swap this for observability.NewMetrics(cfg).Registry.
+func buildRecordingWorkers(
+	cfg config.Config,
+	pool *postgres.Pool,
+	logger *zap.Logger,
+) ([]recordingRunner, error) {
+	if !cfg.Recording.Enabled {
+		logger.Info("recording workers disabled (recording.enabled=false)")
+		return nil, nil
+	}
+
+	rlog := logger.Named("recording")
+	ports, err := wire.LocalPorts(cfg.Recording, rlog)
+	if err != nil {
+		return nil, fmt.Errorf("local ports: %w", err)
+	}
+	if ports == nil {
+		// LocalPorts already logged a WARN — recording workers can't
+		// run without DEK unwrap (integrity pass) or object storage
+		// (retention hard-delete). Skip registration and let the
+		// dialer-retry orchestrator continue.
+		rlog.Warn("recording workers skipped — wire.LocalPorts returned nil (empty/invalid local_keks)")
+		return nil, nil
+	}
+
+	// Shared metrics registry — both passes register against the same
+	// *RecordingMetrics and the LeaderActive gauge's `pass` label
+	// disambiguates them. The registry is intentionally private until
+	// cmd/worker grows a /metrics endpoint.
+	metrics, err := rmetrics.RegisterRecordingMetrics(prometheus.NewRegistry())
+	if err != nil {
+		return nil, fmt.Errorf("recording metrics: %w", err)
+	}
+
+	pgStore := store.NewPostgresStore(pool)
+	outboxWriter := outbox.NewPostgresWriter()
+
+	// Recording service — needed only by the integrity pass for
+	// VerifyChecksum. Mirrors internal/recording/module.go's Module.Register
+	// shape but without the locator + HTTP transport (cmd/worker doesn't
+	// host any HTTP routes).
+	svc := service.New(service.Deps{
+		Pool:    pool,
+		Store:   pgStore,
+		Outbox:  outboxWriter,
+		Logger:  rlog.Named("service"),
+		Metrics: metrics,
+		KMS:     ports.DEK,
+		Objects: ports.Objects,
+	})
+
+	// Leader-election: each pass gets its own advisory-lock slot so
+	// retention and integrity can lead simultaneously. The hash keys
+	// are computed from distinct seed strings (recording.retention_pass
+	// vs recording.integrity_pass), so they don't collide with each
+	// other or with the dialer's DefaultLockKey.
+	retLeader, err := retry.NewPgLeader(pool, worker.RetentionLockKey, rlog.Named("retention.leader"))
+	if err != nil {
+		return nil, fmt.Errorf("retention leader: %w", err)
+	}
+	intLeader, err := retry.NewPgLeader(pool, worker.IntegrityLockKey, rlog.Named("integrity.leader"))
+	if err != nil {
+		return nil, fmt.Errorf("integrity leader: %w", err)
+	}
+
+	wcfg := cfg.Recording.Workers
+	rp, err := worker.NewRetentionPass(worker.RetentionConfig{
+		Pool:     pool,
+		Leader:   retLeader,
+		Store:    pgStore,
+		Objects:  ports.Objects,
+		Outbox:   outboxWriter,
+		Metrics:  metrics,
+		Logger:   rlog.Named("retention"),
+		Interval: wcfg.RetentionInterval,
+		Batch:    wcfg.RetentionBatch,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build retention pass: %w", err)
+	}
+	ip, err := worker.NewIntegrityPass(worker.IntegrityConfig{
+		Pool:          pool,
+		Leader:        intLeader,
+		Store:         pgStore,
+		Service:       svc,
+		Metrics:       metrics,
+		Logger:        rlog.Named("integrity"),
+		Interval:      wcfg.IntegrityInterval,
+		Batch:         wcfg.IntegrityBatch,
+		SamplePercent: wcfg.IntegritySamplePercent,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("build integrity pass: %w", err)
+	}
+
+	rlog.Info("recording workers registered",
+		zap.Duration("retention_interval", wcfg.RetentionInterval),
+		zap.Int("retention_batch", wcfg.RetentionBatch),
+		zap.Duration("integrity_interval", wcfg.IntegrityInterval),
+		zap.Int("integrity_batch", wcfg.IntegrityBatch),
+		zap.Float64("integrity_sample_percent", wcfg.IntegritySamplePercent),
+	)
+	return []recordingRunner{
+		{name: "recording.retention", run: rp.Run},
+		{name: "recording.integrity", run: ip.Run},
+	}, nil
 }
 
 // buildHealthServer returns an *http.Server exposing /healthz on the

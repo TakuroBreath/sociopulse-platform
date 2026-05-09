@@ -164,6 +164,48 @@ func TestPassthroughDecryptorRoundTrip(t *testing.T) {
 	require.NotEqual(t, in, out)
 }
 
+// TestBuildRecordingWorkers_DisabledReturnsEmpty verifies that the Plan
+// 12.4 Task 5 wiring is no-op when recording.enabled=false. No Postgres
+// required: the helper short-circuits before opening anything.
+func TestBuildRecordingWorkers_DisabledReturnsEmpty(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Recording.Enabled = false
+
+	runners, err := buildRecordingWorkers(cfg, nil, zaptestLogger(t))
+	require.NoError(t, err)
+	require.Empty(t, runners, "disabled recording → empty runners")
+}
+
+// TestBuildRecordingWorkers_EnabledButEmptyKEKsSkips verifies the
+// degraded-boot path: recording.enabled=true with no LocalKEKs surfaces
+// as a WARN + empty runners (so the dialer-retry orchestrator can keep
+// running). No Postgres required: wire.LocalPorts returns nil before
+// any pool access.
+func TestBuildRecordingWorkers_EnabledButEmptyKEKsSkips(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Recording.Enabled = true
+	cfg.Recording.LocalKEKs = nil
+
+	runners, err := buildRecordingWorkers(cfg, nil, zaptestLogger(t))
+	require.NoError(t, err)
+	require.Empty(t, runners, "enabled+empty KEKs → empty runners")
+}
+
+// TestBuildRecordingWorkers_BadKEKsErrors confirms that explicit
+// configuration mistakes (bad hex / wrong length) fail boot rather
+// than silently skipping. Plan 12.4 Task 5 contract.
+func TestBuildRecordingWorkers_BadKEKsErrors(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Recording.Enabled = true
+	cfg.Recording.LocalKEKs = map[string]string{"kek-bad": "not-hex"}
+
+	_, err := buildRecordingWorkers(cfg, nil, zaptestLogger(t))
+	require.Error(t, err)
+}
+
 // TestPassthroughDecryptorEmpty surfaces a clean error.
 func TestPassthroughDecryptorEmpty(t *testing.T) {
 	t.Parallel()
