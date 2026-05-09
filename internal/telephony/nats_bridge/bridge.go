@@ -158,16 +158,30 @@ func (b *Bridge) Stop() {
 }
 
 // Drain finishes in-flight messages and unsubscribes cleanly within the
-// supplied context's deadline. Today this delegates to Stop — the
-// underlying eventbus.Subscriber's drain is driven by Close (called by
-// the composition root after Bridge.Drain).
+// supplied context's deadline. The underlying eventbus.Subscriber's drain
+// is driven by Close (called by the composition root after Bridge.Drain).
 //
-// Returns nil when ctx hasn't expired by Stop completion; the
-// composition root calls Drain before subscriber.Close so a SIGTERM
-// gracefully completes commands that already started executing.
-func (b *Bridge) Drain(_ context.Context) error {
-	b.Stop()
-	return nil
+// Drain runs Stop in a goroutine and races it against ctx.Done so a slow
+// event-publisher Stop (waiting for in-flight publishes) cannot pin the
+// SIGTERM grace period — if ctx fires first, Drain returns ctx.Err()
+// while Stop continues to completion in the background (the subsequent
+// publisher.Close in the composition root will tear down whatever Stop
+// hasn't yet drained).
+//
+// The composition root calls Drain before subscriber.Close so commands
+// that already started executing get a chance to finish.
+func (b *Bridge) Drain(ctx context.Context) error {
+	stopDone := make(chan struct{})
+	go func() {
+		b.Stop()
+		close(stopDone)
+	}()
+	select {
+	case <-stopDone:
+		return nil
+	case <-ctx.Done():
+		return fmt.Errorf("nats_bridge: drain: %w", ctx.Err())
+	}
 }
 
 // poolAdapter wraps *pool.ESLPool and resolves each command into a per-

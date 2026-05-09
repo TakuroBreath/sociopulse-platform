@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"go.uber.org/zap"
 
@@ -15,6 +16,17 @@ import (
 // telephony-bridge replica joins the same group so JetStream load-balances
 // inbound commands across exactly one consumer at a time.
 const cmdQueue = "telephony-bridge"
+
+// handleTimeout caps the per-message dispatch ctx so a stalled Redis
+// SetNX or wedged ESL node can't pin the bus handler goroutine
+// indefinitely. 5s is comfortably above:
+//   - Redis SetNX p99 (sub-ms in healthy clusters);
+//   - ESL Originate rendezvous time (a few hundred ms typical, up to
+//     2s on contended trunks);
+//
+// while still bounded enough that bus AckWait + redelivery picks up a
+// stuck handler within a single retry cycle.
+const handleTimeout = 5 * time.Second
 
 // cmdSubject is the wildcard subject the bridge subscribes to. The leading
 // "tenant.*" matches every tenant; the trailing ">" matches every per-call
@@ -135,7 +147,14 @@ func (c *cmdSubscriber) handle(_ string, payload []byte) error {
 	// the pool, regardless of kind. A Redis-side error here MUST
 	// surface so the bus NAKs (silent dedup-failure would let
 	// commands be lost on a publisher-replay storm).
-	ctx, cancel := context.WithCancel(context.Background())
+	//
+	// handleTimeout bounds the entire dispatch (Redis SETNX + pool
+	// originate/hangup/etc.) so a stalled broker or wedged ESL node
+	// can't pin the bus handler goroutine indefinitely. Bus AckWait
+	// would eventually redeliver, but the goroutine itself would be
+	// leaked. Budget covers the slowest expected dispatch (originate
+	// can chase several SIP rings) plus a Redis round-trip.
+	ctx, cancel := context.WithTimeout(context.Background(), handleTimeout)
 	defer cancel()
 
 	seen, err := c.guard.MarkSeen(ctx, env.CommandID)

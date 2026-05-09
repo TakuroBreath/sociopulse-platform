@@ -101,6 +101,14 @@ func (e *eventPublisher) publishOne(ctx context.Context, env pool.EventEnvelope)
 
 	subject := telapi.SubjectChannelEventFor(env.Event.TenantID, env.Event.CallID, string(env.Event.Type))
 
+	// Skip the publish entirely when the parent ctx has already
+	// fired — otherwise we'd publish with an immediately-dead ctx,
+	// emit a publish_error metric tick on every shutdown event,
+	// and pollute alerting noise.
+	if err := ctx.Err(); err != nil {
+		return
+	}
+
 	pubCtx, cancel := context.WithTimeout(ctx, publishTimeout)
 	defer cancel()
 
