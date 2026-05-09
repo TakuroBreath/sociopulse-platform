@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -9,28 +10,37 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	authapi "github.com/sociopulse/platform/internal/auth/api"
+	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/postgres"
 )
 
 // fakeTxRunner runs every fn synchronously with a zero postgres.Tx —
 // the store fakes never read from it, so we don't need to spin up a
 // real database. It records the supplied tenant ids so tests can
-// confirm the service picked the correct one for each call.
+// confirm the service picked the correct one for each call. Plan 11.4:
+// also records whether the most recent WithTenant fn returned an error,
+// which would cause a real *postgres.Pool to roll back the Tx.
 type fakeTxRunner struct {
 	mu                sync.Mutex
 	withTenantTenants []uuid.UUID
 	bypassCount       int
+	lastWithTenantErr error
 }
 
 func (f *fakeTxRunner) WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error {
 	f.mu.Lock()
 	f.withTenantTenants = append(f.withTenantTenants, tenantID)
 	f.mu.Unlock()
-	return fn(postgres.Tx{})
+	err := fn(postgres.Tx{})
+	f.mu.Lock()
+	f.lastWithTenantErr = err
+	f.mu.Unlock()
+	return err
 }
 
 func (f *fakeTxRunner) BypassRLS(ctx context.Context, fn func(postgres.Tx) error) error {
@@ -38,6 +48,16 @@ func (f *fakeTxRunner) BypassRLS(ctx context.Context, fn func(postgres.Tx) error
 	f.bypassCount++
 	f.mu.Unlock()
 	return fn(postgres.Tx{})
+}
+
+// lastRolledBack reports whether the most recent WithTenant fn returned
+// non-nil — the precise condition under which *postgres.Pool.WithTenant
+// rolls the Tx back. Used by Plan 11.4 tests to assert atomic rollback
+// when outbox.Append fails.
+func (f *fakeTxRunner) lastRolledBack() bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastWithTenantErr != nil
 }
 
 // fakeStore is a hand-rolled api.UserStorePort fake. We avoid gomock
@@ -288,23 +308,72 @@ func (a *fakeAudit) snapshot() []auditapi.Event {
 	return out
 }
 
+// fakeOutbox is a recording outbox.Writer fake. Mirrors the slice-backed
+// pattern used in internal/recording/worker/retention_test.go and
+// internal/tenancy/service/tenant_service_test.go. Plan 11.4 introduced
+// this for the auth service tests (the FIRST auth NATS subject).
+type fakeOutbox struct {
+	mu       sync.Mutex
+	events   []outbox.Event
+	failWith error
+}
+
+func newFakeOutbox() *fakeOutbox { return &fakeOutbox{} }
+
+// withFailure returns f wired to fail every Append with err. Returning
+// the receiver lets tests chain construction in one line.
+func (f *fakeOutbox) withFailure(err error) *fakeOutbox {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failWith = err
+	return f
+}
+
+func (f *fakeOutbox) Append(_ context.Context, _ postgres.Tx, ev outbox.Event) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.failWith != nil {
+		return f.failWith
+	}
+	// Defensive copy so a downstream caller mutating ev.Payload does not
+	// race with snapshot readers.
+	cp := ev
+	if ev.Payload != nil {
+		cp.Payload = append([]byte(nil), ev.Payload...)
+	}
+	f.events = append(f.events, cp)
+	return nil
+}
+
+func (f *fakeOutbox) appended() []outbox.Event {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]outbox.Event, len(f.events))
+	copy(out, f.events)
+	return out
+}
+
+// Compile-time interface check.
+var _ outbox.Writer = (*fakeOutbox)(nil)
+
 // newSvc builds a UserService backed by hand-rolled fakes. The
 // returned references are owned by the caller so tests can inspect
-// recorded state directly.
-func newSvc(t *testing.T) (*UserService, *fakeStore, *fakeAudit) {
+// recorded state directly. Plan 11.4 added the outbox fake.
+func newSvc(t *testing.T) (*UserService, *fakeStore, *fakeAudit, *fakeOutbox) {
 	t.Helper()
 	tx := &fakeTxRunner{}
 	store := newFakeStore()
 	audit := &fakeAudit{}
+	outboxFake := newFakeOutbox()
 	clock := func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) }
-	svc := NewUserService(tx, store, fakeHasher{}, audit, clock)
-	return svc, store, audit
+	svc := NewUserService(tx, store, fakeHasher{}, audit, outboxFake, clock)
+	return svc, store, audit, outboxFake
 }
 
 func TestUserService_Create_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	ctx := WithActorID(context.Background(), uuid.New())
 
 	tenantID := uuid.New()
@@ -337,7 +406,7 @@ func TestUserService_Create_HappyPath(t *testing.T) {
 func TestUserService_Create_DuplicateLoginReturnsErrLoginTaken(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	ctx := context.Background()
 
 	tenantID := uuid.New()
@@ -354,7 +423,7 @@ func TestUserService_Create_DuplicateLoginReturnsErrLoginTaken(t *testing.T) {
 func TestUserService_Create_RejectsEmptyRoles(t *testing.T) {
 	t.Parallel()
 
-	svc, _, _ := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 
 	_, _, err := svc.Create(context.Background(), authapi.CreateUserInput{
 		TenantID: uuid.New(),
@@ -367,7 +436,7 @@ func TestUserService_Create_RejectsEmptyRoles(t *testing.T) {
 func TestUserService_List_FiltersArchivedByDefault(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	tenantID := uuid.New()
 	now := time.Now()
 	store.seed(authapi.User{TenantID: tenantID, Login: "active", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
@@ -391,7 +460,7 @@ func TestUserService_List_FiltersArchivedByDefault(t *testing.T) {
 func TestUserService_Get_NotFound(t *testing.T) {
 	t.Parallel()
 
-	svc, _, _ := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 	_, err := svc.Get(context.Background(), uuid.New())
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
 }
@@ -399,7 +468,7 @@ func TestUserService_Get_NotFound(t *testing.T) {
 func TestUserService_UpdateRole_RejectsEmpty(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -411,7 +480,7 @@ func TestUserService_UpdateRole_RejectsEmpty(t *testing.T) {
 func TestUserService_UpdateRole_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -433,7 +502,7 @@ func TestUserService_UpdateRole_HappyPath(t *testing.T) {
 func TestUserService_Archive_Idempotent(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "ar", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "ar")]
@@ -447,10 +516,80 @@ func TestUserService_Archive_Idempotent(t *testing.T) {
 	require.Equal(t, "user.archived", events[1].Action)
 }
 
+// TestUserService_Archive_PublishesOutboxEvent verifies that Archive
+// emits a tenant.<t>.auth.user.deleted outbox row alongside the
+// existing audit row. Plan 11.4 Task 1 contract.
+func TestUserService_Archive_PublishesOutboxEvent(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tenantID := uuid.New()
+	svc, store, audit, outboxFake := newSvc(t)
+	store.seed(authapi.User{TenantID: tenantID, Login: "to-archive", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
+	userID := store.loginIndex[loginKey(tenantID, "to-archive")]
+
+	require.NoError(t, svc.Archive(ctx, userID))
+
+	// Audit row is still emitted (Plan 11.4 doesn't remove existing behaviour).
+	events := audit.snapshot()
+	require.Len(t, events, 1)
+	require.Equal(t, "user.archived", events[0].Action)
+
+	// Outbox row is the new behaviour.
+	rows := outboxFake.appended()
+	require.Len(t, rows, 1, "Archive must append exactly one outbox row")
+
+	got := rows[0]
+	require.Equal(t, authapi.SubjectUserDeletedFor(tenantID), got.Subject)
+	require.NotNil(t, got.TenantID)
+	require.Equal(t, tenantID, *got.TenantID)
+	require.NotNil(t, got.AggregateID)
+	require.Equal(t, userID, *got.AggregateID)
+
+	var ev authapi.UserDeletedEvent
+	require.NoError(t, json.Unmarshal(got.Payload, &ev))
+	assert.Equal(t, userID, ev.UserID)
+	assert.Equal(t, tenantID, ev.TenantID)
+	// The newSvc clock returns 2026-05-08T12:00:00Z.
+	assert.Equal(t, time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC).Unix(), ev.DeletedAt)
+	assert.Equal(t, "archived", ev.Reason)
+}
+
+// TestUserService_Archive_OutboxAppendErrorRollsBackTx ensures the
+// transaction rolls back when outbox append fails — the audit row and
+// the user.archived store mutation must NOT commit independently.
+func TestUserService_Archive_OutboxAppendErrorRollsBackTx(t *testing.T) {
+	t.Parallel()
+
+	ctx := t.Context()
+
+	tenantID := uuid.New()
+
+	tx := &fakeTxRunner{}
+	store := newFakeStore()
+	audit := &fakeAudit{}
+	wantErr := errors.New("outbox down")
+	outboxFake := newFakeOutbox().withFailure(wantErr)
+
+	clock := func() time.Time { return time.Date(2026, 5, 8, 12, 0, 0, 0, time.UTC) }
+	svc := NewUserService(tx, store, fakeHasher{}, audit, outboxFake, clock)
+
+	store.seed(authapi.User{TenantID: tenantID, Login: "to-archive", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
+	userID := store.loginIndex[loginKey(tenantID, "to-archive")]
+
+	err := svc.Archive(ctx, userID)
+	require.Error(t, err)
+	require.ErrorIs(t, err, wantErr,
+		"outbox failure must propagate so the WithTenant Tx rolls back")
+	require.True(t, tx.lastRolledBack(),
+		"outbox.Append failure must roll back the WithTenant Tx")
+}
+
 func TestUserService_Restore_RejectsNonArchived(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -462,7 +601,7 @@ func TestUserService_Restore_RejectsNonArchived(t *testing.T) {
 func TestUserService_Restore_ClearsArchivedAt(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	now := time.Now()
 	store.seed(authapi.User{
@@ -486,7 +625,7 @@ func TestUserService_Restore_ClearsArchivedAt(t *testing.T) {
 func TestUserService_ResetPassword_FlipsMustChange(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "old-hash")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -506,7 +645,7 @@ func TestUserService_ResetPassword_FlipsMustChange(t *testing.T) {
 func TestUserService_ChangePassword_HappyPath(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "fake-hash:old")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -524,7 +663,7 @@ func TestUserService_ChangePassword_HappyPath(t *testing.T) {
 func TestUserService_ChangePassword_WrongOldReturnsErrInvalidCredentials(t *testing.T) {
 	t.Parallel()
 
-	svc, store, audit := newSvc(t)
+	svc, store, audit, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "fake-hash:correct")
 	id := store.loginIndex[loginKey(tenantID, "u")]
@@ -547,7 +686,7 @@ func TestUserService_ChangePassword_WrongOldReturnsErrInvalidCredentials(t *test
 func TestUserService_ChangePassword_MissingUserIndistinguishableFromWrongPassword(t *testing.T) {
 	t.Parallel()
 
-	svc, _, audit := newSvc(t)
+	svc, _, audit, _ := newSvc(t)
 
 	// Brand-new uuid the store has never seen.
 	missingID := uuid.New()
@@ -564,15 +703,17 @@ func TestNewUserService_PanicsOnNilDeps(t *testing.T) {
 	hasher := fakeHasher{}
 	audit := &fakeAudit{}
 	pool := &fakeTxRunner{}
+	outboxFake := newFakeOutbox()
 
 	cases := []struct {
 		name string
 		fn   func()
 	}{
-		{"nil pool", func() { _ = NewUserService(nil, store, hasher, audit, nil) }},
-		{"nil store", func() { _ = NewUserService(pool, nil, hasher, audit, nil) }},
-		{"nil hasher", func() { _ = NewUserService(pool, store, nil, audit, nil) }},
-		{"nil audit logger", func() { _ = NewUserService(pool, store, hasher, nil, nil) }},
+		{"nil pool", func() { _ = NewUserService(nil, store, hasher, audit, outboxFake, nil) }},
+		{"nil store", func() { _ = NewUserService(pool, nil, hasher, audit, outboxFake, nil) }},
+		{"nil hasher", func() { _ = NewUserService(pool, store, nil, audit, outboxFake, nil) }},
+		{"nil audit logger", func() { _ = NewUserService(pool, store, hasher, nil, outboxFake, nil) }},
+		{"nil outbox writer", func() { _ = NewUserService(pool, store, hasher, audit, nil, nil) }},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -585,7 +726,7 @@ func TestNewUserService_PanicsOnNilDeps(t *testing.T) {
 func TestUserService_AuditEvent_CarriesActorFromContext(t *testing.T) {
 	t.Parallel()
 
-	svc, _, audit := newSvc(t)
+	svc, _, audit, _ := newSvc(t)
 	actor := uuid.New()
 	ctx := WithActorID(context.Background(), actor)
 
@@ -606,7 +747,7 @@ func TestUserService_AuditEvent_CarriesActorFromContext(t *testing.T) {
 func TestUserService_AuditEvent_FallsBackToSystemActor(t *testing.T) {
 	t.Parallel()
 
-	svc, _, audit := newSvc(t)
+	svc, _, audit, _ := newSvc(t)
 
 	_, _, err := svc.Create(context.Background(), authapi.CreateUserInput{
 		TenantID: uuid.New(),
@@ -624,7 +765,7 @@ func TestUserService_AuditEvent_FallsBackToSystemActor(t *testing.T) {
 func TestUserService_Archive_PropagatesUserNotFound(t *testing.T) {
 	t.Parallel()
 
-	svc, _, _ := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 
 	err := svc.Archive(context.Background(), uuid.New())
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
@@ -633,7 +774,7 @@ func TestUserService_Archive_PropagatesUserNotFound(t *testing.T) {
 func TestUserService_ValidationGuards(t *testing.T) {
 	t.Parallel()
 
-	svc, _, _ := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 	ctx := context.Background()
 
 	// Create requires tenant + login + roles.
@@ -676,7 +817,7 @@ func TestUserService_ValidationGuards(t *testing.T) {
 func TestUserService_PropagatesNotFoundForMissingTargets(t *testing.T) {
 	t.Parallel()
 
-	svc, _, _ := newSvc(t)
+	svc, _, _, _ := newSvc(t)
 	ctx := context.Background()
 
 	// Each method that resolves the tenant before mutating bubbles
@@ -754,7 +895,7 @@ func TestUserService_PropagatesGenericStoreErrorsAsWrapped(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			svc, store, _ := newSvc(t)
+			svc, store, _, _ := newSvc(t)
 			store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 			id := store.loginIndex[loginKey(tenantID, "u")]
 			err := tt.run(ctx{svc: svc, store: store, id: id})
@@ -766,7 +907,7 @@ func TestUserService_PropagatesGenericStoreErrorsAsWrapped(t *testing.T) {
 func TestUserService_GetByIDStoreErrorIsWrapped(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	store.getByIDErr = errors.New("connection refused")
 
 	_, err := svc.Get(context.Background(), uuid.New())
@@ -779,7 +920,8 @@ func TestUserService_NewUserService_NilClockDefaultsToTimeNow(t *testing.T) {
 	tx := &fakeTxRunner{}
 	store := newFakeStore()
 	audit := &fakeAudit{}
-	svc := NewUserService(tx, store, fakeHasher{}, audit, nil)
+	outboxFake := newFakeOutbox()
+	svc := NewUserService(tx, store, fakeHasher{}, audit, outboxFake, nil)
 	require.NotNil(t, svc.clock)
 	// Ask the service to emit an audit row and verify the timestamp was set.
 	_, _, err := svc.Create(context.Background(), authapi.CreateUserInput{
@@ -796,7 +938,7 @@ func TestUserService_NewUserService_NilClockDefaultsToTimeNow(t *testing.T) {
 func TestUserService_ChangePassword_PropagatesStoreErr(t *testing.T) {
 	t.Parallel()
 
-	svc, store, _ := newSvc(t)
+	svc, store, _, _ := newSvc(t)
 	tenantID := uuid.New()
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "fake-hash:correct")
 	id := store.loginIndex[loginKey(tenantID, "u")]

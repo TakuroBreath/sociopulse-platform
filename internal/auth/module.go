@@ -46,6 +46,7 @@ import (
 	transporthttp "github.com/sociopulse/platform/internal/auth/transport/http"
 	"github.com/sociopulse/platform/internal/modules"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
+	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/passwords"
 )
 
@@ -150,7 +151,10 @@ func (Module) Register(d modules.Deps) error {
 	tenantResolver := authservice.NewTenantResolverAdapter(tenantSvc)
 
 	// 6. Domain services.
-	userSvc := authservice.NewUserService(d.Pool, userStore, pwdHasher, auditLogger, nil)
+	//    Plan 11.4: UserService.Archive emits a tenant.<t>.auth.user.deleted
+	//    outbox row alongside the existing audit row. The PostgresWriter is
+	//    stateless (zero-value); the outbox-relay drains pending rows.
+	userSvc := authservice.NewUserService(d.Pool, userStore, pwdHasher, auditLogger, outbox.NewPostgresWriter(), nil)
 
 	totpSvc, err := authservice.NewTOTPService(authservice.TOTPDeps{
 		Issuer:       cfg.TOTP.Issuer,

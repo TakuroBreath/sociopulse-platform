@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
@@ -10,6 +11,7 @@ import (
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
 	authapi "github.com/sociopulse/platform/internal/auth/api"
+	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/passwords"
 	"github.com/sociopulse/platform/pkg/postgres"
 )
@@ -71,6 +73,7 @@ type UserService struct {
 	store  authapi.UserStorePort
 	hasher passwords.Hasher
 	audit  auditapi.Logger
+	outbox outbox.Writer // Plan 11.4: appends auth.user.deleted etc. inside same Tx.
 	clock  func() time.Time
 
 	// dummyHash is a pre-computed Argon2id hash of a fixed string. We
@@ -98,11 +101,16 @@ var _ authapi.UserService = (*UserService)(nil)
 // and a misconfigured composition root that registered nil would
 // silently drop those rows. Tests that genuinely don't care about the
 // audit trail must inject a no-op fake logger explicitly.
+//
+// outboxWriter MUST NOT be nil — Plan 11.4 (Archive) writes a
+// tenant.<t>.auth.user.deleted row inside the same Tx. Tests use a
+// recording fake; production passes outbox.NewPostgresWriter().
 func NewUserService(
 	pool userTxRunner,
 	store authapi.UserStorePort,
 	hasher passwords.Hasher,
 	auditLogger auditapi.Logger,
+	outboxWriter outbox.Writer,
 	clock func() time.Time,
 ) *UserService {
 	if pool == nil {
@@ -116,6 +124,9 @@ func NewUserService(
 	}
 	if auditLogger == nil {
 		panic("auth/service: NewUserService: auditLogger is required (use a no-op fake in tests, never nil)")
+	}
+	if outboxWriter == nil {
+		panic("auth/service: NewUserService: outboxWriter is required (use a recording fake in tests, never nil)")
 	}
 	if clock == nil {
 		clock = time.Now
@@ -138,6 +149,7 @@ func NewUserService(
 		store:     store,
 		hasher:    hasher,
 		audit:     auditLogger,
+		outbox:    outboxWriter,
 		clock:     clock,
 		dummyHash: dummyHash,
 	}
@@ -302,8 +314,14 @@ func (s *UserService) UpdateRole(ctx context.Context, id uuid.UUID, roles []auth
 }
 
 // Archive implements api.UserService.Archive. Idempotent: archiving a
-// user whose archived_at is already set returns nil. The audit row is
-// emitted on every call so a re-archive is still observable.
+// user whose archived_at is already set returns nil (the store-level
+// idempotency); the audit row is emitted on every call so a re-archive
+// is still observable. Plan 11.4: also publishes the
+// tenant.<t>.auth.user.deleted outbox event so downstream subscribers
+// (realtime resolver cache) can drop stale entries. The outbox row is
+// appended INSIDE the same WithTenant Tx as the store mutation + audit
+// write — a publish failure rolls all three back together (canonical
+// transactional-outbox semantics).
 func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
 	if id == uuid.Nil {
 		return fmt.Errorf("auth/service: archive: id required")
@@ -312,14 +330,32 @@ func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
 	if err != nil {
 		return err
 	}
+	now := s.clock().UTC()
 	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
 		if err := s.store.Archive(ctx, tx, id); err != nil {
 			return err
 		}
-		return s.writeAudit(ctx, auditapi.Event{
+		if err := s.writeAudit(ctx, auditapi.Event{
 			TenantID: tenantID,
 			Action:   "user.archived",
 			Target:   "user:" + id.String(),
+		}); err != nil {
+			return err
+		}
+		payload, err := json.Marshal(authapi.UserDeletedEvent{
+			UserID:    id,
+			TenantID:  tenantID,
+			DeletedAt: now.Unix(),
+			Reason:    "archived",
+		})
+		if err != nil {
+			return fmt.Errorf("marshal user_deleted payload: %w", err)
+		}
+		return s.outbox.Append(ctx, tx, outbox.Event{
+			TenantID:    &tenantID,
+			AggregateID: &id,
+			Subject:     authapi.SubjectUserDeletedFor(tenantID),
+			Payload:     payload,
 		})
 	})
 	if err != nil {
