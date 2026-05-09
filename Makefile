@@ -182,3 +182,14 @@ migrate-create: ## Create a new migration pair: NAME=add_users_table
 	touch migrations/$${next}_$(NAME).up.sql migrations/$${next}_$(NAME).down.sql; \
 	echo "Created migrations/$${next}_$(NAME).up.sql"; \
 	echo "Created migrations/$${next}_$(NAME).down.sql"
+
+# ──────────────────────────── proto codegen ───────────────────────────────────
+.PHONY: proto-recording
+proto-recording: ## Generate Go bindings for the RecordingService proto.
+	PATH="$$(go env GOPATH)/bin:$$PATH" protoc \
+	  -I=docs/api \
+	  --go_out=. \
+	  --go_opt=module=github.com/sociopulse/platform \
+	  --go-grpc_out=. \
+	  --go-grpc_opt=module=github.com/sociopulse/platform \
+	  docs/api/recording/v1/recording.proto

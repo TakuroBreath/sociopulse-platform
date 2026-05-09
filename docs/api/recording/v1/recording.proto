@@ -1,0 +1,97 @@
+syntax = "proto3";
+
+package sociopulse.recording.v1;
+
+option go_package = "github.com/sociopulse/platform/internal/recording/proto/v1;recordingv1";
+
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/duration.proto";
+
+// RecordingService — internal gRPC API consumed by cmd/recording-uploader (out
+// of scope for Plan 12.1 — that command lives in Plan 08 or a future plan).
+// Mounted on :9091 alongside cmd/api's HTTP listener. mTLS is REQUIRED — the
+// server interceptor extracts a SPIFFE-style identity from the verified client
+// cert.
+service RecordingService {
+  // Commit registers a recording that the uploader has already streamed to S3
+  // (.opus.enc) along with its envelope-wrapped DEK (encrypted_dek bytes;
+  // sidecar .dek.enc S3 object is reserved for v2).
+  //
+  // Idempotency: keyed by call_id (UNIQUE constraint in call_recordings).
+  // A duplicate Commit for the same call_id returns the EXISTING row's
+  // metadata with idempotent_replay=true.
+  //
+  // Errors:
+  //   INVALID_ARGUMENT — sha256 length != 64 hex chars, bytes_size <= 0,
+  //                      missing required field.
+  //   FAILED_PRECONDITION — call_id has no matching row in calls(id, tenant_id).
+  //   PERMISSION_DENIED — request.tenant_id mismatches the SPIFFE tenant in the
+  //                       client cert.
+  //   UNAUTHENTICATED — peer cert chain missing / invalid / no SPIFFE URI SAN.
+  rpc Commit(CommitRequest) returns (CommitResponse);
+
+  // Get returns metadata for a single recording (NO audio bytes — public reads
+  // go via HTTP). Used for health-check, diagnostics, and future
+  // cmd/recording-uploader retry handshakes.
+  rpc Get(GetRequest) returns (GetResponse);
+}
+
+message CommitRequest {
+  string tenant_id = 1;          // UUID v7 — must match SPIFFE cert
+  string call_id   = 2;          // UUID v7 — FK to calls(id)
+
+  // S3 layout (single bucket, paths derived):
+  //   audio_object_key = recordings/<tenant_id>/<yyyy>/<mm>/<dd>/<call_id>.opus.enc
+  //   dek_object_key   = recordings/<tenant_id>/<yyyy>/<mm>/<dd>/<call_id>.dek.enc
+  // dek_object_key is OPTIONAL in v1 — encrypted_dek lives in-row in
+  // call_recordings. The sidecar object is reserved for v2 client-side decryption.
+  string s3_bucket        = 3;
+  string audio_object_key = 4;
+  string dek_object_key   = 5;   // may be empty in v1
+
+  // Cryptographic envelope (per-recording DEK wrapped by per-tenant KMS KEK).
+  string kms_key_id    = 6;      // Yandex Cloud KMS key id
+  bytes  encrypted_dek = 7;      // ~88 bytes for KMS-wrapped 32-byte DEK; <= 4096 bytes
+
+  int64                       bytes_size  = 8;   // .opus.enc file size, > 0
+  google.protobuf.Duration    duration    = 9;   // > 0
+  string                      sha256      = 10;  // hex, 64 chars, of CIPHERTEXT
+  string                      codec       = 11;  // "opus" or "opus-32"
+  int32                       sample_rate = 12;  // 48000 typical, > 0
+
+  // Retention plan — resolved by uploader from project policy + tenant defaults.
+  google.protobuf.Timestamp delete_at = 13;
+  google.protobuf.Timestamp cold_at   = 14;
+
+  // Provenance.
+  string ingest_agent_id              = 15;
+  google.protobuf.Timestamp recorded_at = 16;
+}
+
+message CommitResponse {
+  string                    recording_id      = 1;
+  string                    call_id           = 2;
+  google.protobuf.Timestamp committed_at      = 3;
+  bool                      idempotent_replay = 4;
+}
+
+message GetRequest {
+  string tenant_id = 1;
+  string call_id   = 2;
+}
+
+message GetResponse {
+  string                    recording_id     = 1;
+  string                    call_id          = 2;
+  string                    tenant_id        = 3;
+  string                    s3_bucket        = 4;
+  string                    audio_object_key = 5;
+  int64                     bytes_size       = 6;
+  google.protobuf.Duration  duration         = 7;
+  string                    sha256           = 8;
+  string                    status           = 9;
+  google.protobuf.Timestamp committed_at     = 10;
+  google.protobuf.Timestamp delete_at        = 11;
+  google.protobuf.Timestamp cold_at          = 12;
+  google.protobuf.Timestamp verified_at      = 13;
+}
