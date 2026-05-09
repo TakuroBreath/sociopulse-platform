@@ -115,7 +115,7 @@ func parseSpiffeURL(u *url.URL) (PeerIdentity, error) {
 // before invoking the handler — handlers may then assume that
 // peerIdentityFromCtx returns a non-zero PeerIdentity.
 func peerTenantInterceptor() grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		identity, err := peerIdentityFromTLS(ctx)
 		if err != nil {
 			return nil, status.Error(codes.Unauthenticated, err.Error())
@@ -129,7 +129,7 @@ func peerTenantInterceptor() grpc.UnaryServerInterceptor {
 // harness in NewForTest — production callers MUST use
 // peerTenantInterceptor, which derives identity from the TLS layer.
 func fakePeerIdentityInterceptor(id PeerIdentity) grpc.UnaryServerInterceptor {
-	return func(ctx context.Context, req interface{}, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (interface{}, error) {
+	return func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		return handler(withPeerIdentity(ctx, id), req)
 	}
 }
