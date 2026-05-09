@@ -12,6 +12,7 @@ import (
 	"github.com/sociopulse/platform/internal/modules"
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	rtevents "github.com/sociopulse/platform/internal/realtime/events"
+	service "github.com/sociopulse/platform/internal/realtime/service"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
 )
 
@@ -175,16 +176,29 @@ type crmProjectGetter interface {
 
 // projectResolverAdapter mirrors userResolverAdapter for project IDs.
 type projectResolverAdapter struct {
-	svc crmProjectGetter
+	svc              crmProjectGetter
+	bumpInconsistent func(adapterType string)
 }
 
-// newProjectResolverAdapter wraps a crmProjectGetter. nil svc panics —
-// the wiring bug surfaces at cmd/api boot rather than first subscribe.
-func newProjectResolverAdapter(svc crmProjectGetter) *projectResolverAdapter {
+// newProjectResolverAdapterWithMetrics is the metric-aware variant
+// used by registerProjectResolver (Plan 11.3 Task 4 wiring). Tests
+// use this directly to inject a counting fake callback. nil
+// bumpInconsistent is replaced with a no-op so degraded boot
+// (no service.Metrics in the locator) doesn't NPE.
+func newProjectResolverAdapterWithMetrics(
+	svc crmProjectGetter,
+	bumpInconsistent func(adapterType string),
+) *projectResolverAdapter {
 	if svc == nil {
-		panic("cmd/api: newProjectResolverAdapter: svc must be non-nil")
+		panic("cmd/api: newProjectResolverAdapterWithMetrics: svc must be non-nil")
 	}
-	return &projectResolverAdapter{svc: svc}
+	if bumpInconsistent == nil {
+		bumpInconsistent = func(string) {} // nil-safe: no-op metric callback
+	}
+	return &projectResolverAdapter{
+		svc:              svc,
+		bumpInconsistent: bumpInconsistent,
+	}
 }
 
 // Get implements rtapi.ProjectResolver.
@@ -200,9 +214,10 @@ func (a *projectResolverAdapter) Get(ctx context.Context, projectID string) (rta
 	if proj == nil {
 		// Defensive: ProjectService.Get returns (nil, ErrProjectNotFound)
 		// on miss; we handle the error path above. A nil-without-error
-		// would be a service-layer bug, but we surface a typed error
-		// rather than panic so the realtime layer can fold it into
-		// ErrCrossTenantSubscribe alongside other resolver failures.
+		// would be a service-layer bug — surface it via metric so the
+		// regression doesn't hide as a legitimate cross-tenant
+		// rejection. Plan 11.3 Task 4.
+		a.bumpInconsistent("project")
 		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get project %s: nil project returned without error", id)
 	}
 	return rtapi.ResolvedTenant{TenantID: proj.TenantID.String()}, nil
@@ -277,6 +292,17 @@ func registerProjectResolver(locator modules.ServiceLocator, logger *zap.Logger)
 		)
 		return
 	}
-	locator.Register(rtapi.LocatorProjectResolver, rtapi.ProjectResolver(newProjectResolverAdapter(svc)))
+	// Plan 11.3 Task 4: thread realtime.ConnectionMetrics through to
+	// the adapter so the (nil, nil) defensive branch lands on
+	// realtime_resolver_adapter_inconsistent_total{adapter_type="project"}.
+	// Missing metrics → no-op (degraded boot tolerance).
+	var bump func(string)
+	if metricsRaw, ok := locator.Lookup(rtapi.LocatorConnectionMetrics); ok {
+		if m, ok := metricsRaw.(*service.Metrics); ok {
+			bump = m.ObserveResolverAdapterInconsistent
+		}
+	}
+	locator.Register(rtapi.LocatorProjectResolver,
+		rtapi.ProjectResolver(newProjectResolverAdapterWithMetrics(svc, bump)))
 	logger.Info("realtime resolvers: ProjectResolver registered from crm.ProjectService")
 }

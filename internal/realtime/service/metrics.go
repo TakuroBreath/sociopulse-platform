@@ -46,6 +46,13 @@ type Metrics struct {
 	// unbounded payload-string-as-topic surfaces as a closed
 	// connection (CloseProtocolErr), not unbounded series.
 	unknownTopicClasses *prometheus.CounterVec
+
+	// resolverAdapterInconsistent counts resolver-adapter (nil, nil)
+	// defensive-guard fires. Non-zero indicates a service-layer bug
+	// returning (nil, nil) instead of (nil, ErrNotFound). The
+	// {adapter_type} label is bounded ("project", "user") — safe
+	// cardinality. Plan 11.3 Task 4.
+	resolverAdapterInconsistent *prometheus.CounterVec
 }
 
 // RegisterMetrics builds a fresh *Metrics and registers every
@@ -95,6 +102,10 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 			Name: "realtime_unknown_topic_classes_total",
 			Help: "Number of Send() calls with a topic missing FrameClass mapping (wiring bug indicator).",
 		}, []string{"topic"}),
+		resolverAdapterInconsistent: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "realtime_resolver_adapter_inconsistent_total",
+			Help: "Number of resolver-adapter (nil, nil) defensive-guard fires; non-zero indicates a service-layer bug returning (nil, nil) instead of (nil, ErrNotFound) — surfaces what would otherwise look like a legitimate cross-tenant rejection.",
+		}, []string{"adapter_type"}),
 	}
 	reg.MustRegister(
 		m.DroppedFrames,
@@ -103,6 +114,7 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 		m.RateLimitClosures,
 		m.criticalOverflows,
 		m.unknownTopicClasses,
+		m.resolverAdapterInconsistent,
 	)
 	return m
 }
@@ -160,6 +172,23 @@ func (m *Metrics) observeUnknownTopicClass(topic string) {
 		return
 	}
 	m.unknownTopicClasses.WithLabelValues(topic).Inc()
+}
+
+// observeResolverAdapterInconsistent ticks when a resolver adapter's
+// (nil, nil) defensive branch fires. adapterType is "user" or
+// "project" — bounded label cardinality preserved. nil-safe.
+func (m *Metrics) observeResolverAdapterInconsistent(adapterType string) {
+	if m == nil || m.resolverAdapterInconsistent == nil {
+		return
+	}
+	m.resolverAdapterInconsistent.WithLabelValues(adapterType).Inc()
+}
+
+// ObserveResolverAdapterInconsistent is the exported variant called
+// from cmd/api adapters (which cannot reach the unexported observe
+// method via reflection or method values). Functional alias.
+func (m *Metrics) ObserveResolverAdapterInconsistent(adapterType string) {
+	m.observeResolverAdapterInconsistent(adapterType)
 }
 
 // HubMetrics groups the Prometheus collectors emitted by the Hub. The
