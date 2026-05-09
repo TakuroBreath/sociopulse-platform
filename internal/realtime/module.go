@@ -166,7 +166,18 @@ func (m *Module) Register(d modules.Deps) error {
 
 	// Build the per-topic RBAC matrix once. The matrix is immutable
 	// after construction; the Hub holds a pointer.
-	rbac := service.NewTopicRBAC()
+	//
+	// Plan 11.2 Task 4-5: cross-tenant filter check via cached
+	// resolvers. resolveResolversFromLocator returns empty fallbacks
+	// when the production adapters aren't wired (degraded boot); the
+	// empty fallback rejects every cross-tenant lookup so the security
+	// envelope is bounded regardless. cmd/api's
+	// registerRealtimeResolvers populates the locator entries before
+	// this Register runs.
+	rawUsers, rawProjects := resolveResolversFromLocator(d.Locator, logger)
+	cachedUsers := service.NewCachedUserResolver(rawUsers, 0)
+	cachedProjects := service.NewCachedProjectResolver(rawProjects, 0)
+	rbac := service.NewTopicRBACWithResolvers(cachedUsers, cachedProjects)
 
 	// Hub-level metrics + per-connection metrics. Both are registered
 	// on the shared registry so dashboards can correlate

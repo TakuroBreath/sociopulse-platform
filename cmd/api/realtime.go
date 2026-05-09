@@ -4,11 +4,26 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
+	authapi "github.com/sociopulse/platform/internal/auth/api"
+	crmapi "github.com/sociopulse/platform/internal/crm/api"
 	"github.com/sociopulse/platform/internal/modules"
+	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	rtevents "github.com/sociopulse/platform/internal/realtime/events"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
+)
+
+// locatorAuthUserService and locatorCRMProjectService mirror the keys
+// the auth and crm modules register their public services under. Kept
+// private here because cmd/api is the only caller wiring the realtime
+// resolvers; mirroring the keys avoids a transitive import of
+// internal/auth/module.go (which pulls the entire auth/service stack
+// into cmd/api at compile time when only the api/ DTO is needed).
+const (
+	locatorAuthUserService   = "auth.UserService"
+	locatorCRMProjectService = "crm.ProjectService"
 )
 
 // locatorTenantService mirrors the same key the tenancy module
@@ -100,4 +115,158 @@ func resolveTenantLister(locator modules.ServiceLocator, logger *zap.Logger) rte
 		return emptyTenantLister{}
 	}
 	return newTenancyTenantLister(svc)
+}
+
+// authUserGetter is the narrow surface cmd/api needs from
+// auth.UserService to satisfy realtime.UserResolver. The auth module
+// exposes a richer interface; this slice is enough to project a user
+// onto its tenant for the realtime cross-tenant check.
+//
+// auth.UserService.Get is tenant-agnostic by design (it opens a
+// BypassRLS tx so admin tooling can resolve a user id to its tenant
+// before any per-tenant flow); that property is exactly what the
+// realtime resolver needs — the subscriber's claims tenant is used as
+// the "wanted" tenant and Get must return the row regardless of which
+// tenant owns it. See internal/auth/service/user_service.go::Get for
+// the implementation.
+type authUserGetter interface {
+	Get(ctx context.Context, userID uuid.UUID) (authapi.User, error)
+}
+
+// userResolverAdapter projects auth.UserService onto rtapi.UserResolver.
+// The wire-string user_id is parsed via uuid.Parse — a malformed UUID
+// surfaces as a wrapped error that TopicRBAC.Allow folds into
+// ErrCrossTenantSubscribe (security: client cannot probe entity
+// existence cross-tenant).
+type userResolverAdapter struct {
+	svc authUserGetter
+}
+
+// newUserResolverAdapter wraps an authUserGetter. nil svc panics —
+// the wiring bug surfaces at cmd/api boot rather than first subscribe.
+func newUserResolverAdapter(svc authUserGetter) *userResolverAdapter {
+	if svc == nil {
+		panic("cmd/api: newUserResolverAdapter: svc must be non-nil")
+	}
+	return &userResolverAdapter{svc: svc}
+}
+
+// Get implements rtapi.UserResolver.
+func (a *userResolverAdapter) Get(ctx context.Context, userID string) (rtapi.ResolvedTenant, error) {
+	id, err := uuid.Parse(userID)
+	if err != nil {
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: parse user_id %q: %w", userID, err)
+	}
+	user, err := a.svc.Get(ctx, id)
+	if err != nil {
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get user %s: %w", id, err)
+	}
+	return rtapi.ResolvedTenant{TenantID: user.TenantID.String()}, nil
+}
+
+// crmProjectGetter is the tenant-agnostic lookup the resolver uses.
+// crm.ProjectService.Get opens a BypassRLS tx for the same reason as
+// auth.UserService.Get — admin tooling routinely resolves a project
+// id to its tenant before a per-tenant flow. See
+// internal/crm/service/project_service.go::Get.
+type crmProjectGetter interface {
+	Get(ctx context.Context, projectID uuid.UUID) (*crmapi.Project, error)
+}
+
+// projectResolverAdapter mirrors userResolverAdapter for project IDs.
+type projectResolverAdapter struct {
+	svc crmProjectGetter
+}
+
+// newProjectResolverAdapter wraps a crmProjectGetter. nil svc panics —
+// the wiring bug surfaces at cmd/api boot rather than first subscribe.
+func newProjectResolverAdapter(svc crmProjectGetter) *projectResolverAdapter {
+	if svc == nil {
+		panic("cmd/api: newProjectResolverAdapter: svc must be non-nil")
+	}
+	return &projectResolverAdapter{svc: svc}
+}
+
+// Get implements rtapi.ProjectResolver.
+func (a *projectResolverAdapter) Get(ctx context.Context, projectID string) (rtapi.ResolvedTenant, error) {
+	id, err := uuid.Parse(projectID)
+	if err != nil {
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: parse project_id %q: %w", projectID, err)
+	}
+	proj, err := a.svc.Get(ctx, id)
+	if err != nil {
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get project %s: %w", id, err)
+	}
+	if proj == nil {
+		// Defensive: ProjectService.Get returns (nil, ErrProjectNotFound)
+		// on miss; we handle the error path above. A nil-without-error
+		// would be a service-layer bug, but we surface a typed error
+		// rather than panic so the realtime layer can fold it into
+		// ErrCrossTenantSubscribe alongside other resolver failures.
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get project %s: nil project returned without error", id)
+	}
+	return rtapi.ResolvedTenant{TenantID: proj.TenantID.String()}, nil
+}
+
+// registerRealtimeResolvers wires the realtime cross-tenant resolvers
+// into the locator BEFORE realtime.Module.Register runs. The realtime
+// module looks up rtapi.LocatorUserResolver / LocatorProjectResolver
+// and falls back to empty resolvers (which reject every cross-tenant
+// lookup) when an entry is missing — degraded boot is still safe.
+//
+// Order matters: this MUST run AFTER auth.Module.Register +
+// crm.Module.Register (they populate auth.UserService /
+// crm.ProjectService) AND BEFORE realtime.Module.Register (which
+// looks up the resolver keys).
+//
+// Missing-but-tolerated paths log INFO and skip the registration. A
+// type-mismatched entry (a wiring bug — somebody registered the key
+// with the wrong type) logs WARN and skips; the realtime module's
+// empty fallback path covers it. Either way the boot does not abort.
+func registerRealtimeResolvers(locator modules.ServiceLocator, logger *zap.Logger) {
+	if locator == nil {
+		logger.Info("realtime resolvers: locator missing, skipping resolver registration")
+		return
+	}
+	registerUserResolver(locator, logger)
+	registerProjectResolver(locator, logger)
+}
+
+// registerUserResolver looks up auth.UserService and registers the
+// rtapi.UserResolver adapter. Pulled out of registerRealtimeResolvers
+// to keep the two dimensions parallel (gocognit-friendly).
+func registerUserResolver(locator modules.ServiceLocator, logger *zap.Logger) {
+	v, ok := locator.Lookup(locatorAuthUserService)
+	if !ok {
+		logger.Info("realtime resolvers: auth.UserService missing; UserResolver disabled (degraded boot)")
+		return
+	}
+	svc, ok := v.(authapi.UserService)
+	if !ok {
+		logger.Warn("realtime resolvers: auth.UserService registered with wrong type; UserResolver disabled",
+			zap.String("got_type", fmt.Sprintf("%T", v)),
+		)
+		return
+	}
+	locator.Register(rtapi.LocatorUserResolver, rtapi.UserResolver(newUserResolverAdapter(svc)))
+	logger.Info("realtime resolvers: UserResolver registered from auth.UserService")
+}
+
+// registerProjectResolver mirrors registerUserResolver for the project
+// dimension.
+func registerProjectResolver(locator modules.ServiceLocator, logger *zap.Logger) {
+	v, ok := locator.Lookup(locatorCRMProjectService)
+	if !ok {
+		logger.Info("realtime resolvers: crm.ProjectService missing; ProjectResolver disabled (degraded boot)")
+		return
+	}
+	svc, ok := v.(crmapi.ProjectService)
+	if !ok {
+		logger.Warn("realtime resolvers: crm.ProjectService registered with wrong type; ProjectResolver disabled",
+			zap.String("got_type", fmt.Sprintf("%T", v)),
+		)
+		return
+	}
+	locator.Register(rtapi.LocatorProjectResolver, rtapi.ProjectResolver(newProjectResolverAdapter(svc)))
+	logger.Info("realtime resolvers: ProjectResolver registered from crm.ProjectService")
 }

@@ -259,14 +259,32 @@ func run(ctx context.Context, configDir string) error {
 	//    before dialer.Register looks it up. realtime is registered
 	//    AFTER dialer so any future module that wants to look up the
 	//    realtime Hub via Deps.Locator can do so.
+	//
+	//    Plan 11.2 Task 5: providers (telephony/dialer + future
+	//    auth/crm) register first, then registerRealtimeResolvers wires
+	//    auth.UserService/crm.ProjectService onto the rtapi.UserResolver/
+	//    ProjectResolver locator keys, then realtime.Module.Register
+	//    looks them up via the locator and builds cached wrappers. The
+	//    indirection preserves the scope rule that internal/realtime/*
+	//    does not import internal/auth/* or internal/crm/* (Plan 11.1
+	//    Task 2). Today's build has no auth/crm modules wired into
+	//    cmd/api, so the resolvers fall back to the realtime module's
+	//    empty-fallback path — which rejects every cross-tenant lookup
+	//    and is strictly safer than no check.
 	dialerModule := &dialer.Module{}
 	realtimeModule := realtime.New(realtime.Config{Registerer: metrics.Registry})
-	registry := modules.Registry{Modules: []modules.Module{
+	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
+	}}
+	if err := registerModules(providers, deps, logger, redisErr); err != nil {
+		return err
+	}
+	registerRealtimeResolvers(locator, logger)
+	consumers := modules.Registry{Modules: []modules.Module{
 		realtimeModule,
 	}}
-	if err := registerModules(registry, deps, logger, redisErr); err != nil {
+	if err := registerModules(consumers, deps, logger, redisErr); err != nil {
 		return err
 	}
 	defer func() {
