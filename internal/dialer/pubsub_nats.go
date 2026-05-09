@@ -124,17 +124,40 @@ func NewNATSPubSub(pub eventbus.Publisher, sub eventbus.Subscriber, replicaID st
 // Start is single-shot: a second invocation returns a wrapped error
 // rather than re-registering (which would double-deliver every
 // message to the local fan-out path).
+//
+// ctx scopes the JetStream consumer-create RPC only; once Subscribe
+// returns, delivery lifetime is owned by eventbus.Subscriber.Close()
+// (called from cmd/api on shutdown) — ctx-cancellation does NOT tear
+// down delivery.
+//
+// Lock discipline: the started-flag flip is gated by mu, but the
+// network Subscribe call runs WITHOUT the lock held. Holding mu
+// across a JetStream consumer-create RPC would block any concurrent
+// Subscribe/Publish/Stop on the broker round-trip; on a slow boot
+// that could deadlock against a graceful-shutdown cancel. On
+// Subscribe failure we re-acquire mu briefly to reset started=false
+// so a retry caller observes a clean slate.
 func (n *NATSPubSub) Start(ctx context.Context) error {
 	n.mu.Lock()
-	defer n.mu.Unlock()
+	if n.closed {
+		n.mu.Unlock()
+		return errors.New("dialer/pubsub_nats: Start after Stop")
+	}
 	if n.started {
+		n.mu.Unlock()
 		return errors.New("dialer/pubsub_nats: Start called twice")
 	}
+	n.started = true
+	n.mu.Unlock()
+
 	queue := "dialer-pubsub-" + n.replicaID
 	if err := n.sub.Subscribe(ctx, natsPubSubSubjectPattern, queue, n.handleBusMessage); err != nil {
+		// Roll back the started flag so a retry sees a clean slate.
+		n.mu.Lock()
+		n.started = false
+		n.mu.Unlock()
 		return fmt.Errorf("dialer/pubsub_nats: subscribe: %w", err)
 	}
-	n.started = true
 	return nil
 }
 

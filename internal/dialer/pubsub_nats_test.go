@@ -306,8 +306,7 @@ func TestNATSPubSub_StartPropagatesSubscribeError(t *testing.T) {
 
 // TestNATSPubSub_PublishLogsBrokerErrorAndDoesNotPanic uses a stub
 // publisher whose Publish always returns an error so we exercise the
-// publish-error branch (logged + swallowed). We also exercise the
-// nil-Ctx default in Start (passing context.Background()).
+// publish-error branch (logged + swallowed).
 func TestNATSPubSub_PublishLogsBrokerErrorAndDoesNotPanic(t *testing.T) {
 	t.Parallel()
 	ps := dialer.NewNATSPubSub(errPublisher{err: errors.New("publish fail")}, stubSubscriber{}, "r", zaptest.NewLogger(t))
