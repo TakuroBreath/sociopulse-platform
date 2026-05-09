@@ -218,6 +218,16 @@ func (c *Connection) SeedClaims(claims rtapi.Claims) {
 // 11 Task 3) immediately after AuthHandshake and before Run.
 func (c *Connection) SetHubCallback(cb HubCallback) { c.onFrame = cb }
 
+// SetSubscribeFnForTest sets the SubscribeFn directly. Test helper —
+// production callers go through Hub.Connect.
+func (c *Connection) SetSubscribeFnForTest(fn SubscribeFn) { c.setSubscribeFn(fn) }
+
+// HandleFrameForTest dispatches a frame as if the reader goroutine
+// received it. Test helper — production callers do not invoke this.
+func (c *Connection) HandleFrameForTest(frame rtapi.Frame) {
+	c.dispatchFrame(context.Background(), frame)
+}
+
 // setSubscribeFn wires the Hub-side handler for the direct
 // Connection.Subscribe path. Hub.Connect calls this once
 // post-registration; tests that want to bypass the Hub set it

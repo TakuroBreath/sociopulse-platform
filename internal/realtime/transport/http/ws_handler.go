@@ -237,7 +237,7 @@ func (h *wsHandler) handleSubscribeFrame(c *service.Connection, frame rtapi.Fram
 			c.Send(rtapi.Frame{
 				Type:   rtapi.FrameSubscribeErr,
 				Topic:  frame.Topic,
-				Reason: err.Error(),
+				Reason: scrubSubscribeErr(err),
 			})
 			return
 		}
@@ -259,6 +259,33 @@ func (h *wsHandler) handleSubscribeFrame(c *service.Connection, frame rtapi.Fram
 			zap.String("kind", string(frame.Type)),
 		)
 	}
+}
+
+// HandleSubscribeFrame is the exported test seam for the inbound
+// frame handler. Production callers wire it via SetHubCallback —
+// tests may call it directly to drive the dispatch table without
+// spinning up a Hub.
+func (h *wsHandler) HandleSubscribeFrame(c *service.Connection, frame rtapi.Frame) {
+	h.handleSubscribeFrame(c, frame)
+}
+
+// scrubSubscribeErr returns the wire-side Reason string for a
+// FrameSubscribeErr emission. ErrCrossTenantSubscribe folds to a
+// fixed string so the client cannot probe entity existence
+// cross-tenant via wire-string parsing (Plan 11.3 Task 1).
+//
+// Other RBAC errors (forbidden, filter_required, unknown_topic)
+// keep their err.Error() string — operators legitimately need
+// that context to debug a client-side bug.
+//
+// The errors.Is check uses the api-package sentinel so a wrapped
+// chain (e.g. fmt.Errorf("%w: ...", ErrCrossTenantSubscribe)) is
+// still detected.
+func scrubSubscribeErr(err error) string {
+	if errors.Is(err, rtapi.ErrCrossTenantSubscribe) {
+		return "cross-tenant subscription denied"
+	}
+	return err.Error()
 }
 
 // runTouchLoop calls PresenceTracker.Touch on a ticker. The loop exits

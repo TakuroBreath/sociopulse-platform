@@ -3,6 +3,7 @@ package http
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	stdhttp "net/http"
 	"net/http/httptest"
 	"strings"
@@ -625,6 +626,46 @@ func TestWSHandler_TouchLapsed_ClosesConn(t *testing.T) {
 	assert.Equal(t, websocket.StatusGoingAway, st)
 }
 
+// newTestConnectionHTTP builds a *service.Connection backed by a
+// stubWS (defined in force_handler_test.go) with sensible test
+// defaults. Used by transport/http unit tests that need a bare
+// Connection without a live WebSocket or Hub.
+func newTestConnectionHTTP(t *testing.T, cfg service.ConnectionConfig) *service.Connection {
+	t.Helper()
+	if cfg.WriteBufferSize == 0 {
+		cfg.WriteBufferSize = 16
+	}
+	if cfg.WriteTimeout == 0 {
+		cfg.WriteTimeout = time.Second
+	}
+	if cfg.AuthTimeout == 0 {
+		cfg.AuthTimeout = time.Second
+	}
+	if cfg.PingPeriod == 0 {
+		cfg.PingPeriod = time.Second
+	}
+	if cfg.PongTimeout == 0 {
+		cfg.PongTimeout = 2 * time.Second
+	}
+	return service.NewConnection(stubWS{}, cfg)
+}
+
+// newTestWSHandler builds a *wsHandler with a nop logger, a minimal
+// hub, and no presence tracker. Suitable for unit tests that drive
+// the dispatch table without a live WebSocket.
+func newTestWSHandler(t *testing.T) *wsHandler {
+	t.Helper()
+	logger := zap.NewNop()
+	reg := prometheus.NewRegistry()
+	hub := service.NewHub(logger, service.RegisterHubMetrics(reg), service.NewTopicRBAC())
+	t.Cleanup(hub.Shutdown)
+	return newWSHandler(wsHandlerConfig{
+		hub:    hub,
+		auth:   &stubAuthValidator{token: "tok"},
+		logger: logger,
+	})
+}
+
 // TestWSHandler_RefcountKeepsPresenceWhileSiblingActive verifies a
 // per-pod refcount preserves the user's presence key while a second
 // connection is open. OnDisconnect on the tracker fires only when the
@@ -664,4 +705,77 @@ func TestWSHandler_RefcountKeepsPresenceWhileSiblingActive(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return fx.presence.disconnectCount.Load() == 1
 	}, 2*time.Second, 20*time.Millisecond)
+}
+
+// TestWSHandler_HandleSubscribeFrame_CrossTenantReasonScrubbed locks
+// in the Plan 11.3 Task 1 contract: when Allow returns
+// ErrCrossTenantSubscribe (or any error wrapping it), the
+// FrameSubscribeErr Reason MUST be the fixed
+// "cross-tenant subscription denied" string — NOT err.Error() —
+// so a client cannot probe entity existence cross-tenant via
+// wire-string parsing.
+func TestWSHandler_HandleSubscribeFrame_CrossTenantReasonScrubbed(t *testing.T) {
+	t.Parallel()
+
+	// stubAuth + crossTenantSubscribeFn: a SubscribeFn that always
+	// rejects with a wrapped ErrCrossTenantSubscribe carrying a
+	// distinguishing inner message.
+	innerMsg := "operator_id=victim-op: cmd/api: get user victim-op: not found"
+	subscribeFn := func(_ context.Context, _ *service.Connection, _ rtapi.Topic, _ rtapi.SubscriptionFilter) (string, error) {
+		return "", fmt.Errorf("%w: %s", service.ErrCrossTenantSubscribe, innerMsg)
+	}
+
+	conn := newTestConnectionHTTP(t, service.ConnectionConfig{})
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"supervisor"}})
+	conn.SetSubscribeFnForTest(subscribeFn) // test seam added in Step 3
+
+	h := newTestWSHandler(t)
+	conn.SetHubCallback(h.HandleSubscribeFrame) // exported test seam added in Step 3
+
+	conn.HandleFrameForTest(rtapi.Frame{
+		Type:  rtapi.FrameSubscribe,
+		Topic: rtapi.TopicOperatorsState,
+		Filter: &rtapi.SubscriptionFilter{
+			OperatorID: "victim-op",
+		},
+	})
+
+	// Drain the queued FrameSubscribeErr.
+	got := conn.DrainSendForTest()
+	require.NotNil(t, got)
+	assert.Equal(t, rtapi.FrameSubscribeErr, got.Type)
+	assert.Equal(t, "cross-tenant subscription denied", got.Reason,
+		"Reason must be the fixed scrubbed string for ErrCrossTenantSubscribe")
+	assert.NotContains(t, got.Reason, "victim-op",
+		"scrubbed Reason must not leak the operator_id")
+	assert.NotContains(t, got.Reason, "not found",
+		"scrubbed Reason must not leak the inner not-found error")
+}
+
+// TestWSHandler_HandleSubscribeFrame_NonCrossTenantReasonPassthrough
+// ensures the scrub is targeted: other RBAC errors still surface
+// their err.Error() (operators may need that context to debug).
+func TestWSHandler_HandleSubscribeFrame_NonCrossTenantReasonPassthrough(t *testing.T) {
+	t.Parallel()
+
+	subscribeFn := func(_ context.Context, _ *service.Connection, _ rtapi.Topic, _ rtapi.SubscriptionFilter) (string, error) {
+		return "", fmt.Errorf("%w: roles=[operator] topic=trunks.health", service.ErrTopicForbidden)
+	}
+
+	conn := newTestConnectionHTTP(t, service.ConnectionConfig{})
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
+	conn.SetSubscribeFnForTest(subscribeFn)
+	h := newTestWSHandler(t)
+	conn.SetHubCallback(h.HandleSubscribeFrame)
+
+	conn.HandleFrameForTest(rtapi.Frame{
+		Type:  rtapi.FrameSubscribe,
+		Topic: rtapi.TopicTrunksHealth,
+	})
+
+	got := conn.DrainSendForTest()
+	require.NotNil(t, got)
+	assert.Equal(t, rtapi.FrameSubscribeErr, got.Type)
+	assert.Contains(t, got.Reason, "topic not allowed",
+		"non-cross-tenant errors retain their original Reason")
 }
