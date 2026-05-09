@@ -47,10 +47,17 @@ var (
 // fakeBus is an in-memory eventbus.Subscriber. It records each
 // Subscribe call (subject, queue, handler) and lets the test fire
 // synthetic messages through Fire.
+//
+// subscribeErr — if non-nil, EVERY Subscribe call returns it.
+// subscribeErrOn — if non-nil, only Subscribe calls whose subject
+// matches one of the keys return the error; other subjects succeed.
+// Used by tests that need to exercise the trunks.health-specific
+// branch in isolation.
 type fakeBus struct {
-	mu            sync.Mutex
-	subscriptions []fakeSubscription
-	subscribeErr  error
+	mu             sync.Mutex
+	subscriptions  []fakeSubscription
+	subscribeErr   error
+	subscribeErrOn map[string]error
 }
 
 type fakeSubscription struct {
@@ -62,6 +69,9 @@ type fakeSubscription struct {
 func (b *fakeBus) Subscribe(_ context.Context, subject, queue string, handler func(subject string, payload []byte) error) error {
 	if b.subscribeErr != nil {
 		return b.subscribeErr
+	}
+	if err, ok := b.subscribeErrOn[subject]; ok {
+		return err
 	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -194,7 +204,9 @@ func TestNATSSubscriber_Start_RegistersSupportedPatterns(t *testing.T) {
 	t.Cleanup(func() { _ = s.Stop() })
 
 	subjects := bus.Subjects()
-	// Five supported patterns; trunks.health intentionally not wired.
+	// Five supported patterns by default; trunks.health is opt-in via
+	// WithTrunksReplicator so the no-replicator path stays backward
+	// compatible (test below covers the opt-in path).
 	require.ElementsMatch(t, []string{
 		"tenant.*.dialer.op.*.state",
 		"tenant.*.dialer.queue",
@@ -209,6 +221,93 @@ func TestNATSSubscriber_Start_RegistersSupportedPatterns(t *testing.T) {
 	for _, q := range queues {
 		require.Equal(t, "realtime-replica-replica-x", q)
 	}
+}
+
+func TestNATSSubscriber_StartRegistersTrunksHealthWhenReplicatorPresent(t *testing.T) {
+	t.Parallel()
+
+	bus := &fakeBus{}
+	hub := &hubBroadcastRecorder{}
+	lister := &fakeTenantLister{tenants: []string{"tenant-A"}}
+	replicator := events.NewTrunksReplicator(hub, lister, zap.NewNop(), nil)
+
+	s := events.NewNATSSubscriber(
+		bus, hub, zap.NewNop(), nil,
+		events.WithReplicaID("replica-trunks"),
+		events.WithTrunksReplicator(replicator),
+	)
+	require.NoError(t, s.Start(context.Background()))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	// Six subscriptions now: the existing five + trunks.health.
+	subjects := bus.Subjects()
+	require.ElementsMatch(t, []string{
+		"tenant.*.dialer.op.*.state",
+		"tenant.*.dialer.queue",
+		"tenant.*.telephony.event.*.*",
+		"tenant.*.notify.user.*",
+		"tenant.*.force.user.*",
+		"trunks.health",
+	}, subjects)
+
+	// Every subscription must share the replicaID queue (Plan 11
+	// Decision Q2: per-replica fan-out semantics).
+	for _, q := range bus.Queues() {
+		require.Equal(t, "realtime-replica-replica-trunks", q)
+	}
+
+	// Firing a trunks.health message routes through the replicator and
+	// produces one Hub.Broadcast per active tenant.
+	require.NoError(t, bus.Fire("trunks.health", []byte(`{"node":"fs1","ok":true}`)))
+	calls := hub.Calls()
+	require.Len(t, calls, 1)
+	require.Equal(t, rtapi.TopicTrunksHealth, calls[0].topic)
+	require.Equal(t, "tenant-A", calls[0].filter.TenantID)
+}
+
+func TestNATSSubscriber_StartSkipsTrunksHealthWhenReplicatorNil(t *testing.T) {
+	t.Parallel()
+
+	bus := &fakeBus{}
+	hub := &hubBroadcastRecorder{}
+	// No WithTrunksReplicator option — backward-compat path. The
+	// subscriber must NOT register a trunks.health handler.
+	s := events.NewNATSSubscriber(bus, hub, zap.NewNop(), nil)
+	require.NoError(t, s.Start(context.Background()))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	for _, subj := range bus.Subjects() {
+		require.NotEqual(t, "trunks.health", subj,
+			"trunks.health must NOT be subscribed when WithTrunksReplicator is absent")
+	}
+}
+
+func TestNATSSubscriber_StartPropagatesTrunksHealthBusError(t *testing.T) {
+	t.Parallel()
+
+	// Surgical: the bus only errors on the trunks.health subject, so
+	// the five default patterns succeed and Start fails specifically
+	// in the trunks.health branch. Proves that branch wraps the bus
+	// error with the package prefix + the subject string, matching
+	// the contract used by the other patterns.
+	bus := &fakeBus{
+		subscribeErrOn: map[string]error{
+			"trunks.health": errors.New("trunks bus boom"),
+		},
+	}
+	hub := &hubBroadcastRecorder{}
+	lister := &fakeTenantLister{tenants: []string{"tenant-A"}}
+	replicator := events.NewTrunksReplicator(hub, lister, zap.NewNop(), nil)
+	s := events.NewNATSSubscriber(
+		bus, hub, zap.NewNop(), nil,
+		events.WithTrunksReplicator(replicator),
+	)
+
+	err := s.Start(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, "realtime/events:")
+	require.ErrorContains(t, err, "trunks.health")
+	require.ErrorContains(t, err, "trunks bus boom")
 }
 
 func TestNATSSubscriber_Start_TwiceErrors(t *testing.T) {

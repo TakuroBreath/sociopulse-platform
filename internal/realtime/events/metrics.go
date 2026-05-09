@@ -15,9 +15,10 @@ type Metrics struct {
 
 	// DispatchFailures counts messages skipped before they reached the
 	// Hub. Bounded labels: topic + reason ∈ {"malformed_subject",
-	// "empty_tenant"}. A non-zero rate indicates either a misconfigured
-	// upstream publisher (wrong subject token count) or a defence-in-
-	// depth hit (broker delivered an empty-tenant subject).
+	// "empty_tenant", "tenant_lister_failed"}. A non-zero rate indicates
+	// either a misconfigured upstream publisher (wrong subject token
+	// count), a defence-in-depth hit (broker delivered an empty-tenant
+	// subject), or a *TrunksReplicator tenant-catalog lookup failure.
 	DispatchFailures *prometheus.CounterVec
 
 	// FanoutSize is the distribution of Hub.Broadcast return values —
@@ -27,10 +28,14 @@ type Metrics struct {
 	FanoutSize prometheus.Histogram
 }
 
-// Reasons recorded on DispatchFailures.
+// Reasons recorded on DispatchFailures. The set is bounded by design —
+// every failure path in the dispatcher pipeline maps to exactly one of
+// these three string constants. Adding a new reason requires updating
+// the DispatchFailures comment above so dashboards stay in sync.
 const (
-	reasonMalformed   = "malformed_subject"
-	reasonEmptyTenant = "empty_tenant"
+	reasonMalformed          = "malformed_subject"
+	reasonEmptyTenant        = "empty_tenant"
+	reasonTenantListerFailed = "tenant_lister_failed"
 )
 
 // RegisterMetrics builds a fresh *Metrics and registers every collector

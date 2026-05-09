@@ -292,12 +292,25 @@ func run(ctx context.Context, configDir string) error {
 			)
 		} else {
 			eventsMetrics := rtevents.RegisterMetrics(metrics.Registry)
+			// Plan 11.1 Task 2: cross-tenant fan-out for trunks.health.
+			// The replicator looks up active tenants through the
+			// tenancy.TenantService adapter; resolveTenantLister falls
+			// back to an empty list when the tenancy module isn't
+			// registered (minimal-boot path, integration tests).
+			tenantLister := resolveTenantLister(locator, logger.Named("realtime.trunks"))
+			trunksReplicator := rtevents.NewTrunksReplicator(
+				hub,
+				tenantLister,
+				logger.Named("realtime.trunks"),
+				eventsMetrics,
+			)
 			dispatcher = rtevents.NewNATSSubscriber(
 				natsSub,
 				hub,
 				logger.Named("realtime.dispatcher"),
 				eventsMetrics,
 				rtevents.WithReplicaID(uuid.NewString()),
+				rtevents.WithTrunksReplicator(trunksReplicator),
 			)
 		}
 	} else {

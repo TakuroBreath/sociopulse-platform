@@ -30,6 +30,7 @@ type Option func(*subscriberOptions)
 
 type subscriberOptions struct {
 	replicaID string
+	trunks    *TrunksReplicator
 }
 
 // WithReplicaID sets the replica identifier used to derive the queue
@@ -39,6 +40,16 @@ type subscriberOptions struct {
 // message (queue-group degeneration).
 func WithReplicaID(id string) Option {
 	return func(o *subscriberOptions) { o.replicaID = id }
+}
+
+// WithTrunksReplicator opts the dispatcher into the global
+// `trunks.health` subject. When supplied, Start adds a sixth
+// Subscribe registration that delegates to *TrunksReplicator.Dispatch
+// for cross-tenant fan-out (Plan 11.1 Task 2). When nil/absent, the
+// subject stays unwired — backward-compatible with the Plan 11 baseline
+// and useful for tests/local boots that lack a TenantLister.
+func WithTrunksReplicator(r *TrunksReplicator) Option {
+	return func(o *subscriberOptions) { o.trunks = r }
 }
 
 // NATSSubscriber fans out NATS events under tenant.> into the local Hub.
@@ -52,6 +63,12 @@ type NATSSubscriber struct {
 	queue   string
 
 	patterns []subjectPattern
+
+	// trunks is the optional cross-tenant replicator for the global
+	// `trunks.health` subject. nil disables that subject's wire-up
+	// (backward-compat with Plan 11 baseline). Wired via
+	// WithTrunksReplicator.
+	trunks *TrunksReplicator
 
 	mu      sync.Mutex
 	started bool
@@ -102,6 +119,7 @@ func NewNATSSubscriber(bus eventbus.Subscriber, hub HubBroadcaster, logger *zap.
 		metrics:  metrics,
 		queue:    fmt.Sprintf("realtime-replica-%s", o.replicaID),
 		patterns: defaultPatterns(),
+		trunks:   o.trunks,
 	}
 }
 
@@ -109,10 +127,12 @@ func NewNATSSubscriber(bus eventbus.Subscriber, hub HubBroadcaster, logger *zap.
 // a function (not a package-level var) so each *NATSSubscriber owns its
 // own slice — there is no shared mutable state between dispatchers.
 //
-// Note on trunks.health: deliberately omitted. Hub.Broadcast returns 0
-// for an empty TenantID filter (cross-tenant leak guard). Plan 11
-// Task 7's HTTP layer will fan trunks.health out per-tenant via a
-// separate path.
+// Note on trunks.health: NOT in this table. The subject has no tenant
+// scope (FreeSWITCH cluster trunk states), so it cannot be projected to
+// a (topic, BroadcastFilter{TenantID}) tuple inside the dispatch loop.
+// Instead it is wired separately by Start when *TrunksReplicator is
+// supplied — the replicator looks up active tenants and emits one
+// per-tenant Hub.Broadcast each (Plan 11.1 Task 2).
 func defaultPatterns() []subjectPattern {
 	return []subjectPattern{
 		{
@@ -208,18 +228,27 @@ func (s *NATSSubscriber) Start(ctx context.Context) error {
 			return fmt.Errorf("realtime/events: subscribe %q: %w", p.subject, err)
 		}
 	}
+	// trunks.health: opt-in cross-tenant fan-out. Wired only when the
+	// composition root supplied a *TrunksReplicator via
+	// WithTrunksReplicator. The replicator's Dispatch is invoked
+	// synchronously by the bus's push goroutine; lister failures are
+	// logged + counted (never propagated to the bus). See
+	// trunks_replicator.go for the full contract.
+	if s.trunks != nil {
+		replicator := s.trunks // capture so the closure is re-entrant safe
+		handler := func(_ string, payload []byte) error {
+			return replicator.Dispatch(ctx, payload)
+		}
+		if err := s.bus.Subscribe(ctx, "trunks.health", s.queue, handler); err != nil {
+			return fmt.Errorf("realtime/events: subscribe %q: %w", "trunks.health", err)
+		}
+	} else {
+		s.logger.Debug("realtime/events: trunks.health subject not wired (no TrunksReplicator option)",
+			zap.String("queue", s.queue),
+		)
+	}
+
 	s.started = true
-
-	// trunks.health is intentionally not wired here. The Hub refuses
-	// empty-TenantID broadcasts (cross-tenant leak guard). Plan 11
-	// Task 7 (HTTP handlers) will fan trunks.health out per-tenant via
-	// a separate per-tenant replication path. Emit a single debug log
-	// at startup so anyone tailing logs can correlate the missing
-	// subject with this comment.
-	s.logger.Debug("realtime/events: trunks.health subject not yet wired (TODO Plan 11 Task 7)",
-		zap.String("queue", s.queue),
-	)
-
 	return nil
 }
 
