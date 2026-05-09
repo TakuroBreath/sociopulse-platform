@@ -45,8 +45,8 @@ type CacheInvalidatorConfig struct {
 	// ProjectInvalidate is the function called with every
 	// project_id from a parsed ProjectStatusChangedEvent. The
 	// production wiring binds this to
-	// (*service.CachedProjectResolver).Invalidate. Required —
-	// nil panics at construction.
+	// (*service.CachedProjectResolver).Invalidate — nil panics
+	// at construction.
 	ProjectInvalidate projectInvalidateFn
 
 	// Metrics receives counter ticks. Nil-tolerated — observe is
@@ -63,11 +63,14 @@ type CacheInvalidatorConfig struct {
 	QueueGroup string
 }
 
-// projectStatusSubject is the wildcard subject the invalidator
+// SubjectProjectStatus is the wildcard subject the cache invalidator
 // subscribes to. Built from crmapi.SubjectProjectStatus's
 // "tenant.<t>.crm.project.status_changed" template by replacing
 // the tenant placeholder with NATS's '*' single-token wildcard.
-const projectStatusSubject = "tenant.*.crm.project.status_changed"
+//
+// Exported so module.go's log and tests can reference the same
+// source of truth instead of duplicating the literal.
+const SubjectProjectStatus = "tenant.*.crm.project.status_changed"
 
 // defaultCacheInvalidatorQueueGroup is the JetStream queue group
 // used for the cache-invalidator subscription when none is
@@ -82,9 +85,12 @@ const projectStatusSubject = "tenant.*.crm.project.status_changed"
 const defaultCacheInvalidatorQueueGroup = "realtime-cache-invalidator"
 
 // CacheInvalidator is the events-package handle for NATS-driven
-// cache invalidation. Owns one Subscribe registered at Start and
-// torn down implicitly when the parent ctx (passed to Start)
-// cancels — the bus owns the consumer goroutine.
+// cache invalidation. Owns one Subscribe registered at Start.
+// The subscription is torn down by the bus's Close (which drains
+// every registered consumer goroutine). The ctx passed to Start
+// only bounds the registration call itself; cmd/api passes
+// context.Background() so a Register-scoped cancellation doesn't
+// prematurely tear down the long-lived subscription.
 type CacheInvalidator struct {
 	cfg CacheInvalidatorConfig
 
@@ -116,22 +122,31 @@ func NewCacheInvalidator(cfg CacheInvalidatorConfig) *CacheInvalidator {
 // fails — the composition root (module.go) logs WARN and falls
 // back to TTL-only invalidation.
 //
+// The subscription is torn down by the bus's Close (which drains
+// every registered consumer goroutine). The ctx passed to Start
+// only bounds the registration call itself; cmd/api passes
+// context.Background() so a Register-scoped cancellation doesn't
+// prematurely tear down the long-lived subscription.
+//
 // Implementation note: the bus is push-mode; the handler is
 // invoked in a goroutine the bus owns. *CacheInvalidator does
 // NOT spawn its own goroutine (carry-forward of the
-// trunks_replicator pattern; Plan 11.1 Task 2).
+// NATSSubscriber pattern; Plan 11.1 Task 2).
 func (c *CacheInvalidator) Start(ctx context.Context) error {
-	if err := c.cfg.Subscriber.Subscribe(ctx, projectStatusSubject, c.cfg.QueueGroup, c.handle); err != nil {
-		return fmt.Errorf("realtime/events: cache invalidator subscribe %q: %w", projectStatusSubject, err)
+	if err := c.cfg.Subscriber.Subscribe(ctx, SubjectProjectStatus, c.cfg.QueueGroup, c.handle); err != nil {
+		return fmt.Errorf("realtime/events: cache invalidator subscribe %q: %w", SubjectProjectStatus, err)
 	}
 	return nil
 }
 
-// Stop is the lifecycle teardown alias. The actual subscription is
-// closed by the bus implementation when the parent ctx (passed to
-// Start) cancels. Idempotent — second Stop is a no-op. Reserved
-// for symmetry with TrunksReplicator + future extensions that may
-// add a worker goroutine.
+// Stop is the lifecycle teardown alias. The subscription is torn
+// down by the bus's Close (which drains every registered consumer
+// goroutine). The ctx passed to Start only bounds the registration
+// call itself; cmd/api passes context.Background() so a
+// Register-scoped cancellation doesn't prematurely tear down the
+// long-lived subscription. Idempotent — second Stop is a no-op.
+// Reserved for symmetry with NATSSubscriber + future extensions
+// that may add a worker goroutine.
 func (c *CacheInvalidator) Stop() {
 	c.stopOnce.Do(func() {
 		// Nothing to wait on — the bus owns the consumer goroutine.
@@ -166,7 +181,7 @@ func (c *CacheInvalidator) handle(_ string, payload []byte) error {
 	// Defensive: skip empty IDs. The crm publisher always sets
 	// these but a future schema bump could omit; surface as a
 	// metric tick rather than silent.
-	if ev.ProjectID == (uuid.UUID{}) {
+	if ev.ProjectID == uuid.Nil {
 		c.cfg.Metrics.observe("empty_project_id")
 		c.cfg.Logger.Debug("realtime/events: cache invalidator: drop empty project_id",
 			zap.Int("payload_bytes", len(payload)),

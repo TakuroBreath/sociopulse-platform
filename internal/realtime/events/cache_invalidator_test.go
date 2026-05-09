@@ -232,7 +232,7 @@ func TestCacheInvalidator_StartPropagatesSubscribeError(t *testing.T) {
 
 	bus := &fakeBus{
 		subscribeErrOn: map[string]error{
-			"tenant.*.crm.project.status_changed": errBoom,
+			events.SubjectProjectStatus: errBoom,
 		},
 	}
 	inv := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
@@ -242,7 +242,7 @@ func TestCacheInvalidator_StartPropagatesSubscribeError(t *testing.T) {
 	err := inv.Start(context.Background())
 	require.Error(t, err)
 	require.ErrorContains(t, err, "realtime/events:")
-	require.ErrorContains(t, err, "tenant.*.crm.project.status_changed")
+	require.ErrorContains(t, err, events.SubjectProjectStatus)
 }
 
 // TestCacheInvalidator_StopIdempotent ensures Stop can be invoked

@@ -282,7 +282,7 @@ func (m *Module) Register(d modules.Deps) error {
 		} else {
 			m.cacheInvalidator = invalidator
 			logger.Info("realtime: cache invalidator started",
-				zap.String("subject", "tenant.*.crm.project.status_changed"),
+				zap.String("subject", events.SubjectProjectStatus),
 			)
 		}
 	}
@@ -318,11 +318,13 @@ func (m *Module) Stop() error {
 	cacheInvalidator := m.cacheInvalidator
 	m.mu.Unlock()
 
-	// Tear down the cache invalidator first so it stops processing
-	// status_changed events before the Hub closes connections —
-	// avoids a race where a late-delivered Invalidate hits a
-	// half-shutdown resolver. Stop is idempotent and safe even
-	// when the underlying ctx has already cancelled.
+	// Cache invalidator's Stop is currently a no-op flag-flip
+	// (sync.Once). The bus owns the consumer goroutine; cmd/api's
+	// bus.Close drains every registered subscription. We call Stop
+	// here for symmetry with future extensions that may add an
+	// internal worker goroutine. Order relative to Hub.Shutdown is
+	// incidental — Invalidate is sync.Map.Delete + singleflight.Forget,
+	// safe at any Hub state.
 	if cacheInvalidator != nil {
 		cacheInvalidator.Stop()
 	}
