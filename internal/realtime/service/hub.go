@@ -18,13 +18,15 @@ import (
 // handlers call Hub.Connect after AuthHandshake succeeds.
 //
 // Goroutine safety: all maps are protected by hub.mu (RWMutex). Read
-// paths (Broadcast lookup, Stats) take RLock; mutate paths (Connect /
-// Subscribe / Unsubscribe / Disconnect) take Lock. The connection's
-// Send is called while holding RLock in Broadcast — Send is
-// non-blocking by contract (drop-oldest on a full telemetryCh,
-// close-connection on a full criticalCh per Plan 11.2), so a slow
-// consumer doesn't extend lock-hold beyond a memory write +
-// channel-send.
+// paths (Broadcast scan, Stats) take RLock; mutate paths (Connect /
+// Subscribe / Unsubscribe / Disconnect) take Lock. Broadcast +
+// DisconnectByUser use a two-phase iterate-then-deliver pattern: the
+// scan collects target connections into a local slice under RLock,
+// then RELEASES the lock before calling conn.Send / conn.Close. This
+// makes it safe for a per-conn Send to fire Close (e.g., critical-
+// queue overflow → CloseRateLimited) which would otherwise re-enter
+// onConnClose and deadlock on h.mu.Lock while the same goroutine
+// still held RLock.
 //
 // Lifecycle:
 //
@@ -334,11 +336,19 @@ func (h *Hub) onConnClose(c *Connection) {
 // critical-overflow closures via critical_overflows_total. Hub
 // counts dispatches, not deliveries.
 //
-// Locking: holds RLock for the entire iteration. conn.Send is
-// non-blocking by contract, so the lock is held only for the
-// duration of a memory write + channel-send. No write paths
-// (Subscribe / Disconnect / Connect) can run concurrently — they
-// take Lock — so the per-conn subscription-set we read is consistent.
+// Lock-discipline (Plan 11.2 Task 2 fix): two-phase iterate-then-send.
+// We hold h.mu.RLock during the scan to collect matching (conn,
+// subID) pairs into a local slice, then RELEASE the lock and only
+// THEN call conn.Send on each target. This prevents a deadlock
+// between hub.mu and the onClose callback that fires when a
+// per-conn Close happens from inside Send (e.g., critical-queue
+// overflow → Close → Hub.onConnClose → h.mu.Lock(), which would
+// block forever on the RLock we'd otherwise still be holding).
+//
+// Same pattern as DisconnectByUser (see comment there for the
+// canonical rationale). Future Send call sites added inside
+// Broadcast must respect this contract: do not call Send while
+// holding h.mu.
 func (h *Hub) Broadcast(_ context.Context, topic rtapi.Topic, payload json.RawMessage, filter rtapi.BroadcastFilter) int {
 	if filter.TenantID == "" {
 		return 0
@@ -350,11 +360,14 @@ func (h *Hub) Broadcast(_ context.Context, topic rtapi.Topic, payload json.RawMe
 		Payload: payload,
 	}
 
-	h.mu.RLock()
-	defer h.mu.RUnlock()
+	type target struct {
+		conn  *Connection
+		subID string
+	}
 
+	h.mu.RLock()
 	tenantConns := h.byTenant[filter.TenantID]
-	count := 0
+	targets := make([]target, 0, len(tenantConns))
 	for connID, conn := range tenantConns {
 		if filter.UserID != "" && conn.Claims().UserID != filter.UserID {
 			continue
@@ -371,19 +384,25 @@ func (h *Hub) Broadcast(_ context.Context, topic rtapi.Topic, payload json.RawMe
 			if !subFilterMatches(rec.filter, filter) {
 				continue
 			}
-			// Stamp the SubID so the client can correlate the
-			// event with its outstanding subscription handle.
-			deliver := frame
-			deliver.SubID = rec.id
-			conn.Send(deliver)
-			count++
+			targets = append(targets, target{conn: conn, subID: rec.id})
 			break // one frame per connection per broadcast
 		}
 	}
+	h.mu.RUnlock()
 
-	h.metrics.observeBroadcast(string(topic), count)
+	// Phase 2: deliver outside the lock. Each Send is independent;
+	// a critical-queue overflow on one connection cannot wedge the
+	// others (Close → onConnClose → h.mu.Lock now succeeds because
+	// we no longer hold the RLock).
+	for _, t := range targets {
+		deliver := frame
+		deliver.SubID = t.subID
+		t.conn.Send(deliver)
+	}
 
-	return count
+	h.metrics.observeBroadcast(string(topic), len(targets))
+
+	return len(targets)
 }
 
 // subFilterMatches reports whether a BroadcastFilter intersects with

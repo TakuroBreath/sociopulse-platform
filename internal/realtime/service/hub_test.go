@@ -568,6 +568,60 @@ func TestHub_NewHub_NilRBACPanics(t *testing.T) {
 	})
 }
 
+// TestHub_BroadcastDoesNotDeadlockOnCriticalOverflow is the regression
+// guard for the Plan 11.2 Task 2 review-found CRITICAL bug:
+// Broadcast(RLock) → Send → sendCritical → Close → onConnClose(Lock)
+// would deadlock the same goroutine. The two-phase iterate-then-send
+// fix in Broadcast (release lock before delivery) makes this safe.
+//
+// Repro: fill a connection's criticalCh to capacity, then Broadcast a
+// critical-class topic to that connection. Without the fix the test
+// hangs forever (caught by the bounded done channel + time.After).
+func TestHub_BroadcastDoesNotDeadlockOnCriticalOverflow(t *testing.T) {
+	t.Parallel()
+
+	hub := newTestHub(t)
+	conn, fake := newTestConnection(t, service.ConnectionConfig{
+		WriteBufferSize: 16, // telemetry; criticalQueueSize is 32 internally
+	})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
+
+	hub.AttachForTest(conn, rtapi.Claims{
+		UserID: "u1", TenantID: "tenant-A", Roles: []string{"admin"},
+	})
+	_, err := conn.Subscribe(rtapi.TopicCallEvents, rtapi.SubscriptionFilter{CallID: "c1"})
+	require.NoError(t, err)
+
+	// Block the writer so criticalCh actually fills.
+	fake.BlockWrites()
+
+	// Fill criticalCh to capacity (32 slots).
+	for range 32 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicCallEvents})
+	}
+
+	// Now Broadcast a critical-class frame. The 33rd attempted enqueue
+	// should overflow, trigger Close, and (with the fix) NOT deadlock.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		hub.Broadcast(t.Context(),
+			rtapi.TopicCallEvents,
+			[]byte(`{"v":1}`),
+			rtapi.BroadcastFilter{TenantID: "tenant-A", CallID: "c1"},
+		)
+	}()
+
+	select {
+	case <-done:
+		// Pass: Broadcast returned within bound.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Broadcast deadlocked under critical-queue overflow")
+	}
+
+	fake.UnblockWrites()
+}
+
 // drainOneFrame consumes one frame from the connection's writer queue
 // without spawning runWriter. Returns nil if no frame is queued.
 //

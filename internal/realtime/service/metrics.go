@@ -89,7 +89,7 @@ func RegisterMetrics(reg prometheus.Registerer) *Metrics {
 		),
 		criticalOverflows: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "realtime_critical_overflows_total",
-			Help: "Number of WS connections closed due to critical-queue overflow.",
+			Help: "Number of critical-queue overflow events (each event triggers connection close, but multiple goroutines can record overflow on the same connection before closeOnce gates the actual close).",
 		}, []string{"conn_id"}),
 		unknownTopicClasses: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "realtime_unknown_topic_classes_total",

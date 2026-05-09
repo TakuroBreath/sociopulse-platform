@@ -882,6 +882,7 @@ func TestConnection_CriticalFrameOverflowClosesConnection(t *testing.T) {
 	conn, fake := newTestConnection(t, service.ConnectionConfig{
 		WriteBufferSize: 16, // telemetry buffer; critical buffer is fixed at 32
 	})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
 	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"admin"}})
 
 	// Block the writer so the queues fill up.
@@ -896,9 +897,6 @@ func TestConnection_CriticalFrameOverflowClosesConnection(t *testing.T) {
 	require.Eventually(t, conn.IsClosedForTest,
 		2*time.Second, 10*time.Millisecond,
 		"critical-queue overflow must close the connection")
-
-	// Unblock so writer goroutine drains and exits cleanly (no goleak).
-	fake.UnblockWrites()
 }
 
 // TestConnection_TelemetryFramesDropOldest_PreservesCritical asserts
@@ -911,6 +909,7 @@ func TestConnection_TelemetryFramesDropOldest_PreservesCritical(t *testing.T) {
 	conn, fake := newTestConnection(t, service.ConnectionConfig{
 		WriteBufferSize: 4, // tiny telemetry buffer; force overflow fast
 	})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
 	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
 
 	fake.BlockWrites()
@@ -931,6 +930,151 @@ func TestConnection_TelemetryFramesDropOldest_PreservesCritical(t *testing.T) {
 	// At least one frame was dropped (drop-oldest counter incremented).
 	assert.Positive(t, conn.DroppedFrames(),
 		"telemetry overflow should bump drop counter")
+}
 
+// TestConnection_SendUnclassifiedTopicClosesConnection asserts that a
+// frame with a Topic not in TopicClass's switch (a wiring bug) closes
+// the connection with CloseProtocolErr and ticks the
+// realtime_unknown_topic_classes_total metric. Plan 11.2 Task 2
+// "fail loud" contract.
+func TestConnection_SendUnclassifiedTopicClosesConnection(t *testing.T) {
+	t.Parallel()
+
+	conn, _ := newTestConnection(t, service.ConnectionConfig{})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
+
+	reg := prometheus.NewRegistry()
+	conn.SetMetrics(service.RegisterMetrics(reg))
+
+	conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: "garbage.topic"})
+
+	require.True(t, conn.IsClosedForTest(),
+		"unclassified topic must close the connection")
+	// Verify the metric ticked (helper from existing tests).
+	require.InDelta(t, 1.0, unknownTopicCountForLabel(t, reg, "garbage.topic"), 0.0001)
+}
+
+// TestConnection_ControlFramesRouteToTelemetryLane verifies that
+// control frames with empty Topic (FramePing/FramePong/FrameAuthOK
+// and friends) bypass the FrameClass switch and route to telemetryCh.
+// Without this the empty-Topic → FrameClassUnknown default would
+// close ping/pong frames; the explicit guard in Send prevents that.
+func TestConnection_ControlFramesRouteToTelemetryLane(t *testing.T) {
+	t.Parallel()
+
+	conn, _ := newTestConnection(t, service.ConnectionConfig{
+		WriteBufferSize: 4,
+	})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
+
+	conn.Send(rtapi.Frame{Type: rtapi.FramePing}) // empty Topic
+
+	require.False(t, conn.IsClosedForTest(),
+		"control frame (empty Topic) must not close the connection")
+
+	// DrainSendForTest pulls critical first, then telemetry. With no
+	// critical frame queued, the ping should appear from the
+	// telemetry lane.
+	got := conn.DrainSendForTest()
+	require.NotNil(t, got)
+	assert.Equal(t, rtapi.FramePing, got.Type,
+		"ping frame must land on a drainable lane")
+}
+
+// TestConnection_RunWriter_PriorityDrainsCriticalFirst verifies the
+// runWriter priority discipline: when both queues have pending
+// frames, critical drains before telemetry.
+//
+// Test design: queue a deterministic mix (3 critical, 5 telemetry,
+// 2 critical) WHILE the writer is blocked on a slow WriteFrame.
+// After unblocking, the order observed by the fakeWSConn must be
+// all 5 criticals first, then 5 telemetries — interleavings would
+// indicate priority is not preserved.
+//
+// Uses SeedClaims (not AuthHandshake) to avoid the synchronous
+// auth.ok write that would land in fake.Writes() before BlockWrites
+// takes effect.
+func TestConnection_RunWriter_PriorityDrainsCriticalFirst(t *testing.T) {
+	t.Parallel()
+
+	conn, fake := newTestConnection(t, service.ConnectionConfig{
+		WriteBufferSize: 16,
+		PingPeriod:      time.Hour, // disable pinger
+		PongTimeout:     time.Hour,
+	})
+	t.Cleanup(func() { conn.Close(rtapi.CloseNormal) })
+
+	conn.SeedClaims(rtapi.Claims{UserID: "u1", TenantID: "t1", Roles: []string{"operator"}})
+
+	// Block the writer BEFORE Run starts so we can build a
+	// deterministic queue mix without losing any frames to a fast
+	// drain.
+	fake.BlockWrites()
+
+	runDone := make(chan struct{})
+	go func() {
+		_ = conn.Run(t.Context())
+		close(runDone)
+	}()
+
+	// Queue 3 critical, 5 telemetry, 2 critical. The 5 criticals must
+	// emerge first in writer-order.
+	for range 3 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicCallEvents})
+	}
+	for range 5 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicOperatorsState})
+	}
+	for range 2 {
+		conn.Send(rtapi.Frame{Type: rtapi.FrameEvent, Topic: rtapi.TopicCallEvents})
+	}
+
+	// Unblock; writer drains. Wait for all 10 writes to land.
 	fake.UnblockWrites()
+	require.Eventually(t, func() bool {
+		return len(fake.Writes()) >= 10
+	}, 2*time.Second, 10*time.Millisecond)
+
+	// First 5 writes must be critical (TopicCallEvents).
+	writes := fake.Writes()
+	for i := range 5 {
+		var f rtapi.Frame
+		require.NoError(t, json.Unmarshal(writes[i], &f), "write[%d]", i)
+		require.Equal(t, rtapi.TopicCallEvents, f.Topic,
+			"write[%d] must be critical (TopicCallEvents); priority dispatch broken", i)
+	}
+	// Remaining 5 writes must be telemetry (TopicOperatorsState).
+	for i := 5; i < 10; i++ {
+		var f rtapi.Frame
+		require.NoError(t, json.Unmarshal(writes[i], &f), "write[%d]", i)
+		require.Equal(t, rtapi.TopicOperatorsState, f.Topic,
+			"write[%d] must be telemetry; priority dispatch broken", i)
+	}
+
+	conn.Close(rtapi.CloseNormal)
+	fake.QueueReadErr(errors.New("conn closed"))
+	<-runDone
+}
+
+// unknownTopicCountForLabel returns the
+// realtime_unknown_topic_classes_total{topic} counter value.
+func unknownTopicCountForLabel(t *testing.T, reg *prometheus.Registry, topic string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range families {
+		if mf.GetName() != "realtime_unknown_topic_classes_total" {
+			continue
+		}
+		for _, m := range mf.Metric {
+			for _, lp := range m.Label {
+				if lp.GetName() == "topic" && lp.GetValue() == topic {
+					return m.Counter.GetValue()
+				}
+			}
+		}
+	}
+	return 0
 }
