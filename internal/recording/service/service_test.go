@@ -168,15 +168,6 @@ func TestService_OpenAudioStream_NotWired(t *testing.T) {
 	require.Contains(t, err.Error(), "not wired")
 }
 
-func TestService_VerifyChecksum_NotImplemented(t *testing.T) {
-	t.Parallel()
-	svc := newStubService(t)
-
-	_, err := svc.VerifyChecksum(t.Context(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()))
-	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
-	require.Contains(t, err.Error(), "not implemented in foundation phase")
-}
-
 // newStubService builds a minimum-viable RecordingService for tests that
 // only assert on the deferred-method placeholders. No DB, no metrics, no
 // outbox — the stubs return before any field is dereferenced.

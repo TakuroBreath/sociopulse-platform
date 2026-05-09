@@ -286,10 +286,6 @@ func (s *svc) OpenAudioStream(ctx context.Context, tenantID, callID uuid.UUID, _
 	}, nil
 }
 
-func (s *svc) VerifyChecksum(_ context.Context, _, _ uuid.UUID) (rapi.VerifyResult, error) {
-	return rapi.VerifyResult{}, fmt.Errorf("%w: VerifyChecksum not implemented in foundation phase", ErrInvalidInput)
-}
-
 // ----- helpers -----
 
 // validateCommit composes three sub-validators to keep cyclomatic complexity
