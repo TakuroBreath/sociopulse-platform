@@ -35,6 +35,8 @@ import (
 	"go.uber.org/zap"
 	"google.golang.org/grpc"
 
+	authmod "github.com/sociopulse/platform/internal/auth"
+	authapi "github.com/sociopulse/platform/internal/auth/api"
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/grpcserver"
@@ -42,6 +44,7 @@ import (
 	"github.com/sociopulse/platform/internal/recording/service"
 	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/recording/store"
+	rhttp "github.com/sociopulse/platform/internal/recording/transport/http"
 )
 
 // LocatorRecordingService is the locator key under which Register
@@ -157,6 +160,22 @@ func (m *Module) Register(d modules.Deps) error {
 		d.Locator.Register(LocatorRecordingService, svc)
 	}
 
+	// Plan 12.3 Task 5: mount HTTP routes when a router is supplied. Auth
+	// adapters live in the locator (auth module Plan 05); we look them up
+	// at Register time. Nil locator entries fall through to "no auth
+	// middleware" — only safe in dev/test where the harness pre-attaches
+	// claims.
+	if d.HTTPRouter != nil {
+		apiGroup := d.HTTPRouter.Group("/api")
+		rhttp.Mount(apiGroup, rhttp.Deps{
+			Service:   svc,
+			Validator: lookupClaimsValidator(d.Locator, logger),
+			RBAC:      lookupRBACChecker(d.Locator, logger),
+			Logger:    logger,
+		})
+		logger.Info("recording HTTP routes mounted under /api")
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.logger = logger
@@ -245,4 +264,47 @@ func (c Config) registerer() prometheus.Registerer {
 		return c.Registerer
 	}
 	return prometheus.NewRegistry()
+}
+
+// lookupClaimsValidator returns the auth ClaimsValidator from the locator,
+// or nil if absent. The transport then mounts WITHOUT JWT middleware —
+// only safe in dev/test; production always has the auth module wired.
+func lookupClaimsValidator(loc modules.ServiceLocator, logger *zap.Logger) authapi.ClaimsValidator {
+	if loc == nil {
+		if logger != nil {
+			logger.Warn("recording HTTP transport: locator nil — JWT middleware skipped")
+		}
+		return nil
+	}
+	raw, ok := loc.Lookup(authmod.LocatorClaimsValidator)
+	if !ok {
+		if logger != nil {
+			logger.Warn("recording HTTP transport: auth.ClaimsValidator not in locator — JWT middleware skipped")
+		}
+		return nil
+	}
+	cv, ok := raw.(authapi.ClaimsValidator)
+	if !ok {
+		if logger != nil {
+			logger.Warn("recording HTTP transport: auth.ClaimsValidator wrong type — JWT middleware skipped",
+				zap.String("got_type", fmt.Sprintf("%T", raw)))
+		}
+		return nil
+	}
+	return cv
+}
+
+// lookupRBACChecker returns the auth RBACChecker from the locator, or nil
+// if absent. Plan 12.3 transport currently uses transport-level requireRole
+// only; this is wired for future fine-grained checks. nil is acceptable.
+func lookupRBACChecker(loc modules.ServiceLocator, logger *zap.Logger) authapi.RBACChecker {
+	if loc == nil {
+		return nil
+	}
+	raw, ok := loc.Lookup(authmod.LocatorRBACChecker)
+	if !ok {
+		return nil
+	}
+	rb, _ := raw.(authapi.RBACChecker)
+	return rb
 }
