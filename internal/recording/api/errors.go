@@ -17,4 +17,11 @@ var (
 	ErrInvalidInput = errors.New("recording: invalid input")
 	// ErrIntegrityFailed is returned by VerifyChecksum when the recomputed sha256 does not match.
 	ErrIntegrityFailed = errors.New("recording: integrity check failed")
+	// ErrLifecycleConflict is returned when a lifecycle worker observes a
+	// concurrent state change that invalidates its planned action — e.g. a
+	// row was admin-reverted from cold→stored between sweep and apply, or a
+	// legal-hold flag was raised after the worker enqueued a delete. This
+	// is distinct from a benign no-op (covered by 0 rowsAffected on a
+	// status-CAS UPDATE) and signals the worker should re-read the row.
+	ErrLifecycleConflict = errors.New("recording: lifecycle conflict")
 )
