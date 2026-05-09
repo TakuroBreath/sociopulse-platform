@@ -28,4 +28,12 @@ var (
 	// by Send-style helpers that surface drops back to the caller; the public
 	// Connection.Send swallows it and only increments the dropped counter.
 	ErrSlowConsumer = errors.New("realtime: slow consumer (frame dropped)")
+	// ErrCrossTenantSubscribe is returned when TopicRBAC.Allow detects
+	// that a SubscriptionFilter UUID (OperatorID, ProjectID) belongs
+	// to a tenant other than the subscriber's claims.TenantID. Defence-
+	// in-depth — Hub.Broadcast already filters by tenant, but a
+	// cross-tenant subscribe attempt is a security signal we want to
+	// surface (the subscriber should never have observed the foreign
+	// UUID in the first place).
+	ErrCrossTenantSubscribe = errors.New("realtime: cross-tenant subscription denied")
 )

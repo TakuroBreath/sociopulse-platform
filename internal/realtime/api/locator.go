@@ -33,4 +33,15 @@ const (
 	// Redis-less test setups the locator entry is absent and the
 	// handler short-circuits to a no-op presence layer.
 	LocatorPresenceTracker = "realtime.PresenceTracker"
+
+	// LocatorUserResolver is the locator key for the realtime
+	// UserResolver. cmd/api populates this BEFORE realtime.Module.Register
+	// runs by adapting auth.UserStore — preserves the scope rule that
+	// internal/realtime/* does not import internal/auth/*.
+	LocatorUserResolver = "realtime.UserResolver"
+
+	// LocatorProjectResolver is the locator key for the realtime
+	// ProjectResolver. cmd/api adapts crm.ProjectService → ProjectResolver
+	// and registers it under this key BEFORE realtime.Module.Register.
+	LocatorProjectResolver = "realtime.ProjectResolver"
 )

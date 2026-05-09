@@ -71,3 +71,44 @@ type ListenInService interface {
 	// List returns the active sessions for the tenant.
 	List(ctx context.Context, tenantID string) ([]*ListenSession, error)
 }
+
+// ResolvedTenant is the projection of an entity (user, project, call)
+// that resolver ports return. The TenantID field is the cross-check
+// target: TopicRBAC.Allow rejects a subscription when the resolved
+// TenantID does not match the subscriber's claims.TenantID.
+type ResolvedTenant struct {
+	// TenantID is the entity's owning tenant. Returned as a string to
+	// match the existing realtime/api convention (Claims.TenantID is a
+	// string; Hub.Broadcast filters use string TenantID).
+	TenantID string
+}
+
+// UserResolver maps a user_id to its tenant. Used by TopicRBAC.Allow
+// to reject `notifications.user` / `op.commands` subscriptions whose
+// filter.OperatorID belongs to a different tenant than the
+// subscriber's claims.
+//
+// Implementations MUST return an error (ErrCrossTenantSubscribe-folded
+// at the RBAC layer) when the user does not exist; TopicRBAC treats
+// not-found the same as cross-tenant — both are a "you cannot
+// subscribe" signal — so the wire response is identical and the
+// client can't probe user existence cross-tenant.
+type UserResolver interface {
+	// Get resolves user_id to its owning tenant. Returns an error
+	// when the user is not resolvable. ctx-aware so the realtime
+	// layer can bound the resolve under its handshake/subscribe
+	// deadline.
+	Get(ctx context.Context, userID string) (ResolvedTenant, error)
+}
+
+// ProjectResolver maps a project_id to its tenant. Used by
+// TopicRBAC.Allow to reject `operators.state` subscriptions whose
+// filter.ProjectID belongs to a different tenant.
+//
+// Same not-found semantics as UserResolver — the realtime layer
+// folds not-found into cross-tenant rejection.
+type ProjectResolver interface {
+	// Get resolves project_id to its owning tenant. Returns an
+	// error when the project is not resolvable.
+	Get(ctx context.Context, projectID string) (ResolvedTenant, error)
+}
