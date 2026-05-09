@@ -33,11 +33,9 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
-	"github.com/nats-io/nats.go"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
@@ -176,35 +174,39 @@ func run(ctx context.Context, opts runOptions) error {
 	//    health and metrics endpoints get observed too.
 	metrics := observability.NewMetrics(cfg)
 
-	// 5. NATS connection. RetryOnFailedConnect lets the bridge boot even
-	//    when the NATS cluster is briefly unreachable; readyz reports the
-	//    actual state on every probe.
-	nc, err := nats.Connect(joinURLs(cfg.NATS.URLs),
-		nats.Name(serviceName),
-		nats.RetryOnFailedConnect(true),
-		nats.MaxReconnects(-1),
-		nats.ReconnectWait(2*time.Second),
-		nats.DisconnectErrHandler(func(_ *nats.Conn, err error) {
-			logger.Warn("nats disconnected", zap.Error(err))
-		}),
-		nats.ReconnectHandler(func(c *nats.Conn) {
-			logger.Info("nats reconnected", zap.String("url", c.ConnectedUrl()))
-		}),
-		nats.ClosedHandler(func(c *nats.Conn) {
-			logger.Info("nats closed", zap.String("last_err", errString(c.LastError())))
-		}),
-	)
-	if err != nil {
-		return fmt.Errorf("connect nats: %w", err)
+	// 5. NATS publisher + subscriber. Best-effort (mirrors cmd/api): a
+	//    connection failure logs WARN, the bridge skips Bridge.Start, and
+	//    /readyz keeps reporting the actual NATS state on every probe so
+	//    operators see the degraded mode immediately.
+	natsPub, natsSub, natsErr := openNATS(ctx, cfg, logger)
+	if natsErr != nil {
+		logger.Warn("nats unreachable; bridge will not subscribe/publish",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+			zap.Error(natsErr),
+		)
+	} else {
+		logger.Info("nats publisher + subscriber up",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+		)
 	}
-	defer func() {
-		// Drain finishes in-flight messages before close; preferred over
-		// nc.Close() at SIGTERM. If Drain fails (already-closed, etc.),
-		// log and move on — Close is idempotent.
-		if err := nc.Drain(); err != nil && !errors.Is(err, nats.ErrConnectionClosed) {
-			logger.Warn("nats drain", zap.Error(err))
-		}
-	}()
+	// Defer close in LIFO order — see step 11 below for the full chain.
+	// Publisher closes LAST (4th), Subscriber 3rd, Bridge.Stop 2nd,
+	// Bridge.Drain FIRST so in-flight commands complete before cmd
+	// subscriptions tear down.
+	if natsPub != nil {
+		defer func() {
+			if err := natsPub.Close(); err != nil {
+				logger.Warn("nats publisher close", zap.Error(err))
+			}
+		}()
+	}
+	if natsSub != nil {
+		defer func() {
+			if err := natsSub.Close(); err != nil {
+				logger.Warn("nats subscriber close", zap.Error(err))
+			}
+		}()
+	}
 
 	// 6. Redis client. ParseURL accepts both redis:// and rediss:// — the
 	//    DSN is built from cfg.Database.Redis.{Addr,Password,DB} so the
@@ -268,20 +270,39 @@ func run(ctx context.Context, opts runOptions) error {
 	}
 	defer rt.Stop()
 
-	bridge := nats_bridge.New(nats_bridge.Config{
-		NATS:   nc,
-		Pool:   eslPool,
-		Router: rt,
-		Redis:  rdb,
-		Logger: logger.Named("nats_bridge"),
-	})
-	if err := bridge.Start(ctx); err != nil {
-		return fmt.Errorf("start nats bridge: %w", err)
+	// Bridge composition. When NATS is up we wire the real bridge and
+	// Start it; when NATS is down we leave bridge nil (the /healthz +
+	// /readyz + /metrics surfaces still work, the bridge just doesn't
+	// subscribe to commands or publish events). The Stop/Drain defers
+	// below nil-guard so the missing-bridge path doesn't panic.
+	var bridge *nats_bridge.Bridge
+	if natsPub != nil && natsSub != nil {
+		nbMetrics := nats_bridge.RegisterMetrics(metrics.Registry)
+		b, err := nats_bridge.New(nats_bridge.Config{
+			NATSPublisher:  natsPub,
+			NATSSubscriber: natsSub,
+			Pool:           eslPool,
+			Router:         rt,
+			Redis:          rdb,
+			Logger:         logger.Named("nats_bridge"),
+			Metrics:        nbMetrics,
+		})
+		if err != nil {
+			return fmt.Errorf("init nats bridge: %w", err)
+		}
+		if err := b.Start(ctx); err != nil {
+			return fmt.Errorf("start nats bridge: %w", err)
+		}
+		bridge = b
 	}
 	// Stop is the abrupt path; Drain is the graceful path. The shutdown
 	// handler (below) calls Drain before returning, after which Stop is a
 	// no-op safety net.
-	defer bridge.Stop()
+	defer func() {
+		if bridge != nil {
+			bridge.Stop()
+		}
+	}()
 
 	// Reconciler (Plan 09 Task 6). Periodic sweep that aligns the Redis
 	// op:active_channels counter to FS truth via `api show channels count`.
@@ -307,10 +328,15 @@ func run(ctx context.Context, opts runOptions) error {
 
 	// 9. HTTP servers. Two gin engines so /metrics scrape traffic stays
 	//    isolated from /healthz public probes (matches cmd/api's split).
+	//    NATSCheck is only registered when the publisher came up — the
+	//    fallback path with no NATS would otherwise mask a misconfig as
+	//    a permanent /readyz 503 with no actionable signal.
 	checks := []healthz.Checker{
-		healthchecks.NATSCheck{Conn: natsConnAdapter{nc}},
 		healthchecks.RedisCheck{Client: redisPinger{rdb}},
 		eslPoolCheck{pool: eslPool},
+	}
+	if natsPub != nil {
+		checks = append(checks, healthchecks.NATSCheck{Conn: natsPub})
 	}
 	healthSrv := buildHealthServer(opts.HealthAddr, cfg, logger, tracer, metrics, checks) //nolint:contextcheck // server inherits ctx via gin handlers, not caller
 	metricsSrv := buildMetricsServer(cfg, metrics)
@@ -369,13 +395,17 @@ func run(ctx context.Context, opts runOptions) error {
 		//nolint:contextcheck // detached ctx is intentional for graceful drain
 		shutdownServer(mctx, metricsSrv, "metrics", logger)
 
-		// Drain the bridge with the same grace budget. Tasks 2/3 fill in
-		// the real subscription cleanup; the skeleton no-ops.
+		// Drain the bridge with the same grace budget. Bridge nil-safe
+		// because the NATS-down boot path leaves it nil; the cmd
+		// subscriptions tear down via subscriber.Close after this defer
+		// runs (LIFO order — see openNATS defers above).
 		bctx, bcancel := context.WithTimeout(context.Background(), cfg.Shutdown.GracePeriod)
 		defer bcancel()
-		//nolint:contextcheck // detached ctx is intentional for graceful drain
-		if err := bridge.Drain(bctx); err != nil {
-			logger.Warn("bridge drain", zap.Error(err))
+		if bridge != nil {
+			//nolint:contextcheck // detached ctx is intentional for graceful drain
+			if err := bridge.Drain(bctx); err != nil {
+				logger.Warn("bridge drain", zap.Error(err))
+			}
 		}
 		return nil
 	})
@@ -385,16 +415,6 @@ func run(ctx context.Context, opts runOptions) error {
 	}
 	logger.Info("cmd/telephony-bridge shutdown complete")
 	return nil
-}
-
-// joinURLs flattens cfg.NATS.URLs into the comma-separated form
-// nats.Connect understands. Empty list yields nats.DefaultURL so the boot
-// path remains usable in dev tests.
-func joinURLs(urls []string) string {
-	if len(urls) == 0 {
-		return nats.DefaultURL
-	}
-	return strings.Join(urls, ",")
 }
 
 // nodeAddrs flattens config.FSNode -> ESLEndpoint slice.
@@ -424,14 +444,4 @@ func openRedis(cfg config.Config) (*redis.Client, error) {
 		DB:       cfg.Database.Redis.DB,
 		PoolSize: cfg.Database.Redis.PoolSize,
 	}), nil
-}
-
-// errString safely stringifies an optional error for log fields. The NATS
-// callbacks pass nil sometimes; zap.Error(nil) is fine but the explicit
-// helper makes the closure intent clear.
-func errString(err error) string {
-	if err == nil {
-		return ""
-	}
-	return err.Error()
 }

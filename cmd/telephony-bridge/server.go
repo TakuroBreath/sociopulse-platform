@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
-	"github.com/nats-io/nats.go"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"go.opentelemetry.io/otel/trace"
@@ -163,20 +162,3 @@ func (e eslPoolCheck) Check(_ context.Context) error {
 	}
 	return nil
 }
-
-// natsConnAdapter narrows *nats.Conn to the healthchecks.NATSConn surface.
-// healthz/checks declares Status() int — its tests stub a fake — but the
-// real *nats.Conn returns the strongly-typed nats.Status enum. The adapter
-// shifts the enum into its underlying int representation so the check can
-// embed the numeric status in error output.
-type natsConnAdapter struct {
-	c *nats.Conn
-}
-
-// IsConnected satisfies healthchecks.NATSConn.
-func (a natsConnAdapter) IsConnected() bool { return a.c.IsConnected() }
-
-// Status satisfies healthchecks.NATSConn by widening nats.Status (an int
-// alias) into a plain int. The underlying value matches the numeric enum
-// documented on healthchecks.NATSCheck.
-func (a natsConnAdapter) Status() int { return int(a.c.Status()) }
