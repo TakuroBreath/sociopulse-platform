@@ -48,6 +48,21 @@ type RecordingConfig struct {
 	FFmpeg          RecordingFFmpeg    `mapstructure:"ffmpeg"`
 	Upload          RecordingUpload    `mapstructure:"upload"`
 	Retention       RecordingRetention `mapstructure:"retention"`
+
+	// LocalKEKs is a map of kms_key_id → hex-encoded 32-byte KEK plaintext.
+	// Used by the Local DEKUnwrapper for dev/test environments without
+	// access to Yandex Cloud KMS. Production deployments either build with
+	// -tags=yandex_kms (which routes through the Yandex SDK adapter — Plan
+	// 01) OR populate this with a platform-wide test KEK for non-prod
+	// investigations. Keys are hex-encoded so config can be edited safely
+	// in YAML / .env files.
+	//
+	// Format example (config.yaml):
+	//
+	//	recording:
+	//	  local_keks:
+	//	    kek-platform-test: "0000000000...000"  # 64 hex chars
+	LocalKEKs map[string]string `mapstructure:"local_keks"`
 }
 
 // RecordingFFmpeg is the encoder configuration the local recorder hands to

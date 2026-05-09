@@ -150,6 +150,11 @@ recording:
     default_hot_days: 365
     default_cold_days: 730
     cold_storage_class: COLD
+  # local_keks: map of kms_key_id → 64-char hex-encoded 32-byte KEK.
+  # Populate this in dev/test to enable OpenAudioStream without Yandex
+  # KMS. Leave empty (default) when Plan 01's Yandex adapter is in use.
+  # local_keks:
+  #   kek-platform-test: "0000000000000000000000000000000000000000000000000000000000000000"
 
 reports:
   async_threshold_period_days: 30

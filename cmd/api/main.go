@@ -279,9 +279,21 @@ func run(ctx context.Context, configDir string) error {
 	// walk. The gRPC façade is gated by cfg.Recording.Enabled — when
 	// false (the dev default) the module registers RecordingService
 	// in the locator but skips the listener.
+	//
+	// Plan 12.2 Task 5 — wire Local* ports for DEK unwrap + object
+	// storage. recordingPorts hex-decodes the KEK map from config and
+	// fails boot fast on bad hex or wrong key length. An empty KEK
+	// map is non-fatal — OpenAudioStream will fail at the KMS step
+	// until Plan 01 wires the real Yandex adapter.
+	recordingDEK, recordingObjects, err := recordingPorts(cfg.Recording, logger.Named("recording"))
+	if err != nil {
+		return fmt.Errorf("recording ports: %w", err)
+	}
 	recordingModule := recording.New(recording.Config{
-		Registerer: metrics.Registry,
-		GRPCConfig: recordingGRPCConfig(cfg.Recording),
+		Registerer:   metrics.Registry,
+		GRPCConfig:   recordingGRPCConfig(cfg.Recording),
+		DEKUnwrapper: recordingDEK,      // NEW
+		ObjectStore:  recordingObjects,  // NEW
 	})
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},

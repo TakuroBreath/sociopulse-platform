@@ -36,9 +36,11 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/sociopulse/platform/internal/modules"
+	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/grpcserver"
 	"github.com/sociopulse/platform/internal/recording/metrics"
 	"github.com/sociopulse/platform/internal/recording/service"
+	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/recording/store"
 )
 
@@ -60,6 +62,18 @@ const LocatorRecordingService = "recording.RecordingService"
 type Config struct {
 	Registerer prometheus.Registerer
 	GRPCConfig *grpcserver.Config
+
+	// DEKUnwrapper unwraps envelope-encrypted DEKs during OpenAudioStream.
+	// Required for OpenAudioStream — when nil, OpenAudioStream returns
+	// ErrInvalidInput "not wired" but Commit / Get continue to work. The
+	// production binary supplies a Yandex KMS-backed implementation (Plan
+	// 01); dev/test uses crypto.LocalDEKUnwrapper.
+	DEKUnwrapper crypto.DEKUnwrapper
+
+	// ObjectStore is the object-storage backend OpenAudioStream reads from.
+	// Same nil-tolerant semantics as DEKUnwrapper. Production uses Yandex
+	// Object Storage (Plan 01); dev/test uses storage.LocalObjectStore.
+	ObjectStore storage.ObjectStore
 }
 
 // Module is the top-level registration handle for the recording
@@ -134,6 +148,10 @@ func (m *Module) Register(d modules.Deps) error {
 		Store:   pgStore,
 		Logger:  logger,
 		Metrics: rmetrics,
+		KMS:     m.cfg.DEKUnwrapper, // NEW
+		Objects: m.cfg.ObjectStore,  // NEW
+		// Decryptor uses the default (crypto.NewAESGCMDecryptor()) since
+		// there is no production-vs-test variant — it's pure Go.
 	})
 	if d.Locator != nil {
 		d.Locator.Register(LocatorRecordingService, svc)
