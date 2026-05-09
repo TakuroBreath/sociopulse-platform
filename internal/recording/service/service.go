@@ -1,21 +1,28 @@
 // Package service implements the recording module's RecordingService.
-// Plan 12.1 (Foundation): Commit + Get only. Search / OpenAudioStream /
-// VerifyChecksum return wrapped api.ErrInvalidInput with the marker
-// "not implemented in foundation phase" until Plan 12.2 / 12.3.
+// Plan 12.1 (Foundation): Commit + Get implemented; Search / VerifyChecksum
+// return wrapped api.ErrInvalidInput with the marker "not implemented in
+// foundation phase" until Plan 12.3.
+// Plan 12.2 Task 4: OpenAudioStream is wired to the crypto + storage ports
+// (AudioDecryptor, DEKUnwrapper, ObjectStore) and writes a recording.accessed
+// audit row + access metrics on every call.
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	rapi "github.com/sociopulse/platform/internal/recording/api"
+	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/metrics"
+	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/recording/store"
 	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/postgres"
@@ -29,6 +36,7 @@ var (
 	ErrCallNotFound   = rapi.ErrCallNotFound
 	ErrNotFound       = rapi.ErrNotFound
 	ErrTenantMismatch = rapi.ErrTenantMismatch
+	ErrAlreadyDeleted = rapi.ErrAlreadyDeleted
 )
 
 const (
@@ -39,20 +47,32 @@ const (
 
 // Deps wires the service. Pool + Store are required. Logger and Metrics
 // may be nil — the implementation is nil-safe.
+//
+// Plan 12.2 Task 4 added the crypto + storage ports:
+//   - Decryptor defaults to crypto.NewAESGCMDecryptor() when nil.
+//   - KMS and Objects have no defaults; OpenAudioStream returns
+//     ErrInvalidInput ("not wired") if either is nil. The Commit / Get
+//     paths do not need them.
 type Deps struct {
-	Pool    *postgres.Pool
-	Store   *store.PostgresStore
-	Outbox  outbox.Writer
-	Logger  *zap.Logger
-	Metrics *metrics.RecordingMetrics
+	Pool      *postgres.Pool
+	Store     *store.PostgresStore
+	Outbox    outbox.Writer
+	Logger    *zap.Logger
+	Metrics   *metrics.RecordingMetrics
+	Decryptor crypto.AudioDecryptor
+	KMS       crypto.DEKUnwrapper
+	Objects   storage.ObjectStore
 }
 
 type svc struct {
-	pool    *postgres.Pool
-	store   *store.PostgresStore
-	outbox  outbox.Writer
-	logger  *zap.Logger
-	metrics *metrics.RecordingMetrics
+	pool      *postgres.Pool
+	store     *store.PostgresStore
+	outbox    outbox.Writer
+	logger    *zap.Logger
+	metrics   *metrics.RecordingMetrics
+	decryptor crypto.AudioDecryptor
+	kms       crypto.DEKUnwrapper
+	objects   storage.ObjectStore
 }
 
 // Compile-time interface check — guards against contract drift.
@@ -67,12 +87,18 @@ func New(d Deps) rapi.RecordingService {
 	if d.Outbox == nil {
 		d.Outbox = outbox.NewPostgresWriter()
 	}
+	if d.Decryptor == nil {
+		d.Decryptor = crypto.NewAESGCMDecryptor()
+	}
 	return &svc{
-		pool:    d.Pool,
-		store:   d.Store,
-		outbox:  d.Outbox,
-		logger:  d.Logger,
-		metrics: d.Metrics,
+		pool:      d.Pool,
+		store:     d.Store,
+		outbox:    d.Outbox,
+		logger:    d.Logger,
+		metrics:   d.Metrics,
+		decryptor: d.Decryptor,
+		kms:       d.KMS,
+		objects:   d.Objects,
 	}
 }
 
@@ -207,8 +233,83 @@ func (s *svc) Search(_ context.Context, _ uuid.UUID, _ rapi.SearchQuery) (rapi.S
 	return rapi.SearchResult{}, fmt.Errorf("%w: Search not implemented in foundation phase", ErrInvalidInput)
 }
 
-func (s *svc) OpenAudioStream(_ context.Context, _, _ uuid.UUID, _ *rapi.ByteRange) (rapi.AudioStream, error) {
-	return rapi.AudioStream{}, fmt.Errorf("%w: OpenAudioStream not implemented in foundation phase", ErrInvalidInput)
+// OpenAudioStream returns a streamed, decrypted reader for the audio.
+// byteRange is IGNORED in v1 — Plan 12.3 sets Accept-Ranges: none.
+// Future v2 chunked-envelope format will support ranges natively.
+//
+// Pipeline:
+//  1. Lookup row by (tenantID, callID).
+//  2. Bail if status == 'deleted'.
+//  3. Unwrap DEK via the KMS port, AAD = tenant_id bytes.
+//  4. GET ciphertext stream from object store.
+//  5. AES-GCM decrypt with AAD = tenant_id bytes (full-buffer for v1).
+//  6. Write recording.accessed audit row (failure → log + metric, NOT a hard fail).
+//  7. Return AudioStream with bytes.Reader over plaintext.
+func (s *svc) OpenAudioStream(ctx context.Context, tenantID, callID uuid.UUID, _ *rapi.ByteRange) (rapi.AudioStream, error) {
+	if s.kms == nil || s.objects == nil {
+		return rapi.AudioStream{}, fmt.Errorf("%w: recording crypto/storage not wired", ErrInvalidInput)
+	}
+
+	start := time.Now()
+	tenantLabel := tenantID.String()
+
+	row, err := s.store.GetByCallID(ctx, tenantID, callID)
+	if errors.Is(err, store.ErrCallNotFound) {
+		s.metrics.ObserveAccess(tenantLabel, "not_found", time.Since(start).Seconds())
+		return rapi.AudioStream{}, ErrNotFound
+	}
+	if err != nil {
+		s.metrics.ObserveAccess(tenantLabel, "error", time.Since(start).Seconds())
+		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio: %w", err)
+	}
+	if row.Status == "deleted" {
+		s.metrics.ObserveAccess(tenantLabel, "deleted", time.Since(start).Seconds())
+		return rapi.AudioStream{}, ErrAlreadyDeleted
+	}
+
+	aad := []byte(row.TenantID.String())
+
+	dekPlain, err := s.kms.DecryptDEK(ctx, row.KMSKeyID, row.EncryptedDEK, aad)
+	if err != nil {
+		s.metrics.ObserveAccess(tenantLabel, "kms_error", time.Since(start).Seconds())
+		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio.kms: %w", err)
+	}
+	defer zeroBytes(dekPlain)
+
+	rc, err := s.objects.Get(ctx, row.S3Bucket, row.AudioObjectKey)
+	if err != nil {
+		s.metrics.ObserveAccess(tenantLabel, "object_error", time.Since(start).Seconds())
+		if errors.Is(err, storage.ErrObjectNotFound) {
+			return rapi.AudioStream{}, ErrNotFound // hide storage shape from API consumers
+		}
+		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio.object: %w", err)
+	}
+	defer rc.Close()
+
+	plain, err := s.decryptor.Decrypt(ctx, dekPlain, rc, row.BytesSize, aad)
+	if err != nil {
+		s.metrics.ObserveAccess(tenantLabel, "decrypt_error", time.Since(start).Seconds())
+		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio.decrypt: %w", err)
+	}
+
+	if err := s.writeAccessAudit(ctx, row); err != nil {
+		// Audit failure must NOT block playback — log + tick + continue.
+		s.logger.Warn("recording access audit failed",
+			zap.String("tenant_id", tenantLabel),
+			zap.String("call_id", callID.String()),
+			zap.Error(err))
+		s.metrics.ObserveAccess(tenantLabel, "audit_failed", time.Since(start).Seconds())
+	} else {
+		s.metrics.ObserveAccess(tenantLabel, "ok", time.Since(start).Seconds())
+	}
+
+	return rapi.AudioStream{
+		Reader:        io.NopCloser(bytes.NewReader(plain)),
+		ContentType:   contentTypeForCodec(row.Codec),
+		ContentLength: int64(len(plain)),
+		StartOffset:   0,
+		EndOffset:     int64(len(plain)) - 1,
+	}, nil
 }
 
 func (s *svc) VerifyChecksum(_ context.Context, _, _ uuid.UUID) (rapi.VerifyResult, error) {
@@ -331,6 +432,69 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 		r.CommittedAt,
 	)
 	return err
+}
+
+// contentTypeForCodec returns the canonical MIME for our supported codecs.
+// "opus" / "opus-32" → audio/ogg (OGG container is the in-storage wrapping
+// the ingest-uploader produces). Anything else falls back to a generic
+// octet-stream so an HTTP layer doesn't fabricate a misleading Content-Type.
+func contentTypeForCodec(codec string) string {
+	switch codec {
+	case "opus", "opus-32":
+		return "audio/ogg"
+	default:
+		return "application/octet-stream"
+	}
+}
+
+// zeroBytes overwrites the buffer with zeros. Best-effort hygiene against
+// the DEK plaintext lingering in heap memory longer than necessary. Go's
+// GC may still hold a copy; cryptographic claims here are weak.
+func zeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
+}
+
+// writeAccessAudit appends an audit_log row recording who fetched what.
+// Single-statement INSERT inside WithTenant — caller doesn't need
+// rollback semantics (playback proceeds even on audit failure).
+//
+// Mirrors the column order in writeAuditRow above so the schema-shape
+// (verified during Plan 12.1 Task 4) stays consistent across both
+// audit emitters from this service.
+//   - actor_kind = 'service' (service actor, not a user)
+//   - actor_user_id = nil (service actor has no user uuid)
+//   - target_id is text — pass r.ID.String()
+//   - ts = now() server-side so the audit row's stamp is the time the
+//     audit was committed, not the time the recording was originally made.
+func (s *svc) writeAccessAudit(ctx context.Context, r store.RecordingRow) error {
+	payload, err := json.Marshal(map[string]any{
+		"recording_id":     r.ID,
+		"call_id":          r.CallID,
+		"audio_object_key": r.AudioObjectKey,
+		"bytes_size":       r.BytesSize,
+		"sha256":           r.SHA256Hex,
+	})
+	if err != nil {
+		return fmt.Errorf("marshal audit payload: %w", err)
+	}
+	return s.pool.WithTenant(ctx, r.TenantID, func(tx postgres.Tx) error {
+		const q = `
+INSERT INTO audit_log (tenant_id, actor_kind, actor_user_id, action, target_kind, target_id, payload, ts)
+VALUES ($1, $2, $3, $4, $5, $6, $7, now())
+`
+		_, err := tx.Exec(ctx, q,
+			r.TenantID,
+			auditActorKindIngest, // 'service'
+			nil,                  // actor_user_id — service actor has no user uuid
+			rapi.AuditActionAccessed,
+			"recording",
+			r.ID.String(), // target_id is text
+			payload,
+		)
+		return err
+	})
 }
 
 func buildOutboxEvent(r store.RecordingRow) (outbox.Event, error) {

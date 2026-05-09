@@ -4,7 +4,9 @@ package service_test
 
 import (
 	"context"
+	"crypto/rand"
 	"errors"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -22,9 +24,12 @@ import (
 	"go.uber.org/zap/zaptest"
 
 	rapi "github.com/sociopulse/platform/internal/recording/api"
+	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/metrics"
 	"github.com/sociopulse/platform/internal/recording/service"
+	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/recording/store"
+	"github.com/sociopulse/platform/pkg/encryption"
 	"github.com/sociopulse/platform/pkg/postgres"
 )
 
@@ -157,13 +162,19 @@ func TestService_Search_NotImplemented(t *testing.T) {
 	require.Contains(t, err.Error(), "not implemented in foundation phase")
 }
 
-func TestService_OpenAudioStream_NotImplemented(t *testing.T) {
+// TestService_OpenAudioStream_NotWired covers the same scenario the old
+// foundation-phase TestService_OpenAudioStream_NotImplemented test did —
+// service constructed without KMS / Objects ports, expected to fail fast
+// without touching DB or storage. The stub branch's marker text changed
+// from "not implemented in foundation phase" to "not wired" once the real
+// implementation landed in Plan 12.2 Task 4.
+func TestService_OpenAudioStream_NotWired(t *testing.T) {
 	t.Parallel()
 	svc := newStubService(t)
 
 	_, err := svc.OpenAudioStream(t.Context(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), nil)
 	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
-	require.Contains(t, err.Error(), "not implemented in foundation phase")
+	require.Contains(t, err.Error(), "not wired")
 }
 
 func TestService_VerifyChecksum_NotImplemented(t *testing.T) {
@@ -183,6 +194,128 @@ func newStubService(t *testing.T) rapi.RecordingService {
 	return service.New(service.Deps{})
 }
 
+// ────────── OpenAudioStream tests (Plan 12.2 Task 4) ──────────
+
+func TestService_OpenAudioStream_HappyPath(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callID := seedCall(t, pool)
+
+	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
+	audio := []byte("hello recording audio bytes")
+	recordingID, plaintext := commitRecordingWithEncrypted(t, svc, objects, kek, tenantID, callID, audio)
+
+	stream, err := svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
+	require.NoError(t, err)
+	require.NotNil(t, stream.Reader)
+	t.Cleanup(func() { _ = stream.Reader.Close() })
+
+	got, err := io.ReadAll(stream.Reader)
+	require.NoError(t, err)
+	require.Equal(t, plaintext, got)
+
+	require.Equal(t, "audio/ogg", stream.ContentType)
+	require.Equal(t, int64(len(plaintext)), stream.ContentLength)
+
+	// Audit row must exist for recording.accessed.
+	requireExactlyOneAuditRow(t, pool, tenantID, recordingID, "recording.accessed")
+}
+
+func TestService_OpenAudioStream_NotFound(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID := seedTenant(t, pool)
+	svc, _, _, _ := buildServiceWithCrypto(t, pool)
+
+	_, err := svc.OpenAudioStream(t.Context(), tenantID, uuid.Must(uuid.NewV7()), nil)
+	require.True(t, errors.Is(err, rapi.ErrNotFound),
+		"expected ErrNotFound, got %v", err)
+}
+
+func TestService_OpenAudioStream_AlreadyDeleted(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callID := seedCall(t, pool)
+	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
+	commitRecordingWithEncrypted(t, svc, objects, kek, tenantID, callID, []byte("audio"))
+
+	// Manually update status='deleted' via WithTenant tx so the RLS-protected
+	// row is reachable from the test caller.
+	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
+		_, err := tx.Exec(t.Context(),
+			`UPDATE call_recordings SET status='deleted' WHERE call_id = $1`, callID)
+		return err
+	}))
+
+	_, err := svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
+	require.True(t, errors.Is(err, rapi.ErrAlreadyDeleted),
+		"expected ErrAlreadyDeleted, got %v", err)
+}
+
+func TestService_OpenAudioStream_KMSWrongAAD(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callID := seedCall(t, pool)
+	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
+
+	// Encrypt the DEK with WRONG aad to simulate a corrupted record.
+	// At Open time the service's AAD = tenant_id won't match, so the
+	// LocalDEKUnwrapper returns ErrDecryptFailed and the service maps
+	// that into "kms_error" + a wrapped error containing "kms".
+	aad := []byte("wrong-aad-not-tenant-id")
+	dek := make([]byte, 32)
+	_, err := rand.Read(dek)
+	require.NoError(t, err)
+	encryptedDEK, err := encryption.Encrypt(kek, dek, aad)
+	require.NoError(t, err)
+
+	// Commit with the wrongly-AAD'd encryptedDEK — Commit accepts it
+	// (it doesn't unwrap). OpenAudioStream will fail at the KMS step.
+	in := newCommitInput(t, tenantID, callID)
+	in.S3Bucket = "rec-bucket-test"
+	in.AudioObjectKey = "k.opus.enc"
+	in.KMSKeyID = "kek-test"
+	in.EncryptedDEK = encryptedDEK
+	in.BytesSize = 1024 // doesn't matter — we'll fail before reading
+	_, err = svc.Commit(t.Context(), in)
+	require.NoError(t, err)
+	objects.PutBytes(in.S3Bucket, in.AudioObjectKey, make([]byte, 1024))
+
+	_, err = svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "kms",
+		"error message should reference the KMS step; got %v", err)
+}
+
+func TestService_OpenAudioStream_ObjectMissing(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callID := seedCall(t, pool)
+	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
+
+	// Commit normally but DO NOT seed objects — the Get will miss.
+	aad := []byte(tenantID.String())
+	dek := make([]byte, 32)
+	_, err := rand.Read(dek)
+	require.NoError(t, err)
+	encryptedDEK, err := encryption.Encrypt(kek, dek, aad)
+	require.NoError(t, err)
+
+	in := newCommitInput(t, tenantID, callID)
+	in.S3Bucket = "rec-bucket-test"
+	in.AudioObjectKey = "missing.opus.enc"
+	in.KMSKeyID = "kek-test"
+	in.EncryptedDEK = encryptedDEK
+	in.BytesSize = 1024
+	_, err = svc.Commit(t.Context(), in)
+	require.NoError(t, err)
+	_ = objects // unused — intentionally not seeded
+
+	_, err = svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
+	require.True(t, errors.Is(err, rapi.ErrNotFound),
+		"ErrObjectNotFound MUST be hidden behind ErrNotFound; got %v", err)
+}
+
 // ────────── helpers ──────────
 
 func buildService(t *testing.T, pool *postgres.Pool) rapi.RecordingService {
@@ -196,6 +329,86 @@ func buildService(t *testing.T, pool *postgres.Pool) rapi.RecordingService {
 		Logger:  zaptest.NewLogger(t),
 		Metrics: met,
 	})
+}
+
+// buildServiceWithCrypto wires the recording service with the
+// LocalDEKUnwrapper + LocalObjectStore + AESGCMDecryptor primitives so
+// OpenAudioStream can run end-to-end against a real DB. Returns the svc
+// plus the live KMS / Objects / KEK so per-test setup can seed wrapped
+// DEKs and ciphertext using the SAME KEK.
+func buildServiceWithCrypto(t *testing.T, pool *postgres.Pool) (rapi.RecordingService, *crypto.LocalDEKUnwrapper, *storage.LocalObjectStore, []byte) {
+	t.Helper()
+	pgStore := store.NewPostgresStore(pool)
+	met, err := metrics.RegisterRecordingMetrics(nil) // nil reg — tests don't run a prom server
+	require.NoError(t, err)
+
+	kek := make([]byte, 32)
+	_, err = rand.Read(kek)
+	require.NoError(t, err)
+	kms := crypto.NewLocalDEKUnwrapper(map[string][]byte{"kek-test": kek})
+	objects := storage.NewLocalObjectStore()
+
+	svc := service.New(service.Deps{
+		Pool:      pool,
+		Store:     pgStore,
+		Logger:    zaptest.NewLogger(t),
+		Metrics:   met,
+		Decryptor: crypto.NewAESGCMDecryptor(),
+		KMS:       kms,
+		Objects:   objects,
+	})
+	return svc, kms, objects, kek
+}
+
+// commitRecordingWithEncrypted builds an end-to-end seeded recording.
+//  1. Generate a random DEK (32 bytes).
+//  2. Wrap DEK under the test KEK with AAD = tenant_id (this is what
+//     the ingest-uploader does in production via Yandex KMS).
+//  3. Encrypt the audio payload with the DEK + AAD = tenant_id.
+//  4. Seed LocalObjectStore with the ciphertext at the row's
+//     audio_object_key.
+//  5. Call svc.Commit with the wrapped DEK to register the recording.
+//
+// Returns the recordingID + the original plaintext (for assertion).
+func commitRecordingWithEncrypted(
+	t *testing.T,
+	svc rapi.RecordingService,
+	objects *storage.LocalObjectStore,
+	kek []byte,
+	tenantID, callID uuid.UUID,
+	audio []byte,
+) (uuid.UUID, []byte) {
+	t.Helper()
+
+	aad := []byte(tenantID.String())
+
+	// 1+2: generate DEK, wrap under KEK.
+	dek := make([]byte, 32)
+	_, err := rand.Read(dek)
+	require.NoError(t, err)
+	encryptedDEK, err := encryption.Encrypt(kek, dek, aad)
+	require.NoError(t, err)
+
+	// 3: encrypt audio under DEK.
+	ciphertext, err := encryption.Encrypt(dek, audio, aad)
+	require.NoError(t, err)
+
+	// 4: seed object store.
+	bucket := "rec-bucket-test"
+	audioKey := "recordings/x/x/x/" + callID.String() + ".opus.enc"
+	objects.PutBytes(bucket, audioKey, ciphertext)
+
+	// 5: commit.
+	in := newCommitInput(t, tenantID, callID)
+	in.S3Bucket = bucket
+	in.AudioObjectKey = audioKey
+	in.KMSKeyID = "kek-test"
+	in.EncryptedDEK = encryptedDEK
+	in.BytesSize = int64(len(ciphertext))
+
+	out, err := svc.Commit(t.Context(), in)
+	require.NoError(t, err)
+	return out.RecordingID, audio
 }
 
 func startPGContainer(t *testing.T) *postgres.Pool {

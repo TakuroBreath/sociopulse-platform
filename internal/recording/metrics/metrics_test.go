@@ -31,5 +31,6 @@ func TestRecordingMetrics_NilReceiverNoOp(t *testing.T) {
 	require.NotPanics(t, func() {
 		m.ObserveCommit("t", "ok", 0.1)
 		m.AddStorageBytes("t", 1234)
+		m.ObserveAccess("t", "ok", 0.1)
 	})
 }

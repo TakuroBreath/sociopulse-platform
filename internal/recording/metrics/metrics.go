@@ -16,6 +16,8 @@ type RecordingMetrics struct {
 	CommitTotal      *prometheus.CounterVec   // labels: tenant_id, result {ok|replay|invalid|call_not_found|error}
 	StorageSizeBytes *prometheus.GaugeVec     // labels: tenant_id (Counter-like, only Add on commit)
 	CommitDuration   *prometheus.HistogramVec // labels: tenant_id, result
+	AccessTotal      *prometheus.CounterVec   // labels: tenant_id, result {ok|not_found|deleted|kms_error|object_error|decrypt_error|audit_failed|error}
+	AccessDuration   *prometheus.HistogramVec // labels: tenant_id, result
 }
 
 // RegisterRecordingMetrics constructs and registers all collectors with reg.
@@ -45,13 +47,28 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 			Help:      "Wall time of one Commit call (validation + INSERT + outbox + audit).",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"tenant_id", "result"}),
+
+		AccessTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "access_total",
+			Help:      "Number of OpenAudioStream calls broken out by result {ok|not_found|deleted|kms_error|object_error|decrypt_error|audit_failed|error}.",
+		}, []string{"tenant_id", "result"}),
+
+		AccessDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "access_duration_seconds",
+			Help:      "Wall time of one OpenAudioStream call (lookup + KMS + S3 + decrypt + audit).",
+			Buckets:   prometheus.DefBuckets,
+		}, []string{"tenant_id", "result"}),
 	}
 
 	if reg == nil {
 		return m, nil
 	}
 
-	for _, c := range []prometheus.Collector{m.CommitTotal, m.StorageSizeBytes, m.CommitDuration} {
+	for _, c := range []prometheus.Collector{m.CommitTotal, m.StorageSizeBytes, m.CommitDuration, m.AccessTotal, m.AccessDuration} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("recording metrics: register: %w", err)
 		}
@@ -74,4 +91,13 @@ func (m *RecordingMetrics) AddStorageBytes(tenantID string, bytes int64) {
 		return
 	}
 	m.StorageSizeBytes.WithLabelValues(tenantID).Add(float64(bytes))
+}
+
+// ObserveAccess ticks the access collectors. Safe to call on a nil receiver.
+func (m *RecordingMetrics) ObserveAccess(tenantID, result string, durSec float64) {
+	if m == nil {
+		return
+	}
+	m.AccessTotal.WithLabelValues(tenantID, result).Inc()
+	m.AccessDuration.WithLabelValues(tenantID, result).Observe(durSec)
 }
