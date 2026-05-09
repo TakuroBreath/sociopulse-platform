@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"errors"
 	"testing"
 	"testing/iotest"
 
@@ -44,14 +43,13 @@ func TestAESGCMDecryptor_AADMismatchYieldsErrAuth(t *testing.T) {
 
 	d := crypto.NewAESGCMDecryptor()
 	_, err = d.Decrypt(ctx, key, bytes.NewReader(ct), int64(len(ct)), []byte("tenant-B"))
-	require.Error(t, err)
-	require.True(t, errors.Is(err, crypto.ErrAuth), "expected ErrAuth, got %v", err)
+	require.ErrorIs(t, err, crypto.ErrAuth)
 
 	// Locks in the spec's "never expose tampering details" contract:
 	// the inner encryption.ErrAuth and crypto/cipher's text MUST NOT
 	// be reachable through the returned error chain. Plan 12.3's HTTP
 	// handler relies on this scrub when mapping ErrAuth → 502.
-	require.False(t, errors.Is(err, encryption.ErrAuth),
+	require.NotErrorIs(t, err, encryption.ErrAuth,
 		"encryption.ErrAuth must not leak through the fold")
 	require.NotContains(t, err.Error(), "cipher",
 		"underlying cipher error text must not appear in the message; got %q", err.Error())
@@ -69,8 +67,7 @@ func TestAESGCMDecryptor_TamperedCiphertextYieldsErrAuth(t *testing.T) {
 
 	d := crypto.NewAESGCMDecryptor()
 	_, err = d.Decrypt(ctx, key, bytes.NewReader(ct), int64(len(ct)), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, crypto.ErrAuth))
+	require.ErrorIs(t, err, crypto.ErrAuth)
 }
 
 func TestAESGCMDecryptor_SizeCapRejected(t *testing.T) {
@@ -79,8 +76,7 @@ func TestAESGCMDecryptor_SizeCapRejected(t *testing.T) {
 
 	d := crypto.NewAESGCMDecryptor()
 	_, err := d.Decrypt(ctx, make([]byte, 32), bytes.NewReader(nil), crypto.MaxAudioPlaintextBytes+1, nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, crypto.ErrAudioTooLargeForV1))
+	require.ErrorIs(t, err, crypto.ErrAudioTooLargeForV1)
 }
 
 func TestAESGCMDecryptor_InvalidSize(t *testing.T) {
@@ -109,6 +105,5 @@ func TestAESGCMDecryptor_CtxCancelled(t *testing.T) {
 	d := crypto.NewAESGCMDecryptor()
 	// OneByteReader forces multiple reads so the ctx check fires
 	_, err := d.Decrypt(ctx, key, iotest.OneByteReader(bytes.NewReader(ct)), int64(len(ct)), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, context.Canceled), "expected context.Canceled, got %v", err)
+	require.ErrorIs(t, err, context.Canceled)
 }

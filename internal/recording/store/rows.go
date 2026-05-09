@@ -36,10 +36,10 @@ type RecordingRow struct {
 	// supply a non-nil value (Commit validation rejects zero), but the column
 	// can carry NULL for legal-hold/eternal-retention scenarios introduced
 	// later.
-	DeleteAt       *time.Time
-	ColdAt         time.Time
-	RecordedAt     time.Time
-	VerifiedAt     *time.Time
-	IntegrityOK    *bool
-	IngestAgentID  string
+	DeleteAt      *time.Time
+	ColdAt        time.Time
+	RecordedAt    time.Time
+	VerifiedAt    *time.Time
+	IntegrityOK   *bool
+	IngestAgentID string
 }

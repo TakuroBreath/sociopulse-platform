@@ -318,12 +318,36 @@ func (s *svc) VerifyChecksum(_ context.Context, _, _ uuid.UUID) (rapi.VerifyResu
 
 // ----- helpers -----
 
+// validateCommit composes three sub-validators to keep cyclomatic complexity
+// below the project's gocyclo cap (15). The split is by concern: identity
+// fields (tenant/call), provenance fields (S3 + KMS + DEK), and content
+// fields (sizes + timestamps + codec). Returns the FIRST failure to mirror
+// the original switch's short-circuit behaviour.
 func validateCommit(in rapi.CommitInput) error {
+	if err := validateCommitIdentity(in); err != nil {
+		return err
+	}
+	if err := validateCommitProvenance(in); err != nil {
+		return err
+	}
+	return validateCommitContent(in)
+}
+
+// validateCommitIdentity rejects malformed tenant/call references — the
+// surface area that drives RLS + the call_recordings UNIQUE constraint.
+func validateCommitIdentity(in rapi.CommitInput) error {
 	switch {
 	case in.TenantID == uuid.Nil:
 		return errors.New("tenant_id required")
 	case in.CallID == uuid.Nil:
 		return errors.New("call_id required")
+	}
+	return nil
+}
+
+// validateCommitProvenance rejects malformed S3 + KMS + DEK fields.
+func validateCommitProvenance(in rapi.CommitInput) error {
+	switch {
 	case in.S3Bucket == "":
 		return errors.New("s3_bucket required")
 	case in.AudioObjectKey == "":
@@ -334,6 +358,14 @@ func validateCommit(in rapi.CommitInput) error {
 		return errors.New("encrypted_dek required")
 	case len(in.EncryptedDEK) > maxEncryptedDEKBytes:
 		return fmt.Errorf("encrypted_dek too large: max %d bytes", maxEncryptedDEKBytes)
+	}
+	return nil
+}
+
+// validateCommitContent rejects malformed audio-content fields (sizes, codec,
+// retention plan timestamps).
+func validateCommitContent(in rapi.CommitInput) error {
+	switch {
 	case in.BytesSize <= 0:
 		return errors.New("bytes_size must be > 0")
 	case in.Duration <= 0:

@@ -2,11 +2,11 @@ package storage_test
 
 import (
 	"context"
-	"errors"
 	"io"
 	"sync"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/sociopulse/platform/internal/recording/storage"
@@ -35,9 +35,7 @@ func TestLocalObjectStore_GetMissingReturnsNotFound(t *testing.T) {
 
 	s := storage.NewLocalObjectStore()
 	_, err := s.Get(ctx, "bucket-A", "missing-key")
-	require.Error(t, err)
-	require.True(t, errors.Is(err, storage.ErrObjectNotFound),
-		"expected ErrObjectNotFound, got %v", err)
+	require.ErrorIs(t, err, storage.ErrObjectNotFound)
 }
 
 func TestLocalObjectStore_DeleteMissingIsNoOp(t *testing.T) {
@@ -58,7 +56,7 @@ func TestLocalObjectStore_DeleteThenGetReturnsNotFound(t *testing.T) {
 
 	require.NoError(t, s.Delete(ctx, "bucket-A", "k"))
 	_, err := s.Get(ctx, "bucket-A", "k")
-	require.True(t, errors.Is(err, storage.ErrObjectNotFound))
+	require.ErrorIs(t, err, storage.ErrObjectNotFound)
 }
 
 func TestLocalObjectStore_GetIsolatedFromCallerMutations(t *testing.T) {
@@ -119,6 +117,11 @@ func TestLocalObjectStore_ConcurrentPutAndGet(t *testing.T) {
 	const goroutines = 10
 	const iterations = 1000
 
+	// Use assert (not require) inside the goroutine: testifylint flags
+	// require.* in non-test goroutines because t.FailNow only stops the
+	// goroutine that called it, leaving the WaitGroup hanging on a panic.
+	// assert.NoError logs the failure on t and lets the loop continue;
+	// wg.Wait still completes and the parent test sees the assertion fail.
 	var wg sync.WaitGroup
 	for g := range goroutines {
 		wg.Add(1)
@@ -129,9 +132,9 @@ func TestLocalObjectStore_ConcurrentPutAndGet(t *testing.T) {
 				payload := []byte{byte(g), byte(i)}
 				s.PutBytes("bucket-A", key, payload)
 				rc, err := s.Get(context.Background(), "bucket-A", key)
-				require.NoError(t, err)
+				assert.NoError(t, err)
 				_, err = io.ReadAll(rc)
-				require.NoError(t, err)
+				assert.NoError(t, err)
 				_ = rc.Close()
 			}
 		}(g)
@@ -149,10 +152,10 @@ func TestLocalObjectStore_CtxCancelled(t *testing.T) {
 	cancel()
 
 	_, err := s.Get(ctx, "bucket-A", "k")
-	require.True(t, errors.Is(err, context.Canceled))
+	require.ErrorIs(t, err, context.Canceled)
 
 	err = s.Delete(ctx, "bucket-A", "k")
-	require.True(t, errors.Is(err, context.Canceled))
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 // keyFor produces a deterministic unique key per (goroutine, iteration).

@@ -264,4 +264,3 @@ func loadServerCreds(cfg Config) (credentials.TransportCredentials, error) {
 	}
 	return credentials.NewTLS(tlsCfg), nil
 }
-

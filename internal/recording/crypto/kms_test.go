@@ -3,7 +3,6 @@ package crypto_test
 import (
 	"context"
 	"crypto/rand"
-	"errors"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -40,9 +39,7 @@ func TestLocalDEKUnwrapper_UnknownKey(t *testing.T) {
 
 	u := crypto.NewLocalDEKUnwrapper(map[string][]byte{}) // empty
 	_, err := u.DecryptDEK(ctx, "kek-tenant-A", []byte("anything"), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, crypto.ErrUnknownKey),
-		"expected ErrUnknownKey, got %v", err)
+	require.ErrorIs(t, err, crypto.ErrUnknownKey)
 }
 
 func TestLocalDEKUnwrapper_AADMismatch(t *testing.T) {
@@ -56,11 +53,9 @@ func TestLocalDEKUnwrapper_AADMismatch(t *testing.T) {
 
 	u := crypto.NewLocalDEKUnwrapper(map[string][]byte{"kek-1": kek})
 	_, err = u.DecryptDEK(ctx, "kek-1", encryptedDEK, []byte("tenant-B"))
-	require.Error(t, err)
-	require.True(t, errors.Is(err, crypto.ErrDecryptFailed),
-		"expected ErrDecryptFailed on AAD mismatch, got %v", err)
+	require.ErrorIs(t, err, crypto.ErrDecryptFailed)
 	// Lock in the spec scrub contract — like Task 1's ErrAuth fold.
-	require.False(t, errors.Is(err, encryption.ErrAuth),
+	require.NotErrorIs(t, err, encryption.ErrAuth,
 		"encryption.ErrAuth must not leak through the fold")
 	require.NotContains(t, err.Error(), "cipher",
 		"underlying cipher error text must not appear in the message; got %q", err.Error())
@@ -75,9 +70,7 @@ func TestLocalDEKUnwrapper_CtxCancelled(t *testing.T) {
 	kek := make([]byte, 32)
 	u := crypto.NewLocalDEKUnwrapper(map[string][]byte{"kek-1": kek})
 	_, err := u.DecryptDEK(ctx, "kek-1", []byte("anything"), nil)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, context.Canceled),
-		"expected context.Canceled, got %v", err)
+	require.ErrorIs(t, err, context.Canceled)
 }
 
 func TestNewLocalDEKUnwrapper_ClonesInputMap(t *testing.T) {

@@ -292,8 +292,8 @@ func run(ctx context.Context, configDir string) error {
 	recordingModule := recording.New(recording.Config{
 		Registerer:   metrics.Registry,
 		GRPCConfig:   recordingGRPCConfig(cfg.Recording),
-		DEKUnwrapper: recordingDEK,      // NEW
-		ObjectStore:  recordingObjects,  // NEW
+		DEKUnwrapper: recordingDEK,     // NEW
+		ObjectStore:  recordingObjects, // NEW
 	})
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
