@@ -89,15 +89,20 @@ func New(d Deps) rapi.RecordingService {
 // NOT block on NATS ack. Replay path skips audit + outbox so downstream
 // subscribers see exactly one event per recording.
 func (s *svc) Commit(ctx context.Context, in rapi.CommitInput) (rapi.CommitOutput, error) {
-	start := time.Now()
+	// Single time.Now() reading: `now` doubles as the metrics-timer base AND
+	// as the row's committed_at. Splitting these into separate Now() calls
+	// would let the test-asserted CommitOutput.CommittedAt drift away from
+	// the metrics-tagged duration baseline by a few microseconds — a latent
+	// hazard for tests that compare them.
+	now := time.Now()
 	tenantLabel := in.TenantID.String()
 
 	if err := validateCommit(in); err != nil {
-		s.metrics.ObserveCommit(tenantLabel, "invalid", time.Since(start).Seconds())
+		s.metrics.ObserveCommit(tenantLabel, "invalid", time.Since(now).Seconds())
 		return rapi.CommitOutput{}, fmt.Errorf("%w: %s", ErrInvalidInput, err.Error())
 	}
 
-	row := storeRowFromInput(in, time.Now().UTC())
+	row := storeRowFromInput(in, now.UTC())
 
 	var (
 		out    rapi.CommitOutput
@@ -134,7 +139,7 @@ func (s *svc) Commit(ctx context.Context, in rapi.CommitInput) (rapi.CommitOutpu
 		return nil
 	})
 
-	dur := time.Since(start).Seconds()
+	dur := time.Since(now).Seconds()
 	switch {
 	case errors.Is(err, store.ErrCallNotFound):
 		s.metrics.ObserveCommit(tenantLabel, "call_not_found", dur)

@@ -143,10 +143,14 @@ func TestService_Get_NotFound(t *testing.T) {
 		"expected api.ErrNotFound, got %v", err)
 }
 
+// The three NotImplemented tests verify only the marker-string contract on
+// the deferred service methods — they don't touch storage, so we skip the
+// 90-second Postgres container bring-up by passing nil Pool/Store. The svc
+// returns the placeholder error before reaching any DB call.
+
 func TestService_Search_NotImplemented(t *testing.T) {
 	t.Parallel()
-	pool := startPGContainer(t)
-	svc := buildService(t, pool)
+	svc := newStubService(t)
 
 	_, err := svc.Search(t.Context(), uuid.Must(uuid.NewV7()), rapi.SearchQuery{Limit: 10})
 	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
@@ -155,8 +159,7 @@ func TestService_Search_NotImplemented(t *testing.T) {
 
 func TestService_OpenAudioStream_NotImplemented(t *testing.T) {
 	t.Parallel()
-	pool := startPGContainer(t)
-	svc := buildService(t, pool)
+	svc := newStubService(t)
 
 	_, err := svc.OpenAudioStream(t.Context(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()), nil)
 	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
@@ -165,12 +168,19 @@ func TestService_OpenAudioStream_NotImplemented(t *testing.T) {
 
 func TestService_VerifyChecksum_NotImplemented(t *testing.T) {
 	t.Parallel()
-	pool := startPGContainer(t)
-	svc := buildService(t, pool)
+	svc := newStubService(t)
 
 	_, err := svc.VerifyChecksum(t.Context(), uuid.Must(uuid.NewV7()), uuid.Must(uuid.NewV7()))
 	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
 	require.Contains(t, err.Error(), "not implemented in foundation phase")
+}
+
+// newStubService builds a minimum-viable RecordingService for tests that
+// only assert on the deferred-method placeholders. No DB, no metrics, no
+// outbox — the stubs return before any field is dereferenced.
+func newStubService(t *testing.T) rapi.RecordingService {
+	t.Helper()
+	return service.New(service.Deps{})
 }
 
 // ────────── helpers ──────────
