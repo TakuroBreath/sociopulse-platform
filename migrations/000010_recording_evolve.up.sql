@@ -35,19 +35,29 @@ alter table call_recordings
     add column if not exists ingest_agent_id text;
 
 -- ─── step 2: backfill ─────────────────────────────────────────────────────────
--- id              — new surrogate PK; must be non-null before we can add a PK.
--- committed_at    — semantically "when the record was committed"; map from created_at.
--- duration_ms     — millisecond equivalent of duration_sec.
--- bytes_size      — no legacy value; use 0 as safe sentinel (rows are empty in prod).
--- cold_at         — replaces retention_until; promote date → timestamptz at midnight UTC.
--- recorded_at     — best approximation from created_at (no better source in legacy rows).
--- ingest_agent_id — no legacy value; use '' as safe sentinel.
+-- The table is empty in production (Plan 12 has not shipped yet), so this
+-- UPDATE is normally a no-op — but it stays safe even if a future restore
+-- introduces rows: the whole migration runs in one transaction (begin/commit
+-- at top/bottom), so a crash rolls back atomically and a re-run starts from
+-- the pre-migration state. The `where id is null` predicate is defence-in-
+-- depth: it avoids re-rolling new UUIDs over rows that some future hand-
+-- patched runner might have already partially backfilled.
+--
+-- Backfill mapping:
+--   id              — new surrogate PK; must be non-null before we can add a PK.
+--   committed_at    — semantically "when the record was committed"; map from created_at.
+--   duration_ms     — millisecond equivalent of duration_sec.
+--   bytes_size      — no legacy value; use 0 as safe sentinel.
+--   cold_at         — replaces retention_until; promote date → timestamptz at midnight UTC,
+--                     anchored explicitly via timezone('UTC', …) to avoid session-tz drift.
+--   recorded_at     — best approximation from created_at (no better source in legacy rows).
+--   ingest_agent_id — no legacy value; use '' as safe sentinel.
 update call_recordings set
     id              = gen_random_uuid(),
     committed_at    = created_at,
     duration_ms     = duration_sec::bigint * 1000,
     bytes_size      = 0,
-    cold_at         = retention_until::timestamptz,
+    cold_at         = timezone('UTC', retention_until::timestamp),
     recorded_at     = created_at,
     ingest_agent_id = ''
 where id is null;
@@ -74,10 +84,14 @@ begin
 end$$;
 
 -- ─── step 4: change delete_at from date to timestamptz ────────────────────────
--- Cast through text to keep any existing date values at midnight UTC.
+-- Anchor existing date values to midnight UTC explicitly. A direct
+-- `date → timestamptz` cast resolves midnight in the *session* time zone, not
+-- UTC, so on a non-UTC server we would silently shift the boundary by the
+-- session offset. timezone('UTC', date::timestamp) pins the result to
+-- 00:00:00+00 regardless of the runner's TimeZone setting.
 alter table call_recordings
     alter column delete_at type timestamptz
-        using delete_at::timestamptz;
+        using timezone('UTC', delete_at::timestamp);
 
 -- ─── step 5: drop columns replaced by the new ones ───────────────────────────
 alter table call_recordings
@@ -99,8 +113,11 @@ alter table call_recordings
 
 -- ─── step 7: PK swap — drop old PK on call_id, add new PK on id ──────────────
 -- The legacy table was created with `call_id uuid primary key`, so Postgres
--- gave the constraint the default name `call_recordings_pkey`. We use IF
--- EXISTS via a DO block so this is idempotent on a partial replay.
+-- gave the constraint the default name `call_recordings_pkey`. The DO-block
+-- guard makes this script idempotent on a *full re-run of an already-applied
+-- migration* (e.g. `migrate up` after `migrate down`). Partial-step replay is
+-- impossible inside a transaction — the wrapping begin/commit makes the whole
+-- script atomic, so a crash rolls everything back.
 do $$
 begin
     if exists (
