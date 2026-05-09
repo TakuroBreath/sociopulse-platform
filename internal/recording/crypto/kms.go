@@ -89,7 +89,13 @@ func (u *LocalDEKUnwrapper) DecryptDEK(ctx context.Context, kmsKeyID string, enc
 	}
 	kek, ok := u.keks[kmsKeyID]
 	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownKey, kmsKeyID)
+		// Scrub the kmsKeyID from the error string — same defence-in-depth
+		// rationale as the ErrDecryptFailed scrub below. The ID is tenant-
+		// scoped metadata; an HTTP handler that accidentally pipes
+		// err.Error() to a 5xx body would leak it. Callers that need the
+		// ID for diagnostics MUST attach `zap.String("kms_key_id", id)`
+		// to their structured log at the call site.
+		return nil, fmt.Errorf("%w", ErrUnknownKey)
 	}
 	plain, err := encryption.Decrypt(kek, encryptedDEK, aad)
 	if err != nil {

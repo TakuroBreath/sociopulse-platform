@@ -84,37 +84,36 @@ func TestNewLocalDEKUnwrapper_ClonesInputMap(t *testing.T) {
 	t.Parallel()
 	ctx := t.Context()
 
+	// Generate a KEK and encrypt a payload under it BEFORE handing it
+	// to the constructor. Then mutate (zero) the original KEK bytes and
+	// delete the map entry. If the constructor cloned both the map and
+	// each value, the unwrapper still owns the original KEK bytes and
+	// can successfully decrypt the payload.
 	kek := make([]byte, 32)
-	_, _ = rand.Read(kek)
-	keks := map[string][]byte{"kek-1": kek}
+	_, err := rand.Read(kek)
+	require.NoError(t, err)
 
+	dekPayload := []byte("dek-payload-for-clone-test")
+	encryptedDEK, err := encryption.Encrypt(kek, dekPayload, nil)
+	require.NoError(t, err)
+
+	keks := map[string][]byte{"kek-1": kek}
 	u := crypto.NewLocalDEKUnwrapper(keks)
 
-	// Mutate the original map AND the slice — the unwrapper must be
-	// unaffected because the constructor clones.
-	keks["kek-1"] = nil
-	delete(keks, "kek-1")
+	// Now sabotage the caller-side state: zero the KEK bytes AND the map
+	// entry. Without the per-value clone, the unwrapper's decrypt would
+	// run AES-256-GCM with an all-zero key against the (originally valid)
+	// ciphertext — the auth tag fails and we'd get ErrDecryptFailed.
 	for i := range kek {
 		kek[i] = 0
 	}
+	keks["kek-1"] = nil
+	delete(keks, "kek-1")
 
-	// Round-trip with a fresh encrypt under the original kek bytes.
-	freshKEK := make([]byte, 32)
-	_, _ = rand.Read(freshKEK)
-	keks2 := map[string][]byte{"kek-2": freshKEK}
-	u2 := crypto.NewLocalDEKUnwrapper(keks2)
-
-	encryptedDEK, err := encryption.Encrypt(freshKEK, []byte("dek"), nil)
-	require.NoError(t, err)
-	got, err := u2.DecryptDEK(ctx, "kek-2", encryptedDEK, nil)
-	require.NoError(t, err)
-	require.Equal(t, []byte("dek"), got)
-
-	// And the FIRST unwrapper should still know "kek-1" exists, despite
-	// the caller having deleted it from the original map.
-	_, err = u.DecryptDEK(ctx, "kek-1", []byte("anything"), nil)
-	// We expect ErrDecryptFailed (not ErrUnknownKey) — the key entry
-	// is still registered, but the ciphertext "anything" is bogus.
-	require.True(t, errors.Is(err, crypto.ErrDecryptFailed),
-		"key must remain registered despite caller mutations; got %v", err)
+	// The decrypt MUST succeed — the unwrapper owns its own copy of the
+	// pre-zero KEK bytes, and "kek-1" is still registered because the
+	// constructor cloned the map shell too.
+	got, err := u.DecryptDEK(ctx, "kek-1", encryptedDEK, nil)
+	require.NoError(t, err, "constructor must defensively clone both the map and each KEK byte slice")
+	require.Equal(t, dekPayload, got)
 }
