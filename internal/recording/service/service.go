@@ -204,33 +204,7 @@ func (s *svc) Get(ctx context.Context, tenantID, callID uuid.UUID) (rapi.Recordi
 		return rapi.RecordingMetadata{}, fmt.Errorf("recording.get: %w", err)
 	}
 
-	// store.RecordingRow.DeleteAt is *time.Time; api.RecordingMetadata.DeleteAt
-	// is time.Time. Plan 12.1 always commits with non-nil DeleteAt, but be
-	// defensive: nil → zero time (callers can treat zero as "no deletion").
-	var deleteAt time.Time
-	if r.DeleteAt != nil {
-		deleteAt = *r.DeleteAt
-	}
-
-	return rapi.RecordingMetadata{
-		RecordingID:    r.ID,
-		CallID:         r.CallID,
-		TenantID:       r.TenantID,
-		S3Bucket:       r.S3Bucket,
-		AudioObjectKey: r.AudioObjectKey,
-		BytesSize:      r.BytesSize,
-		Duration:       time.Duration(r.DurationMS) * time.Millisecond,
-		SHA256Hex:      r.SHA256Hex,
-		Status:         r.Status,
-		CommittedAt:    r.CommittedAt,
-		DeleteAt:       deleteAt,
-		ColdAt:         r.ColdAt,
-		VerifiedAt:     r.VerifiedAt,
-	}, nil
-}
-
-func (s *svc) Search(_ context.Context, _ uuid.UUID, _ rapi.SearchQuery) (rapi.SearchResult, error) {
-	return rapi.SearchResult{}, fmt.Errorf("%w: Search not implemented in foundation phase", ErrInvalidInput)
+	return rowToMetadata(r), nil
 }
 
 // OpenAudioStream returns a streamed, decrypted reader for the audio.

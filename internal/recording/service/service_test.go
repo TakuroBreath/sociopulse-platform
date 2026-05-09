@@ -148,19 +148,10 @@ func TestService_Get_NotFound(t *testing.T) {
 		"expected api.ErrNotFound, got %v", err)
 }
 
-// The three NotImplemented tests verify only the marker-string contract on
+// The two NotImplemented tests verify only the marker-string contract on
 // the deferred service methods — they don't touch storage, so we skip the
 // 90-second Postgres container bring-up by passing nil Pool/Store. The svc
 // returns the placeholder error before reaching any DB call.
-
-func TestService_Search_NotImplemented(t *testing.T) {
-	t.Parallel()
-	svc := newStubService(t)
-
-	_, err := svc.Search(t.Context(), uuid.Must(uuid.NewV7()), rapi.SearchQuery{Limit: 10})
-	require.True(t, errors.Is(err, rapi.ErrInvalidInput))
-	require.Contains(t, err.Error(), "not implemented in foundation phase")
-}
 
 // TestService_OpenAudioStream_NotWired covers the same scenario the old
 // foundation-phase TestService_OpenAudioStream_NotImplemented test did —
