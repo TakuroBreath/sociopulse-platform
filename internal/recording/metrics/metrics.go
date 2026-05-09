@@ -18,6 +18,26 @@ type RecordingMetrics struct {
 	CommitDuration   *prometheus.HistogramVec // labels: tenant_id, result
 	AccessTotal      *prometheus.CounterVec   // labels: tenant_id, result {ok|not_found|deleted|kms_error|object_error|decrypt_error|audit_failed|error}
 	AccessDuration   *prometheus.HistogramVec // labels: tenant_id, result
+
+	// RetentionPassDuration measures one full retention sweep — pass label
+	// is "cold_move" or "delete"; result is "ok" (sweep completed; per-row
+	// errors are tracked separately on RetentionActionsTotal) or "error"
+	// (the LIST query itself failed). Buckets cover 100ms .. ~17min.
+	RetentionPassDuration *prometheus.HistogramVec
+
+	// RetentionActionsTotal counts per-row outcomes inside a sweep. Bounded
+	// cardinality on action ("cold_move" | "delete") and result
+	// ("ok" | "stale" | "error" | "orphaned"). tenant_id is the high-card
+	// dimension — keep alerts on action+result aggregates rather than
+	// faceting per tenant in a global panel.
+	//
+	// Result semantics:
+	//   - ok       — UPDATE matched, audit (and outbox, for delete) committed.
+	//   - stale    — status-CAS rowsAffected=0 (concurrent flip; benign).
+	//   - error    — Tx-scope error (DB write failed, or Phase A on delete).
+	//   - orphaned — Phase A on delete reported ErrObjectNotFound; Phase B
+	//                still proceeded so DB and S3 end up reconciled.
+	RetentionActionsTotal *prometheus.CounterVec
 }
 
 // RegisterRecordingMetrics constructs and registers all collectors with reg.
@@ -62,13 +82,32 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 			Help:      "Wall time of one OpenAudioStream call (lookup + KMS + S3 + decrypt + audit).",
 			Buckets:   prometheus.DefBuckets,
 		}, []string{"tenant_id", "result"}),
+
+		RetentionPassDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "retention_pass_duration_seconds",
+			Help:      "Wall time of one retention sweep (cold_move or delete pass).",
+			Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 100ms .. ~17min
+		}, []string{"pass", "result"}),
+
+		RetentionActionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "retention_actions_total",
+			Help:      "Per-row outcomes inside a retention sweep: action {cold_move|delete} × result {ok|stale|error|orphaned}.",
+		}, []string{"tenant_id", "action", "result"}),
 	}
 
 	if reg == nil {
 		return m, nil
 	}
 
-	for _, c := range []prometheus.Collector{m.CommitTotal, m.StorageSizeBytes, m.CommitDuration, m.AccessTotal, m.AccessDuration} {
+	for _, c := range []prometheus.Collector{
+		m.CommitTotal, m.StorageSizeBytes, m.CommitDuration,
+		m.AccessTotal, m.AccessDuration,
+		m.RetentionPassDuration, m.RetentionActionsTotal,
+	} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("recording metrics: register: %w", err)
 		}
@@ -100,4 +139,24 @@ func (m *RecordingMetrics) ObserveAccess(tenantID, result string, durSec float64
 	}
 	m.AccessTotal.WithLabelValues(tenantID, result).Inc()
 	m.AccessDuration.WithLabelValues(tenantID, result).Observe(durSec)
+}
+
+// ObserveRetentionPass records one sweep's wall-clock duration. Safe on
+// a nil receiver. pass is "cold_move" | "delete"; result is "ok" |
+// "error".
+func (m *RecordingMetrics) ObserveRetentionPass(pass, result string, durSec float64) {
+	if m == nil {
+		return
+	}
+	m.RetentionPassDuration.WithLabelValues(pass, result).Observe(durSec)
+}
+
+// IncRetentionAction increments the per-row outcome counter. Safe on a
+// nil receiver. action is "cold_move" | "delete"; result is one of
+// "ok" | "stale" | "error" | "orphaned" (orphaned only applies to delete).
+func (m *RecordingMetrics) IncRetentionAction(tenantID, action, result string) {
+	if m == nil {
+		return
+	}
+	m.RetentionActionsTotal.WithLabelValues(tenantID, action, result).Inc()
 }

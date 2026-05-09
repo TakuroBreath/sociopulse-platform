@@ -187,6 +187,7 @@ linters-settings:
           - "!**/internal/recording/store/**"
           - "!**/internal/recording/events/**"
           - "!**/internal/recording/transport/**"
+          - "!**/internal/recording/worker/**"
           - "!**/internal/recording/module.go"
           - "!**/internal/analytics/service/**"
           - "!**/internal/analytics/store/**"

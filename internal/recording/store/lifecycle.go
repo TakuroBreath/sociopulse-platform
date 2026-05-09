@@ -286,6 +286,62 @@ UPDATE call_recordings
 	})
 }
 
+// MarkColdTx is the in-Tx variant of MarkCold. Status-CAS pattern: the
+// WHERE clause requires status='stored', returning rowsAffected so the
+// caller treats 0 as a benign skip.
+//
+// Tx-scope contract: the caller MUST have set the tenant scope via
+// pool.WithTenant before invoking — MarkColdTx does NOT switch role
+// itself. Using this from a BypassRLS Tx will fail unless the row
+// happens to satisfy the tenant_id RLS predicate.
+//
+// The retention worker uses this so MarkCold + audit insert commit
+// atomically inside one WithTenant transaction. Splitting them across
+// two transactions would let the audit row leak even when the status
+// flip rolled back, leaving a divergent chain-of-custody record.
+func (s *PostgresStore) MarkColdTx(ctx context.Context, tx postgres.Tx, id uuid.UUID) (int64, error) {
+	const q = `
+UPDATE call_recordings
+   SET status = 'cold'
+ WHERE id = $1
+   AND status = 'stored'
+`
+	tag, err := tx.Exec(ctx, q, id)
+	if err != nil {
+		return 0, fmt.Errorf("recording.store: mark cold tx %s: %w", id, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
+// MarkDeletedTx is the in-Tx variant of MarkDeleted. Status-CAS pattern:
+// the WHERE clause requires status IN ('stored','cold'), returning
+// rowsAffected so the caller treats 0 as a benign skip (concurrent
+// delete already happened).
+//
+// Tx-scope contract: the caller MUST have set the tenant scope via
+// pool.WithTenant before invoking — MarkDeletedTx does NOT switch role
+// itself. The retention worker batches MarkDeletedTx with audit_log +
+// event_outbox inserts inside one WithTenant transaction so all three
+// state changes commit atomically; an S3 delete that already happened
+// (Phase A) is reconciled with DB state (Phase B) in a single Tx.
+//
+// Note: this only flips the status column. The audio object purge is
+// the worker's Phase A (irreversible) responsibility — see
+// internal/recording/worker.RetentionPass.
+func (s *PostgresStore) MarkDeletedTx(ctx context.Context, tx postgres.Tx, id uuid.UUID) (int64, error) {
+	const q = `
+UPDATE call_recordings
+   SET status = 'deleted'
+ WHERE id = $1
+   AND status IN ('stored', 'cold')
+`
+	tag, err := tx.Exec(ctx, q, id)
+	if err != nil {
+		return 0, fmt.Errorf("recording.store: mark deleted tx %s: %w", id, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // Compile-time check that *PostgresStore satisfies rapi.LifecycleStore.
 // This is the canonical assertion — failing here means a method was
 // removed or its signature drifted.
