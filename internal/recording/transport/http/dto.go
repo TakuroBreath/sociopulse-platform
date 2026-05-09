@@ -23,17 +23,21 @@ type SearchResponse struct {
 // Field names use snake_case per project convention. DurationMS is
 // milliseconds (consistent with call_recordings.duration_ms column).
 type RecordingMetadataDTO struct {
-	RecordingID uuid.UUID  `json:"recording_id"`
-	CallID      uuid.UUID  `json:"call_id"`
-	TenantID    uuid.UUID  `json:"tenant_id"`
-	BytesSize   int64      `json:"bytes_size"`
-	DurationMS  int64      `json:"duration_ms"`
-	SHA256Hex   string     `json:"sha256"`
-	Status      string     `json:"status"`
-	CommittedAt time.Time  `json:"committed_at"`
-	DeleteAt    time.Time  `json:"delete_at,omitempty"`
-	ColdAt      time.Time  `json:"cold_at"`
-	VerifiedAt  *time.Time `json:"verified_at,omitempty"`
+	RecordingID uuid.UUID `json:"recording_id"`
+	CallID      uuid.UUID `json:"call_id"`
+	TenantID    uuid.UUID `json:"tenant_id"`
+	BytesSize   int64     `json:"bytes_size"`
+	DurationMS  int64     `json:"duration_ms"`
+	SHA256Hex   string    `json:"sha256"`
+	Status      string    `json:"status"`
+	CommittedAt time.Time `json:"committed_at"`
+	// time.Time with `omitempty` does NOT omit a zero time — `omitempty` only
+	// drops Go zero values for primitives. Use `omitzero` (Go 1.24+ json tag)
+	// which calls IsZero() on time.Time and correctly drops "0001-01-01..."
+	// from the wire when the row carries NULL delete_at (legal-hold scenarios).
+	DeleteAt   time.Time  `json:"delete_at,omitzero"`
+	ColdAt     time.Time  `json:"cold_at"`
+	VerifiedAt *time.Time `json:"verified_at,omitempty"`
 }
 
 // VerifyResponse is the POST /verify payload.
