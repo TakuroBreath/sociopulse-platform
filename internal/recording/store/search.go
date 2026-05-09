@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -132,12 +133,5 @@ LIMIT %s
 }
 
 func joinAnd(terms []string) string {
-	out := ""
-	for i, t := range terms {
-		if i > 0 {
-			out += " AND "
-		}
-		out += t
-	}
-	return out
+	return strings.Join(terms, " AND ")
 }
