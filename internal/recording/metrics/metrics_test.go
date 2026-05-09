@@ -32,5 +32,10 @@ func TestRecordingMetrics_NilReceiverNoOp(t *testing.T) {
 		m.ObserveCommit("t", "ok", 0.1)
 		m.AddStorageBytes("t", 1234)
 		m.ObserveAccess("t", "ok", 0.1)
+		m.ObserveRetentionPass("cold_move", "ok", 0.1)
+		m.IncRetentionAction("t", "cold_move", "ok")
+		m.ObserveIntegrityPass("ok", 0.1)
+		m.IncIntegrityAction("t", "ok")
+		m.IncIntegrityFailure("t")
 	})
 }

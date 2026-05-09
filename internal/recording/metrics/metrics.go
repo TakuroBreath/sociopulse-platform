@@ -38,6 +38,35 @@ type RecordingMetrics struct {
 	//   - orphaned — Phase A on delete reported ErrObjectNotFound; Phase B
 	//                still proceeded so DB and S3 end up reconciled.
 	RetentionActionsTotal *prometheus.CounterVec
+
+	// IntegrityPassDuration measures one full integrity sweep. Result is
+	// "ok" (sweep completed; per-row errors are tracked separately on
+	// IntegrityActionsTotal) or "error" (the SampleForVerify query itself
+	// failed). Buckets cover 100ms .. ~17min to track verify load against
+	// SLOs.
+	IntegrityPassDuration *prometheus.HistogramVec
+
+	// IntegrityActionsTotal counts per-row outcomes inside an integrity
+	// sweep. Result is one of "ok" | "mismatch" | "error":
+	//   - ok       — VerifyChecksum returned OK=true; verified_at +
+	//                integrity_ok=true persisted, audit row written.
+	//   - mismatch — VerifyChecksum returned OK=false (sha256 disagreement
+	//                — corruption or tampering); verified_at +
+	//                integrity_ok=false persisted, audit row written.
+	//                Paired with an IntegrityFailuresTotal increment.
+	//   - error    — VerifyChecksum returned an error OR the persistence
+	//                Tx failed; verified_at NOT updated, no audit row,
+	//                row stays eligible so the next sweep retries.
+	IntegrityActionsTotal *prometheus.CounterVec
+
+	// IntegrityFailuresTotal counts confirmed checksum mismatches per
+	// tenant — the master spec §15.5 alerting metric. A non-zero rate
+	// over the verify window indicates either real corruption (S3 object
+	// drift, KMS issue) or active tampering. Distinct from
+	// IntegrityActionsTotal{result=mismatch} so dashboards can keep a
+	// dedicated alert pane on the failure metric without filtering
+	// labels.
+	IntegrityFailuresTotal *prometheus.CounterVec
 }
 
 // RegisterRecordingMetrics constructs and registers all collectors with reg.
@@ -97,6 +126,28 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 			Name:      "retention_actions_total",
 			Help:      "Per-row outcomes inside a retention sweep: action {cold_move|delete} × result {ok|stale|error|orphaned}.",
 		}, []string{"tenant_id", "action", "result"}),
+
+		IntegrityPassDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "integrity_pass_duration_seconds",
+			Help:      "Wall time of one integrity sweep (sample + per-row verify + persist).",
+			Buckets:   prometheus.ExponentialBuckets(0.1, 2, 12), // 100ms .. ~17min
+		}, []string{"result"}),
+
+		IntegrityActionsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "integrity_actions_total",
+			Help:      "Per-row outcomes inside an integrity sweep: result {ok|mismatch|error}.",
+		}, []string{"tenant_id", "result"}),
+
+		IntegrityFailuresTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "recording",
+			Name:      "integrity_failures_total",
+			Help:      "Confirmed checksum mismatches per tenant (master spec §15.5).",
+		}, []string{"tenant_id"}),
 	}
 
 	if reg == nil {
@@ -107,6 +158,7 @@ func RegisterRecordingMetrics(reg prometheus.Registerer) (*RecordingMetrics, err
 		m.CommitTotal, m.StorageSizeBytes, m.CommitDuration,
 		m.AccessTotal, m.AccessDuration,
 		m.RetentionPassDuration, m.RetentionActionsTotal,
+		m.IntegrityPassDuration, m.IntegrityActionsTotal, m.IntegrityFailuresTotal,
 	} {
 		if err := reg.Register(c); err != nil {
 			return nil, fmt.Errorf("recording metrics: register: %w", err)
@@ -159,4 +211,36 @@ func (m *RecordingMetrics) IncRetentionAction(tenantID, action, result string) {
 		return
 	}
 	m.RetentionActionsTotal.WithLabelValues(tenantID, action, result).Inc()
+}
+
+// ObserveIntegrityPass records one integrity sweep's wall-clock
+// duration. Safe on a nil receiver. result is "ok" | "error" — the
+// SampleForVerify query failure case is the only "error" outcome at
+// the pass level (per-row VerifyChecksum errors are bucketed onto
+// IntegrityActionsTotal instead).
+func (m *RecordingMetrics) ObserveIntegrityPass(result string, durSec float64) {
+	if m == nil {
+		return
+	}
+	m.IntegrityPassDuration.WithLabelValues(result).Observe(durSec)
+}
+
+// IncIntegrityAction increments the per-row outcome counter. Safe on a
+// nil receiver. result is one of "ok" | "mismatch" | "error".
+func (m *RecordingMetrics) IncIntegrityAction(tenantID, result string) {
+	if m == nil {
+		return
+	}
+	m.IntegrityActionsTotal.WithLabelValues(tenantID, result).Inc()
+}
+
+// IncIntegrityFailure increments the confirmed-mismatch counter (master
+// spec §15.5). Safe on a nil receiver. Callers MUST pair this with
+// IncIntegrityAction(...,"mismatch") so the per-row dashboard and the
+// dedicated failure-rate alert agree.
+func (m *RecordingMetrics) IncIntegrityFailure(tenantID string) {
+	if m == nil {
+		return
+	}
+	m.IntegrityFailuresTotal.WithLabelValues(tenantID).Inc()
 }

@@ -48,6 +48,13 @@ const (
 	// after Phase A (S3 object delete) succeeds and Phase B (DB status flip
 	// + outbox event) commits.
 	AuditActionDeleted = "recording.deleted"
+	// AuditActionVerified is the audit Action emitted by the integrity worker
+	// (Plan 12.4 Task 3) after recomputing a recording's sha256 against the
+	// stored ciphertext and persisting verified_at + integrity_ok.
+	// VerifyChecksum itself is audit-free (it is a metadata check, not an
+	// access of plaintext audio), so the integrity worker is the canonical
+	// emitter of this row.
+	AuditActionVerified = "recording.verified"
 )
 
 // asynq task type constants.

@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	rapi "github.com/sociopulse/platform/internal/recording/api"
@@ -69,26 +68,6 @@ type Leader interface {
 	Release(ctx context.Context)
 	// Key returns the advisory-lock key. Used for diagnostic logging.
 	Key() int64
-}
-
-// LifecycleStore is the worker-package narrow contract on the store.
-// It bundles the cross-tenant LIST methods (which run on BypassRLS Tx
-// inside the store impl) with the in-Tx mutation methods (which the
-// caller MUST run inside an already-tenant-scoped Tx).
-//
-// Production wiring passes *store.PostgresStore directly; this
-// interface exists primarily as a documentation surface and a seam
-// for future fakes. Plan 12.4 tests use the real store + real Postgres
-// because the audit-row + outbox INSERT paths need a real Tx anyway.
-type LifecycleStore interface {
-	// ListDueColdMoves runs cross-tenant on a BypassRLS Tx.
-	ListDueColdMoves(ctx context.Context, now time.Time, limit int) ([]rapi.LifecycleRow, error)
-	// ListDueDeletes runs cross-tenant on a BypassRLS Tx.
-	ListDueDeletes(ctx context.Context, now time.Time, limit int) ([]rapi.LifecycleRow, error)
-	// MarkColdTx runs in the caller's already-tenant-scoped Tx.
-	MarkColdTx(ctx context.Context, tx postgres.Tx, id uuid.UUID) (int64, error)
-	// MarkDeletedTx runs in the caller's already-tenant-scoped Tx.
-	MarkDeletedTx(ctx context.Context, tx postgres.Tx, id uuid.UUID) (int64, error)
 }
 
 // RetentionConfig wires the dependencies and tunables for a

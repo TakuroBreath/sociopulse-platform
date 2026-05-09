@@ -342,6 +342,40 @@ UPDATE call_recordings
 	return tag.RowsAffected(), nil
 }
 
+// UpdateVerifyResultTx is the in-Tx variant of UpdateVerifyResult. It
+// writes verified_at=verifiedAt and integrity_ok=integrityOK
+// unconditionally — re-applying with the same (id, verifiedAt,
+// integrityOK) is a benign overwrite. Returns rowsAffected so the caller
+// can detect a row that was concurrently deleted between SampleForVerify
+// and the Tx (rowsAffected=0 → benign skip).
+//
+// Tx-scope contract: the caller MUST have set the tenant scope via
+// pool.WithTenant before invoking — UpdateVerifyResultTx does NOT switch
+// role itself. The integrity worker (Plan 12.4 Task 3) bundles this with
+// the recording.verified audit row inside one WithTenant Tx so the
+// verified_at column and the audit row's ts column commit atomically;
+// splitting them across two transactions would let the audit row leak
+// even when the column update rolled back, breaking chain-of-custody.
+func (s *PostgresStore) UpdateVerifyResultTx(
+	ctx context.Context,
+	tx postgres.Tx,
+	id uuid.UUID,
+	verifiedAt time.Time,
+	integrityOK bool,
+) (int64, error) {
+	const q = `
+UPDATE call_recordings
+   SET verified_at = $2,
+       integrity_ok = $3
+ WHERE id = $1
+`
+	tag, err := tx.Exec(ctx, q, id, verifiedAt, integrityOK)
+	if err != nil {
+		return 0, fmt.Errorf("recording.store: update verify result tx %s: %w", id, err)
+	}
+	return tag.RowsAffected(), nil
+}
+
 // Compile-time check that *PostgresStore satisfies rapi.LifecycleStore.
 // This is the canonical assertion — failing here means a method was
 // removed or its signature drifted.

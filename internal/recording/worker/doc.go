@@ -1,6 +1,9 @@
 // Package worker hosts the recording-module background daemons:
-// the retention pass (this package, Plan 12.4 Task 2) and — when
-// shipped — the integrity verifier (Plan 12.4 Task 3).
+// the retention pass (Plan 12.4 Task 2) and the integrity verifier
+// (Plan 12.4 Task 3). Both are leader-elected via distinct
+// pg_try_advisory_lock slots and share the Run/tick/SweepOnce shape;
+// they touch disjoint row sets and can lead simultaneously across
+// replicas.
 //
 // # RetentionPass lifecycle
 //
@@ -73,6 +76,43 @@
 //   - Phase A returned ErrObjectNotFound → DB and S3 are out of sync;
 //     Phase B reconciles them. Bump "orphaned" metric so dashboards
 //     can flag the divergence rate.
+//
+// # IntegrityPass lifecycle
+//
+// IntegrityPass mirrors RetentionPass. Each tick (when leading):
+// SampleForVerify → per-row VerifyChecksum → in-Tx UpdateVerifyResultTx
+// + writeAudit (recording.verified). Defaults: Interval=1h, Batch=10,
+// SamplePercent=1.0 — naturally rate-limited to ~1680 verifications/
+// week by the SampleForVerify eligibility filter (status IN
+// ('stored','cold') AND verified_at < now() - 7 days).
+//
+//	┌───────────────────────────────────────────────────────────────┐
+//	│ IntegrityPass.Run(ctx)                                        │
+//	│   ┌─── ticker fires ────┐                                     │
+//	│   ▼                     │                                     │
+//	│  tick(ctx)              │                                     │
+//	│   ├─ Acquire(ctx) ──────┘  (peer holds lock → skip this tick) │
+//	│   └─ leading?                                                 │
+//	│      └─ SweepOnce(ctx)                                        │
+//	│         SampleForVerify (BypassRLS, BERNOULLI(samplePct))     │
+//	│         for each row:                                         │
+//	│           handleVerify                                        │
+//	│             Service.VerifyChecksum(tenantID, callID)          │
+//	│               ├─ error → IncIntegrityAction(error) + retry    │
+//	│               └─ result                                       │
+//	│             WithTenant(tenantID, fn(tx) {                     │
+//	│               UpdateVerifyResultTx(verified_at, integrity_ok) │
+//	│               writeAudit(action=verified, expected/actual sha)│
+//	│             })                                                │
+//	│             result.OK?                                        │
+//	│               ├─ true  → IncIntegrityAction(ok)               │
+//	│               └─ false → IncIntegrityAction(mismatch) +       │
+//	│                          IncIntegrityFailure (§15.5 alert)    │
+//	└───────────────────────────────────────────────────────────────┘
+//
+// VerifyChecksum is itself audit-free (a metadata-level check, not an
+// access of plaintext audio); the integrity worker is therefore the
+// canonical emitter of recording.verified rows.
 //
 // # Lock keys
 //
