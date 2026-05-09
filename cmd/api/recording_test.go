@@ -35,7 +35,6 @@ func TestRecordingPorts_HexDecodeAndLengthValidation(t *testing.T) {
 		{"non_hex", "z" + hex.EncodeToString(make([]byte, 32))[1:], false},
 	}
 	for _, tc := range cases {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			cfg := config.RecordingConfig{LocalKEKs: map[string]string{"kek-1": tc.hexKEK}}
