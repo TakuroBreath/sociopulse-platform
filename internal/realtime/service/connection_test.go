@@ -20,8 +20,24 @@ import (
 // connection spawns three goroutines (reader / writer / pinger) so
 // test cleanup discipline matters: any forgotten Close + Run-blocking
 // will surface here as a leak.
+//
+// Suppressed leak: go-redis v9 spawns a background tryDial() retry
+// goroutine when its connection pool exhausts dial errors (e.g.,
+// TestPresence_RedisErrorPropagation deliberately closes miniredis
+// mid-test to assert error-path metrics). tryDial sleeps up to 1s
+// between attempts and only checks p.closed() AFTER waking — closing
+// the redis client does NOT preempt the sleep (no ctx threaded
+// through; a known go-redis architectural limitation, see
+// internal/pool/pool.go's tryDial). On a -race CI runner with slower
+// goroutine scheduling the tests can finish before the goroutine
+// wakes and exits, surfacing here as a leak. Suppressing this
+// specific function still catches every other leak in the package —
+// the connection reader/writer/pinger triple, the presence touch
+// ticker, and any forgotten Hub/dispatcher goroutines.
 func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m)
+	goleak.VerifyTestMain(m,
+		goleak.IgnoreAnyFunction("github.com/redis/go-redis/v9/internal/pool.(*ConnPool).tryDial"),
+	)
 }
 
 func TestConnection_DropsOldestFrameWhenSlowConsumer(t *testing.T) {
