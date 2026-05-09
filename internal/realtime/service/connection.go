@@ -57,11 +57,12 @@ type AuthValidator interface {
 type HubCallback func(c *Connection, frame rtapi.Frame)
 
 // SubscribeFn is the Hub-side handler for direct (Connection.Subscribe)
-// subscription registration. Returns the assigned subID or an error
-// (RBAC denial / unknown topic). Plan 11 Task 3 wires the real fn at
-// Hub.Connect time; before then it is nil and Connection.Subscribe
-// returns ErrConnectionClosed.
-type SubscribeFn func(c *Connection, topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error)
+// subscription registration. ctx-aware (Plan 11.2 Task 4) so the
+// RBAC tenant cross-check has a deadline. Returns the assigned subID
+// or an error (RBAC denial / unknown topic / cross-tenant). Plan 11
+// Task 3 wires the real fn at Hub.Connect time; before then it is
+// nil and Connection.Subscribe returns ErrConnectionClosed.
+type SubscribeFn func(ctx context.Context, c *Connection, topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error)
 
 // UnsubscribeFn is the Hub-side handler for direct (Connection.Unsubscribe)
 // subscription removal. Plan 11 Task 3 wires the real fn at
@@ -298,7 +299,10 @@ func (c *Connection) Subscribe(topic rtapi.Topic, filter rtapi.SubscriptionFilte
 	if c.subscribeFn == nil {
 		return "", errors.New("realtime/service: Subscribe not wired (Hub.Connect not called)")
 	}
-	return c.subscribeFn(c, topic, filter)
+	// Use a Background-derived ctx scoped to the connection's
+	// lifetime. The Hub-side SubscribeFn applies its own per-call
+	// deadline for the resolver lookups (Plan 11.2 Task 4).
+	return c.subscribeFn(context.Background(), c, topic, filter)
 }
 
 // Unsubscribe removes the subscription with the given ID. Defers to

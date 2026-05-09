@@ -9,18 +9,37 @@
 package service_test
 
 import (
+	"context"
+	"errors"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	rtapi "github.com/sociopulse/platform/internal/realtime/api"
 	"github.com/sociopulse/platform/internal/realtime/service"
 )
 
+// stubResolver returns a fixed TenantID for any input. Used in the
+// cross-tenant tests below; the real CachedUserResolver wires this
+// through to auth.UserStore in production.
+type stubResolver struct {
+	tenantByID map[string]string
+}
+
+func (s *stubResolver) Get(_ context.Context, id string) (rtapi.ResolvedTenant, error) {
+	tid, ok := s.tenantByID[id]
+	if !ok {
+		return rtapi.ResolvedTenant{}, errors.New("not found")
+	}
+	return rtapi.ResolvedTenant{TenantID: tid}, nil
+}
+
 func TestRBAC_OperatorCannotSubscribeOperatorsState(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicOperatorsState,
 		rtapi.SubscriptionFilter{},
@@ -32,6 +51,7 @@ func TestRBAC_AdminCanSubscribeOperatorsState(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicOperatorsState,
 		rtapi.SubscriptionFilter{},
@@ -43,6 +63,7 @@ func TestRBAC_SupervisorCanSubscribeOperatorsState(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor"}},
 		rtapi.TopicOperatorsState,
 		rtapi.SubscriptionFilter{},
@@ -54,6 +75,7 @@ func TestRBAC_OperatorCannotSubscribeDialerQueue(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicDialerQueue,
 		rtapi.SubscriptionFilter{},
@@ -65,6 +87,7 @@ func TestRBAC_AdminCanSubscribeDialerQueue(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicDialerQueue,
 		rtapi.SubscriptionFilter{},
@@ -76,6 +99,7 @@ func TestRBAC_SupervisorCanSubscribeDialerQueue(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor"}},
 		rtapi.TopicDialerQueue,
 		rtapi.SubscriptionFilter{},
@@ -87,6 +111,7 @@ func TestRBAC_OperatorCannotSubscribeTrunksHealth(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicTrunksHealth,
 		rtapi.SubscriptionFilter{},
@@ -98,6 +123,7 @@ func TestRBAC_SupervisorCannotSubscribeTrunksHealth(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor"}},
 		rtapi.TopicTrunksHealth,
 		rtapi.SubscriptionFilter{},
@@ -109,6 +135,7 @@ func TestRBAC_AdminCanSubscribeTrunksHealth(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicTrunksHealth,
 		rtapi.SubscriptionFilter{},
@@ -120,6 +147,7 @@ func TestRBAC_CallEvents_RequiresCallID(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicCallEvents,
 		rtapi.SubscriptionFilter{},
@@ -131,6 +159,7 @@ func TestRBAC_CallEvents_OperatorWithCallIDAllowed(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicCallEvents,
 		rtapi.SubscriptionFilter{CallID: "call-1"},
@@ -142,6 +171,7 @@ func TestRBAC_CallEvents_AdminWithCallIDAllowed(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicCallEvents,
 		rtapi.SubscriptionFilter{CallID: "call-1"},
@@ -153,6 +183,7 @@ func TestRBAC_CallEvents_SupervisorWithCallIDAllowed(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor"}},
 		rtapi.TopicCallEvents,
 		rtapi.SubscriptionFilter{CallID: "call-1"},
@@ -165,6 +196,7 @@ func TestRBAC_NotificationsUser_SelfOnly_AllowsSelf(t *testing.T) {
 	r := service.NewTopicRBAC()
 	// OperatorID == UserID is the self case → allowed.
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicNotifications,
 		rtapi.SubscriptionFilter{OperatorID: "u1"},
@@ -177,6 +209,7 @@ func TestRBAC_NotificationsUser_SelfOnly_AllowsEmptyOperatorID(t *testing.T) {
 	r := service.NewTopicRBAC()
 	// Empty OperatorID == "self by default" → allowed.
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicNotifications,
 		rtapi.SubscriptionFilter{},
@@ -189,6 +222,7 @@ func TestRBAC_NotificationsUser_SelfOnly_RejectsForeign(t *testing.T) {
 	r := service.NewTopicRBAC()
 	// Even an admin cannot subscribe to another user's notifications.
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.TopicNotifications,
 		rtapi.SubscriptionFilter{OperatorID: "u2"},
@@ -200,6 +234,7 @@ func TestRBAC_ForceCommands_SelfOnly_AllowsSelf(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicForceCommands,
 		rtapi.SubscriptionFilter{OperatorID: "u1"},
@@ -211,6 +246,7 @@ func TestRBAC_ForceCommands_SelfOnly_AllowsEmptyOperatorID(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"operator"}},
 		rtapi.TopicForceCommands,
 		rtapi.SubscriptionFilter{},
@@ -222,6 +258,7 @@ func TestRBAC_ForceCommands_SelfOnly_RejectsForeign(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor"}},
 		rtapi.TopicForceCommands,
 		rtapi.SubscriptionFilter{OperatorID: "u2"},
@@ -233,6 +270,7 @@ func TestRBAC_UnknownTopic(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"admin"}},
 		rtapi.Topic("not.a.topic"),
 		rtapi.SubscriptionFilter{},
@@ -247,6 +285,7 @@ func TestRBAC_SelfOnly_EmptyUserIDDenied_Notifications(t *testing.T) {
 	// with a non-empty role and empty filter.OperatorID. Defence-in-
 	// depth against an upstream auth bug that planted empty UserID.
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{Roles: []string{"operator"}},
 		rtapi.TopicNotifications,
 		rtapi.SubscriptionFilter{},
@@ -258,6 +297,7 @@ func TestRBAC_SelfOnly_EmptyUserIDDenied_ForceCommands(t *testing.T) {
 	t.Parallel()
 	r := service.NewTopicRBAC()
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{Roles: []string{"supervisor"}},
 		rtapi.TopicForceCommands,
 		rtapi.SubscriptionFilter{},
@@ -275,6 +315,7 @@ func TestRBAC_NoRoles_DeniedEverywhere(t *testing.T) {
 		t.Run(string(topic), func(t *testing.T) {
 			t.Parallel()
 			err := r.Allow(
+				t.Context(),
 				rtapi.Claims{UserID: "u1"},
 				topic,
 				rtapi.SubscriptionFilter{CallID: "c1", OperatorID: "u1"},
@@ -290,6 +331,7 @@ func TestRBAC_MultiRole_UnionApplies(t *testing.T) {
 	// User has both supervisor + operator. TopicTrunksHealth requires
 	// admin only → still denied.
 	err := r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor", "operator"}},
 		rtapi.TopicTrunksHealth,
 		rtapi.SubscriptionFilter{},
@@ -299,9 +341,126 @@ func TestRBAC_MultiRole_UnionApplies(t *testing.T) {
 	// But TopicOperatorsState (admin + supervisor) → allowed via
 	// supervisor role.
 	err = r.Allow(
+		t.Context(),
 		rtapi.Claims{UserID: "u1", Roles: []string{"supervisor", "operator"}},
 		rtapi.TopicOperatorsState,
 		rtapi.SubscriptionFilter{},
 	)
 	require.NoError(t, err)
+}
+
+// TestTopicRBAC_RejectsCrossTenantOperatorFilter verifies that a
+// supervisor in tenant A subscribing to operators.state with an
+// OperatorID belonging to tenant B is rejected with
+// ErrCrossTenantSubscribe.
+func TestTopicRBAC_RejectsCrossTenantOperatorFilter(t *testing.T) {
+	t.Parallel()
+
+	users := &stubResolver{tenantByID: map[string]string{
+		"victim-op": "tenant-B", // foreign tenant
+	}}
+	rbac := service.NewTopicRBACWithResolvers(users, nil)
+
+	claims := rtapi.Claims{
+		UserID:   "attacker",
+		TenantID: "tenant-A",
+		Roles:    []string{"supervisor"},
+	}
+	filter := rtapi.SubscriptionFilter{OperatorID: "victim-op"}
+
+	err := rbac.Allow(t.Context(), claims, rtapi.TopicOperatorsState, filter)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe,
+		"cross-tenant OperatorID must reject with ErrCrossTenantSubscribe")
+}
+
+// TestTopicRBAC_RejectsCrossTenantProjectFilter mirrors the operator
+// case for project_id filters.
+func TestTopicRBAC_RejectsCrossTenantProjectFilter(t *testing.T) {
+	t.Parallel()
+
+	projects := &stubResolver{tenantByID: map[string]string{
+		"foreign-project": "tenant-B",
+	}}
+	rbac := service.NewTopicRBACWithResolvers(nil, projects)
+
+	claims := rtapi.Claims{
+		UserID:   "u1",
+		TenantID: "tenant-A",
+		Roles:    []string{"supervisor"},
+	}
+	filter := rtapi.SubscriptionFilter{ProjectID: "foreign-project"}
+
+	err := rbac.Allow(t.Context(), claims, rtapi.TopicOperatorsState, filter)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe)
+}
+
+// TestTopicRBAC_AllowsSameTenantFilters is the happy path: filter
+// UUIDs whose TenantID matches the subscriber's claims pass.
+func TestTopicRBAC_AllowsSameTenantFilters(t *testing.T) {
+	t.Parallel()
+
+	users := &stubResolver{tenantByID: map[string]string{
+		"my-op": "tenant-A",
+	}}
+	projects := &stubResolver{tenantByID: map[string]string{
+		"my-project": "tenant-A",
+	}}
+	rbac := service.NewTopicRBACWithResolvers(users, projects)
+
+	claims := rtapi.Claims{
+		UserID:   "supervisor",
+		TenantID: "tenant-A",
+		Roles:    []string{"supervisor"},
+	}
+
+	require.NoError(t, rbac.Allow(t.Context(), claims, rtapi.TopicOperatorsState,
+		rtapi.SubscriptionFilter{OperatorID: "my-op", ProjectID: "my-project"}))
+}
+
+// TestTopicRBAC_AllowsZeroResolverFallback verifies that the legacy
+// NewTopicRBAC() (no resolvers) preserves Plan 11 behaviour: the
+// cross-tenant check is skipped entirely when resolvers are absent.
+func TestTopicRBAC_AllowsZeroResolverFallback(t *testing.T) {
+	t.Parallel()
+
+	rbac := service.NewTopicRBAC() // legacy constructor
+
+	claims := rtapi.Claims{
+		UserID:   "u1",
+		TenantID: "tenant-A",
+		Roles:    []string{"supervisor"},
+	}
+	// Foreign-looking UUIDs — Allow must NOT reject because the
+	// resolver wasn't wired.
+	filter := rtapi.SubscriptionFilter{
+		OperatorID: "this-could-be-any-tenant",
+		ProjectID:  "another-arbitrary-id",
+	}
+
+	require.NoError(t, rbac.Allow(t.Context(), claims, rtapi.TopicOperatorsState, filter))
+}
+
+// TestTopicRBAC_FoldsResolverErrorIntoCrossTenant is the security
+// guarantee: a resolver error (not-found, DB error) MUST surface as
+// ErrCrossTenantSubscribe so the wire response is indistinguishable
+// from a real cross-tenant attempt — the client cannot probe entity
+// existence.
+func TestTopicRBAC_FoldsResolverErrorIntoCrossTenant(t *testing.T) {
+	t.Parallel()
+
+	users := &stubResolver{tenantByID: map[string]string{}} // empty → all lookups fail
+	rbac := service.NewTopicRBACWithResolvers(users, nil)
+
+	claims := rtapi.Claims{
+		UserID:   "u1",
+		TenantID: "tenant-A",
+		Roles:    []string{"supervisor"},
+	}
+	err := rbac.Allow(t.Context(), claims, rtapi.TopicOperatorsState,
+		rtapi.SubscriptionFilter{OperatorID: "nonexistent"})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe,
+		"resolver error must fold into ErrCrossTenantSubscribe (don't leak entity existence)")
 }

@@ -205,8 +205,13 @@ func (h *Hub) attach(c *Connection) {
 // bySubConn) holds hub.mu.Lock; the RBAC check and uuid allocation
 // run lock-free against the immutable matrix and a goroutine-local
 // random source.
-func (h *Hub) subscribeForConn(c *Connection, topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error) {
-	if err := h.rbac.Allow(c.Claims(), topic, filter); err != nil {
+//
+// ctx is threaded into rbac.Allow so the cross-tenant resolver
+// lookups (Plan 11.2 Task 4) can be bounded; Connection.Subscribe
+// supplies a Background-derived ctx scoped to the connection's
+// lifetime.
+func (h *Hub) subscribeForConn(ctx context.Context, c *Connection, topic rtapi.Topic, filter rtapi.SubscriptionFilter) (string, error) {
+	if err := h.rbac.Allow(ctx, c.Claims(), topic, filter); err != nil {
 		h.metrics.observeSubscribeFailure(string(topic), classifyRBACErr(err))
 		return "", err
 	}
@@ -504,6 +509,8 @@ func classifyRBACErr(err error) string {
 		return "filter_required"
 	case errors.Is(err, ErrUnknownTopic):
 		return "unknown"
+	case errors.Is(err, ErrCrossTenantSubscribe):
+		return "cross_tenant"
 	default:
 		return "internal"
 	}
