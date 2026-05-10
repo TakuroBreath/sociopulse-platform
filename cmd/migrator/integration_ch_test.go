@@ -97,6 +97,18 @@ func writeStubCHMigration(t *testing.T) string {
 	return "file://" + dir
 }
 
+// applyAllCHMigrations applies every migration in
+// ../../migrations/clickhouse against the given DSN. Tests run from
+// cmd/migrator/, so migrations/clickhouse is two directories up.
+// The DSN passed in must be the migrate-flavoured one (with
+// x-multi-statement=true) — see chDSNs.migrate.
+func applyAllCHMigrations(t *testing.T, dsn string) {
+	t.Helper()
+	absMigrations, err := filepath.Abs(filepath.Join("..", "..", "migrations", "clickhouse"))
+	require.NoError(t, err)
+	require.NoError(t, run([]string{"up"}, dsn, "file://"+absMigrations, os.Stdout))
+}
+
 // TestRunCH_UpAndStatus_AppliesStubMigration drives a full up against a
 // fresh CH container, then verifies (a) schema_migrations carries the
 // applied version and is not dirty, (b) the stub table actually exists
@@ -169,4 +181,197 @@ func TestRunCH_ConnectionError_DistinctFromUsage(t *testing.T) {
 
 	var ue *usageError
 	require.False(t, errors.As(err, &ue), "connection error must not be classified as usage")
+}
+
+// TestSchema_EventsCalls_HasExpectedColumns asserts the engine,
+// partition + sort keys, and full column shape of events_calls after
+// applying the real migrations from migrations/clickhouse. Locked-in
+// per master spec §6.4.
+func TestSchema_EventsCalls_HasExpectedColumns(t *testing.T) {
+	t.Parallel()
+
+	dsns := startClickHouse(t)
+	applyAllCHMigrations(t, dsns.migrate)
+	db := openCHDB(t, dsns.verify)
+
+	// Engine + partition + order key live on system.tables.
+	var engine, partitionKey, sortingKey string
+	require.NoError(t, db.QueryRow(`
+		SELECT engine, partition_key, sorting_key
+		FROM system.tables
+		WHERE database = currentDatabase() AND name = 'events_calls'
+	`).Scan(&engine, &partitionKey, &sortingKey))
+
+	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "toYYYYMM(date)", partitionKey)
+	require.Equal(t, "tenant_id, project_id, ts", sortingKey)
+
+	// Column types live on system.columns. Use a map for unordered
+	// comparison; ORDER BY position is kept for readable failure output.
+	rows, err := db.Query(`
+		SELECT name, type FROM system.columns
+		WHERE database = currentDatabase() AND table = 'events_calls'
+		ORDER BY position
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var n, ty string
+		require.NoError(t, rows.Scan(&n, &ty))
+		got[n] = ty
+	}
+	require.NoError(t, rows.Err())
+
+	want := map[string]string{
+		"date":         "Date",
+		"ts":           "DateTime64(3)",
+		"tenant_id":    "UUID",
+		"project_id":   "UUID",
+		"operator_id":  "UUID",
+		"call_id":      "UUID",
+		"status":       "LowCardinality(String)",
+		"duration_sec": "UInt32",
+		"hangup_cause": "LowCardinality(String)",
+		"region_code":  "LowCardinality(String)",
+		"attempt_no":   "UInt8",
+		"trunk_used":   "LowCardinality(String)",
+		"event_id":     "UUID",
+		"_inserted_at": "DateTime",
+	}
+	require.Equal(t, want, got)
+}
+
+// TestSchema_EventsOperatorState_HasExpectedColumns asserts the engine,
+// partition + sort keys, and full column shape of events_operator_state.
+// Locked-in per master spec §6.4.
+func TestSchema_EventsOperatorState_HasExpectedColumns(t *testing.T) {
+	t.Parallel()
+
+	dsns := startClickHouse(t)
+	applyAllCHMigrations(t, dsns.migrate)
+	db := openCHDB(t, dsns.verify)
+
+	var engine, partitionKey, sortingKey string
+	require.NoError(t, db.QueryRow(`
+		SELECT engine, partition_key, sorting_key
+		FROM system.tables
+		WHERE database = currentDatabase() AND name = 'events_operator_state'
+	`).Scan(&engine, &partitionKey, &sortingKey))
+
+	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "toYYYYMM(date)", partitionKey)
+	require.Equal(t, "tenant_id, user_id, ts", sortingKey)
+
+	rows, err := db.Query(`
+		SELECT name, type FROM system.columns
+		WHERE database = currentDatabase() AND table = 'events_operator_state'
+		ORDER BY position
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var n, ty string
+		require.NoError(t, rows.Scan(&n, &ty))
+		got[n] = ty
+	}
+	require.NoError(t, rows.Err())
+
+	want := map[string]string{
+		"date":                  "Date",
+		"ts":                    "DateTime64(3)",
+		"tenant_id":             "UUID",
+		"user_id":               "UUID",
+		"state":                 "LowCardinality(String)",
+		"duration_in_state_sec": "UInt32",
+		"project_id":            "Nullable(UUID)",
+		"event_id":              "UUID",
+		"_inserted_at":          "DateTime",
+	}
+	require.Equal(t, want, got)
+}
+
+// TestSchema_EventsRecordingUploaded_HasExpectedColumns asserts the
+// engine, partition + sort keys, and full column shape of
+// events_recording_uploaded. Out-of-spec relative to master §6.4 but
+// required for the QC report use case in Plan 13.3 — see references Q4.
+func TestSchema_EventsRecordingUploaded_HasExpectedColumns(t *testing.T) {
+	t.Parallel()
+
+	dsns := startClickHouse(t)
+	applyAllCHMigrations(t, dsns.migrate)
+	db := openCHDB(t, dsns.verify)
+
+	var engine, partitionKey, sortingKey string
+	require.NoError(t, db.QueryRow(`
+		SELECT engine, partition_key, sorting_key
+		FROM system.tables
+		WHERE database = currentDatabase() AND name = 'events_recording_uploaded'
+	`).Scan(&engine, &partitionKey, &sortingKey))
+
+	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "toYYYYMM(date)", partitionKey)
+	require.Equal(t, "tenant_id, ts", sortingKey)
+
+	rows, err := db.Query(`
+		SELECT name, type FROM system.columns
+		WHERE database = currentDatabase() AND table = 'events_recording_uploaded'
+		ORDER BY position
+	`)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	got := map[string]string{}
+	for rows.Next() {
+		var n, ty string
+		require.NoError(t, rows.Scan(&n, &ty))
+		got[n] = ty
+	}
+	require.NoError(t, rows.Err())
+
+	want := map[string]string{
+		"date":                 "Date",
+		"ts":                   "DateTime64(3)",
+		"tenant_id":            "UUID",
+		"project_id":           "UUID",
+		"call_id":              "UUID",
+		"fs_node":              "LowCardinality(String)",
+		"s3_key":               "String",
+		"size_bytes":           "UInt64",
+		"duration_sec":         "UInt32",
+		"encryption_key_alias": "LowCardinality(String)",
+		"event_id":             "UUID",
+		"_inserted_at":         "DateTime",
+	}
+	require.Equal(t, want, got)
+}
+
+// TestRunCH_UpIsIdempotent confirms that re-running `up` against an
+// already-fully-migrated CH is a no-op (migrate.ErrNoChange swallowed
+// by run()) and that the recorded version stays at 3 — which means the
+// driver did not silently apply something extra on the second pass.
+//
+// schema_migrations on TinyLog is append-only; the latest applied
+// version is the row with max sequence — same idiom as
+// TestRunCH_UpAndStatus_AppliesStubMigration.
+func TestRunCH_UpIsIdempotent(t *testing.T) {
+	t.Parallel()
+
+	dsns := startClickHouse(t)
+	applyAllCHMigrations(t, dsns.migrate)
+	applyAllCHMigrations(t, dsns.migrate) // re-apply: must be a no-op
+
+	db := openCHDB(t, dsns.verify)
+
+	var version uint64
+	var dirty bool
+	require.NoError(t, db.QueryRow(`
+		SELECT version, dirty FROM schema_migrations
+		ORDER BY sequence DESC LIMIT 1
+	`).Scan(&version, &dirty))
+	require.Equal(t, uint64(3), version, "expected version=3 after applying 000001..000003")
+	require.False(t, dirty)
 }
