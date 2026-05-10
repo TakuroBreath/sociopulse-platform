@@ -1840,6 +1840,22 @@ Phase 3 will reference it.
 
 ---
 
-## Amendments: none
+## Amendments (post-execution 2026-05-10)
 
-> Filled at close-out (Phase 4) if reality diverges from this plan.
+1. **Task 3 §3.2 step 8 — added 4th DDL statement: read-side VIEW.** The plan-provided SQL for migration `000005_mv_operator_kpi_daily.up.sql` defined the state table + 2 MV feeders (`mv_operator_kpi_daily_calls`, `mv_operator_kpi_daily_states`), but the rollup test in §3.2 step 6 read `FROM mv_operator_kpi_daily` — a name nothing in the migration created. Fix: added `CREATE VIEW IF NOT EXISTS mv_operator_kpi_daily AS SELECT * FROM mv_operator_kpi_daily_state` as the 4th statement (`coordinated` with the down-migration which now drops the VIEW first, before the feeders, before the state table). Two-feeder MVs need an explicit canonical read alias — the bare state-table name is implementation-detail. Captured as Production lesson in references.
+
+2. **Task 3 §3.4 step 16 — pre-formatted timestamp in Go.** Plan SQL `toDateTime64(concat('2026-05-10 ', leftPad(toString(?), 2, '0'), ':00:00'), 3)` was rejected by ClickHouse 24.8's INSERT VALUES parser with code 36 "not a constant expression" — even when the bound `?` was a plain integer. Fix: replaced with Go-side `ts := fmt.Sprintf("2026-05-10 %02d:00:00", i%4)` and bound the whole pre-formatted string as a single placeholder; added `"fmt"` import. Test intent (split 100 calls across 4 hourly buckets) preserved. The CH parser quirk is now noted inline in the test comment + captured as Production lesson.
+
+3. **Task 1 §1.3 — `chDSNs{migrate, verify}` pair instead of single DSN.** Plan §1.3 step 8 had `startClickHouse(t)` return a single DSN, but `clickhouse-go/v2`'s `sql.Open` rejects `x-multi-statement=true` as an unknown setting (it's a `golang-migrate` extension). Fix: split into a "migrate-DSN" (with the flag, used by `run([]string{"up"}, ...)`) and a "verify-DSN" (without the flag, used by `sql.Open("clickhouse", ...)` in verification queries) — formalized in a `chDSNs` struct.
+
+4. **Task 1 §1.2 step 5 — `loadTargetEnv` helper instead of inline branch.** Plan sketched the per-target env-var lookup as an inline `switch target` block in `main()` with two unused locals (`dsnEnv`, `pathEnv` with `_ =` suppressions). Implementer factored the routing into a small `loadTargetEnv(target string) (dsn, migPath string)` helper — same behaviour, no dead vars. Code-quality reviewer accepted.
+
+5. **Task 1 §1.4 step 11 — `usageText` example DSN replaced with prose.** Plan's `clickhouse://app:pwd@host:9000/...` literal in the help text tripped `gosec G101` (hardcoded credentials in URL). Replaced with descriptive prose ("CH DSN — must include `x-multi-statement=true`") to preserve operator-facing information without the SAST false-positive.
+
+6. **Task 3 fix-of-fix `6247ad1` — `;` in `--` SQL comments breaks the splitter.** Plan didn't anticipate this even though the references file's § Gotchas already noted "x-multi-statement=true splits by `;`". The follow-up commit `b389a47` (NIT fix from Task 3 review) added an inline `--` comment above `coalesce(project_id, ...)` whose text contained "logout); coalesce" — a literal `;` inside the comment. The migrator splitter cut through the comment, fragmenting the CREATE MATERIALIZED VIEW into two malformed statements; ClickHouse rejected with code 47 "Unknown expression identifier 'tenant_id'". Fix at `6247ad1`: rewrote the comment to use no semicolons, and added an in-comment warning. New gotcha captured in references — SQL `--` comments are NOT immune to the `;` splitter.
+
+7. **Idempotency test version bump.** Pre-existing `TestRunCH_UpIsIdempotent` (Task 2) asserted `version == 3` after applying migrations. With Task 3's 3 additional MV migrations, the latest version is now 6; assertion + comment updated in commit `efb3a0c`. Trivial bookkeeping, captured for completeness.
+
+8. **`make ci` does NOT exercise the `-tags=integration` suite.** Final reviewer noted: CI's `test` job runs `make test` without the integration tag, so the 8+ CH integration tests in `cmd/migrator/integration_ch_test.go` won't catch CH driver regressions in CI — they only catch locally during the pre-commit gate. This matches the documented testing strategy (testcontainers in CI requires Docker setup; current CI exercises only unit tests). Acceptable for v1; revisit in Plan 13.2 when more CH-dependent code lands.
+
+> If reality diverges from this plan in further sub-plans, append more amendments here. Future agents reading the plan get the corrected canonical SQL + workflow patterns above.

@@ -300,13 +300,110 @@ the `mv_operator_kpi_daily` materialised view. Document this in
 
 ---
 
-## Production lessons (post-execution — to be filled by close-out)
+## Production lessons (post-execution)
 
 > Filled at close-out of each sub-plan. The "next agent on this
 > module" reads this section first; it's the highest-leverage doc
 > in the file.
 
-### 13.1 (TBD)
+### 13.1 (post-execution 2026-05-10)
+
+The CH ecosystem has a few sharp edges that caught us during execution.
+Document them here so the next sub-plan (and Plan 14, and any future
+CH work) doesn't re-discover them the hard way.
+
+1. **`;` inside `--` SQL comments breaks the multi-statement splitter
+   even though `--` comments are otherwise honoured.** golang-migrate's
+   `x-multi-statement=true` splits the migration body by literal `;`
+   regardless of comment context. We tripped on this in the Task 3
+   NIT-fix commit (`b389a47`) — an inline `--` comment above
+   `coalesce(project_id, ...)` containing the text "logout); coalesce"
+   fragmented the `CREATE MATERIALIZED VIEW` into two malformed
+   statements. CH rejected at parse time. Fix landed in commit
+   `6247ad1`. **Rule:** in any `migrations/clickhouse/` migration with
+   multiple statements, NO `;` inside any comment text — period.
+
+2. **Two-feeder MVs need an explicit read-side VIEW alias.** When two
+   `MATERIALIZED VIEW … TO state_table` feeders share a state table
+   (e.g. `mv_operator_kpi_daily_state` is fed by both
+   `mv_operator_kpi_daily_calls` and `mv_operator_kpi_daily_states`),
+   consumers cannot read from a single feeder and see merged results
+   — each feeder only carries the columns it owns, with `sumState(0)`
+   for everything else. The canonical read endpoint must be a plain
+   `CREATE VIEW canonical_name AS SELECT * FROM state_table`. Plan 13.1
+   originally shipped the spec without this 4th statement — caught
+   during Task 3 execution; added inline. Plan 13.2 query authors:
+   the `mv_*` view names in this file's table are the read endpoints;
+   never read from `mv_*_state` or any individual feeder.
+
+3. **CH INSERT VALUES rejects non-constant column expressions.**
+   `concat(…)`, `leftPad(…)`, `toString(?)` and similar functions
+   inside an `INSERT INTO … VALUES (…)` clause return code 36 "not a
+   constant expression" — even when the only "non-constant" element
+   is a bound `?` of plain-integer type. Fix: pre-format complex
+   literals in the host language before binding, or use `INSERT INTO
+   … SELECT` syntax (which DOES allow expressions). We hit this in
+   `TestMV_CallsHourly_RawVsMVParity` at execution time; Go-side
+   `fmt.Sprintf("2026-05-10 %02d:00:00", i%4)` is the canonical fix
+   for tests.
+
+4. **`x-multi-statement=true` is a `golang-migrate`-only DSN
+   extension.** `clickhouse-go/v2`'s `sql.Open("clickhouse", dsn)`
+   returns "unexpected key 'x-multi-statement'" if the DSN includes
+   the flag. The integration suite carries TWO DSNs in a `chDSNs`
+   struct: a "migrate-DSN" (with the flag) for `migrate.New` calls,
+   and a "verify-DSN" (without the flag) for `database/sql` queries.
+   Plan 13.2 will encounter the same — keep the pair.
+
+5. **CH `schema_migrations` engine is `TinyLog` (append-only).**
+   Reading the current migration version requires `ORDER BY sequence
+   DESC LIMIT 1` — the table accumulates one row per state transition,
+   not a single mutable row. golang-migrate's own `Version()` reads
+   it this way internally; tests must mirror the pattern.
+
+6. **`gosec G101` trips on illustrative DSN strings in `usageText`.**
+   A literal `clickhouse://user:password@host:port/db` in source
+   (e.g. inside the migrator's help text) fails the SAST as
+   "hardcoded credentials". Replace with descriptive prose ("CH DSN —
+   must include `x-multi-statement=true` for multi-statement
+   migrations") to preserve operator info without the false-positive.
+   The `Makefile`'s `CLICKHOUSE_DSN ?= clickhouse://app:devpass@…`
+   default is fine because gitleaks/gosec already allow-list `devpass`
+   (matches the existing PG dev-password pattern).
+
+7. **Schema shape can be locked via `system.tables` + `system.columns`
+   queries.** This is a clean test pattern that catches column-type
+   drift, ORDER BY drift, partition-key drift, and engine drift in
+   one shot. The `want map[string]string` in
+   `TestSchema_EventsCalls_HasExpectedColumns` (and siblings) is the
+   prior-art reference. Beware: ClickHouse normalises type names
+   verbosely — `Nullable(UUID)` (parens, not angle brackets),
+   `DateTime64(3)` (precision in parens), `LowCardinality(String)`
+   (parens), `DateTime` (no precision when `DEFAULT now()` is used
+   without explicit precision). Match `want` strings byte-for-byte.
+
+8. **`sorting_key` and `partition_key` are stored as the LITERAL
+   expression text from the table definition** — `ORDER BY (a, b, c)`
+   becomes `"a, b, c"` (commas + spaces, no parens) in
+   `system.tables.sorting_key`; `PARTITION BY toYYYYMM(date)` becomes
+   `"toYYYYMM(date)"`. No surprise normalisation.
+
+9. **CI does NOT run `-tags=integration`.** The 8+ testcontainer-based
+   tests in `cmd/migrator/integration_ch_test.go` only fire locally
+   during pre-commit. This is the documented strategy (per
+   `docs/architecture/04-testing-strategy.md`) — testcontainers in
+   CI need Docker setup that the project hasn't adopted yet. The
+   trade-off: regressions in the CH driver itself only surface
+   locally OR in the user's CI. Plan 13.2 should consider adding
+   a separate `integration` CI job once the cost of Docker-in-CI
+   is justified by the volume of CH-dependent tests.
+
+10. **Per-test CH containers cost ~10s startup but are independent
+    and isolated.** With `t.Parallel()` and ~8 cores the integration
+    suite finishes in 15-20s wall-time. RAM pressure can produce
+    sporadic startup-jitter flakes (one observed during Task 3
+    execution); not a Plan 13.1 issue, just an environmental note.
+    If CI is going to run integration, allocate ≥8GB to the runner.
 
 ### 13.2 (TBD)
 
