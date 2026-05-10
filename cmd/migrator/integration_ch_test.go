@@ -396,7 +396,7 @@ func TestMV_CallsHourly_RollupShape(t *testing.T) {
 	const projectStr = "22222222-2222-2222-2222-222222222222"
 
 	// 6 calls in the same hour-bucket: 4 success, 2 fail, region MSK.
-	for i := 0; i < 6; i++ {
+	for i := range 6 {
 		status := "success"
 		if i >= 4 {
 			status = "fail"
@@ -424,8 +424,8 @@ func TestMV_CallsHourly_RollupShape(t *testing.T) {
 		  AND bucket_hour >= toDateTime('2026-05-10 12:00:00')
 		  AND bucket_hour <  toDateTime('2026-05-10 13:00:00')
 	`, tenantStr, projectStr).Scan(&totalCalls, &totalDur))
-	require.Equal(t, uint64(6), totalCalls)
-	require.Equal(t, uint64(360), totalDur) // 6 calls × 60s each
+	require.Equal(t, uint64(6), totalCalls, "6 calls inserted")
+	require.Equal(t, uint64(360), totalDur, "6 calls × 60s each")
 }
 
 // TestMV_OperatorKpiDaily_AggregatesStatesAndCalls exercises the
@@ -517,7 +517,7 @@ func TestMV_QuotasProgress_RegionGroupedByDay(t *testing.T) {
 	}
 	for region, statusCounts := range fixtures {
 		for status, count := range statusCounts {
-			for i := 0; i < count; i++ {
+			for range count {
 				_, err := db.Exec(`
 					INSERT INTO events_calls
 					(date, ts, tenant_id, project_id, operator_id, call_id, status,
@@ -592,7 +592,7 @@ func TestMV_CallsHourly_RawVsMVParity(t *testing.T) {
 	const projectStr = "99999999-9999-9999-9999-999999999999"
 
 	// 100 calls split across 4 hourly buckets and 3 statuses.
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		ts := fmt.Sprintf("2026-05-10 %02d:00:00", i%4)
 		status := []string{"success", "fail", "refusal"}[i%3]
 		_, err := db.Exec(`

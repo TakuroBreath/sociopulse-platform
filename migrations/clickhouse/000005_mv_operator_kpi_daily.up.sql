@@ -38,6 +38,10 @@ TO mv_operator_kpi_daily_state AS
 SELECT
     tenant_id,
     user_id,
+    -- project_id is Nullable in events_operator_state (state changes can
+    -- happen outside any project, e.g. on login/logout); coalesce to a
+    -- sentinel zero-UUID so the AggregatingMergeTree ORDER BY tuple
+    -- (which requires non-null) collapses these into one bucket.
     coalesce(project_id, toUUID('00000000-0000-0000-0000-000000000000')) AS project_id,
     toDate(ts)                                               AS bucket_date,
     sumState(if(state = 'in_call', toUInt64(duration_in_state_sec), toUInt64(0))) AS talk_sec,
