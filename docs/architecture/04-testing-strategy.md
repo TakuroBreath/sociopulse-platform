@@ -471,12 +471,37 @@ The mechanically enforced parts of this strategy:
 | Comma-ok type assertions | `forcetypeassert` |
 | Module isolation `internal/X/api/` only | `depguard:module-boundaries` |
 
+## What this strategy does NOT yet cover (system-level gap)
+
+The pyramid above is solid at the **per-module** level. What it does
+not yet cover is the **system level** — full `cmd/api` boot against
+the real backing stack, with cross-module flows exercised over the
+public HTTP / WS surface. As of 2026-05-10:
+
+- No `tests/smoke/` package exists yet (planned in
+  `09-agent-workflow-improvements.md` § Improvement #5).
+- No REST collection (Bruno / Postman) for manual exploration.
+- No Frontend E2E (Playwright) — owned by `sociopulse-web` repo,
+  Plan 15+.
+- No real-FreeSWITCH integration — owned by Plan 08.
+- No real-Yandex-SDK adapter coverage — owned by Plan 01.
+- No chaos / load — pre-launch milestone.
+
+The full gap analysis, the rationale ("not coverage — confidence"),
+the failure-class examples, and the phased closure plan live in
+**[`10-end-to-end-testing-gaps.md`](./10-end-to-end-testing-gaps.md)**.
+Read that document before assuming "the system is tested" based on
+the unit + integration numbers above.
+
 ## Cross-references
 
 - `08-tdd-discipline.md` — the Red-Green-Refactor playbook.
 - `02-module-contracts.md` — interfaces tests build mocks for.
 - `06-observability.md` — metrics emitted on test failures (CI).
 - `07-go-coding-standards.md` § Testing — the cc-skills heritage.
+- `09-agent-workflow-improvements.md` — workflow-level testing
+  improvements.
+- `10-end-to-end-testing-gaps.md` — system-level gaps + closure plan.
 - `samber/cc-skills-golang@golang-testing` — full skill at
   `~/.agents/skills/golang-testing/SKILL.md`.
 - ADR-0015 — TDD as mandatory discipline.

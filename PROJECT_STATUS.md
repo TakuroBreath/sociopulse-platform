@@ -259,6 +259,9 @@ The phone-hash pepper is stored as `bytea` in `tenants.phone_hash_pepper`. Plan 
 ### Compliance posture
 **Functional security, not compliance theater.** No external 152-ФЗ audit is planned in v1. We do AES-256-GCM, RLS, KMS, audit log, IVR consent because they're good engineering — not for regulators. Stop adding compliance ceremony unless an actual auditor surfaces. Rule documented in `CLAUDE.md` § Compliance posture and `docs/references/COMMON.md` § Compliance posture.
 
+### E2E testing gap (added 2026-05-10)
+The per-module testing surface (≈2 000 unit + 246 integration via testcontainers + 280 HTTP-handler unit + 1 single-module WS E2E + 1 cmd/api boot smoke) is **deeply layered but not stitched end-to-end**. There is **no `tests/smoke/`** package booting `cmd/api` against a real PG+Redis+NATS+MinIO stack and exercising cross-module flows over the public HTTP/WS surface. There is **no REST collection** (Postman/Bruno) for manual exploration. The full inventory, six concrete failure classes the gap allows, and a five-phase closure plan live in **`docs/architecture/10-end-to-end-testing-gaps.md`**. Phase 1 (smoke tests, ~2-3 days) is the immediate priority — should land before Plan 14 ships, ideally as a side-track parallel to Plan 13.2. Do NOT confuse "all gates green" with "system works end-to-end" until Phase 1 closes.
+
 ### Tooling rule (added 2026-05-08)
 Subagents and the controller MUST use:
 - **`context7` MCP** for library API verification (don't guess from training data).
