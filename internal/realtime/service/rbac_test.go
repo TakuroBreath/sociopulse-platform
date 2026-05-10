@@ -464,3 +464,80 @@ func TestTopicRBAC_FoldsResolverErrorIntoCrossTenant(t *testing.T) {
 	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe,
 		"resolver error must fold into ErrCrossTenantSubscribe (don't leak entity existence)")
 }
+
+// TestTopicRBAC_AllowRejectsCrossTenantCallID verifies the new Plan 11.4
+// CallResolver dimension. A call_id whose tenant differs from the
+// subscriber's claims must be rejected with ErrCrossTenantSubscribe.
+func TestTopicRBAC_AllowRejectsCrossTenantCallID(t *testing.T) {
+	t.Parallel()
+
+	calls := &stubResolver{tenantByID: map[string]string{
+		"call-other-tenant": "tenant-B",
+	}}
+	rbac := service.NewTopicRBACWithCallResolver(nil, nil, calls)
+
+	err := rbac.Allow(t.Context(),
+		rtapi.Claims{TenantID: "tenant-A", UserID: "u-1", Roles: []string{"operator"}},
+		rtapi.TopicCallEvents,
+		rtapi.SubscriptionFilter{CallID: "call-other-tenant"},
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe,
+		"cross-tenant call subscribe must be folded into ErrCrossTenantSubscribe")
+}
+
+// TestTopicRBAC_AllowAcceptsSameTenantCallID verifies the happy path —
+// a CallID whose tenant matches the subscriber's claims passes.
+func TestTopicRBAC_AllowAcceptsSameTenantCallID(t *testing.T) {
+	t.Parallel()
+
+	calls := &stubResolver{tenantByID: map[string]string{
+		"call-same-tenant": "tenant-A",
+	}}
+	rbac := service.NewTopicRBACWithCallResolver(nil, nil, calls)
+
+	err := rbac.Allow(t.Context(),
+		rtapi.Claims{TenantID: "tenant-A", UserID: "u-1", Roles: []string{"operator"}},
+		rtapi.TopicCallEvents,
+		rtapi.SubscriptionFilter{CallID: "call-same-tenant"},
+	)
+	require.NoError(t, err)
+}
+
+// TestTopicRBAC_AllowFoldsCallResolverErrorIntoCrossTenant — a
+// resolver-error path (not-found / DB error) must NOT distinguishably
+// surface to the wire; the wire error is identical to a tenant
+// mismatch so clients cannot probe call existence cross-tenant.
+func TestTopicRBAC_AllowFoldsCallResolverErrorIntoCrossTenant(t *testing.T) {
+	t.Parallel()
+
+	calls := &stubResolver{tenantByID: map[string]string{}} // empty → all lookups fail
+	rbac := service.NewTopicRBACWithCallResolver(nil, nil, calls)
+
+	err := rbac.Allow(t.Context(),
+		rtapi.Claims{TenantID: "tenant-A", UserID: "u-1", Roles: []string{"operator"}},
+		rtapi.TopicCallEvents,
+		rtapi.SubscriptionFilter{CallID: "call-x"},
+	)
+	require.Error(t, err)
+	assert.ErrorIs(t, err, service.ErrCrossTenantSubscribe,
+		"resolver error must fold into cross-tenant for wire indistinguishability")
+}
+
+// TestTopicRBAC_AllowSkipsCallCheckWhenCallResolverNil — preserves the
+// degraded-boot path: when no CallResolver is wired (e.g. cmd/api
+// hasn't connected the recording adapter), the cross-tenant CallID
+// check is skipped entirely. Hub.Broadcast tenant-prefix filtering
+// remains the upstream defence.
+func TestTopicRBAC_AllowSkipsCallCheckWhenCallResolverNil(t *testing.T) {
+	t.Parallel()
+
+	rbac := service.NewTopicRBACWithCallResolver(nil, nil, nil)
+
+	err := rbac.Allow(t.Context(),
+		rtapi.Claims{TenantID: "tenant-A", UserID: "u-1", Roles: []string{"operator"}},
+		rtapi.TopicCallEvents,
+		rtapi.SubscriptionFilter{CallID: "any-call-id-from-any-tenant"},
+	)
+	require.NoError(t, err, "nil CallResolver must skip the cross-tenant check (degraded boot)")
+}

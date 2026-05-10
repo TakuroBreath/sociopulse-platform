@@ -33,6 +33,7 @@ type TopicRBAC struct {
 	rules           map[rtapi.Topic]topicRule
 	userResolver    rtapi.UserResolver    // optional; nil = skip cross-tenant on OperatorID
 	projectResolver rtapi.ProjectResolver // optional; nil = skip cross-tenant on ProjectID
+	callResolver    rtapi.CallResolver    // optional; nil = skip cross-tenant on CallID (Plan 11.4)
 }
 
 // topicRule is the policy attached to a single Topic.
@@ -83,6 +84,27 @@ func NewTopicRBACWithResolvers(users rtapi.UserResolver, projects rtapi.ProjectR
 		rules:           defaultTopicRules(),
 		userResolver:    users,
 		projectResolver: projects,
+	}
+}
+
+// NewTopicRBACWithCallResolver wires all three resolvers used for the
+// cross-tenant filter check. Plan 11.4 Task 5 — extends
+// NewTopicRBACWithResolvers with the call dimension. nil resolvers are
+// allowed; the matching dimension simply skips the check.
+//
+// Production wiring (cmd/api + realtime.Module.Register) supplies all
+// three; tests typically supply stubs for the dimension under test
+// and nil for the others.
+func NewTopicRBACWithCallResolver(
+	users rtapi.UserResolver,
+	projects rtapi.ProjectResolver,
+	calls rtapi.CallResolver,
+) *TopicRBAC {
+	return &TopicRBAC{
+		rules:           defaultTopicRules(),
+		userResolver:    users,
+		projectResolver: projects,
+		callResolver:    calls,
 	}
 }
 
@@ -163,21 +185,22 @@ func (r *TopicRBAC) checkSelfOnly(rule topicRule, claims rtapi.Claims, filter rt
 }
 
 // checkCrossTenant enforces the Plan 11.2 Task 4 cross-tenant filter
-// check. Resolvers are optional — a nil resolver skips its
-// dimension (preserves the Plan 11 behaviour for tests + degraded
-// boot).
+// check, extended in Plan 11.4 Task 5 to cover the call dimension.
+// Resolvers are optional — a nil resolver skips its dimension
+// (preserves the Plan 11 behaviour for tests + degraded boot).
 //
 // selfOnly+matching-userID short-circuit: when the rule is selfOnly
-// and filter.OperatorID equals claims.UserID, the resolver call is
-// skipped — claims.TenantID already established the tenant
+// and filter.OperatorID equals claims.UserID, the user-resolver call
+// is skipped — claims.TenantID already established the tenant
 // relationship via the auth handshake.
 //
-// CallID cross-tenant check is intentionally NOT performed here.
-// See Plan 11.2 plan, "Out of scope" — Plan 12 (recording metadata)
-// introduces the CallStore.Get the third resolver would consume.
-// Today, TopicCallEvents cross-tenant safety is enforced by the
-// NATS subject prefix + Hub.Broadcast tenant filter (see Plan 11
-// Task 3 + 4b doc).
+// CallID cross-tenant check: when callResolver is wired AND the
+// filter has a CallID, the resolver must confirm the call's tenant
+// matches the claim. Wire-side indistinguishability is preserved via
+// verifyTenant's %s (not %w) error fold. Hub.Broadcast's tenant
+// filter remains the upstream defence-in-depth — this check exists so
+// the WS client gets an explicit ErrCrossTenantSubscribe rather than
+// silent zero-event delivery.
 func (r *TopicRBAC) checkCrossTenant(ctx context.Context, rule topicRule, claims rtapi.Claims, filter rtapi.SubscriptionFilter) error {
 	if r.userResolver != nil && filter.OperatorID != "" {
 		skipResolve := rule.selfOnly && filter.OperatorID == claims.UserID
@@ -189,6 +212,11 @@ func (r *TopicRBAC) checkCrossTenant(ctx context.Context, rule topicRule, claims
 	}
 	if r.projectResolver != nil && filter.ProjectID != "" {
 		if err := verifyTenant(ctx, r.projectResolver.Get, filter.ProjectID, claims.TenantID, "project_id"); err != nil {
+			return err
+		}
+	}
+	if r.callResolver != nil && filter.CallID != "" {
+		if err := verifyTenant(ctx, r.callResolver.Get, filter.CallID, claims.TenantID, "call_id"); err != nil {
 			return err
 		}
 	}
