@@ -2,17 +2,34 @@
 //
 // Usage:
 //
-//	migrator up                          # apply all pending up migrations
-//	migrator down                        # revert all migrations (dev/test)
-//	migrator down --steps=1              # revert exactly one step
-//	migrator status                      # print current version and dirty flag
-//	migrator force <version>             # set version + clear dirty (recover)
+//	migrator up                                # apply all pending up migrations (Postgres)
+//	migrator --target=clickhouse up            # same, against ClickHouse
+//	migrator down                              # revert all migrations (dev/test)
+//	migrator down --steps=1                    # revert exactly one step
+//	migrator status                            # print current version and dirty flag
+//	migrator force <version>                   # set version + clear dirty (recover)
 //
-// Environment:
+// The optional --target=<name> flag selects which database to migrate:
+//
+//	postgres   (default) — uses DATABASE_URL + MIGRATIONS_PATH
+//	clickhouse           — uses CLICKHOUSE_DSN + CLICKHOUSE_MIGRATIONS_PATH
+//
+// The flag may appear before or after the sub-command. Each target has
+// its own env-var pair so a single Helm Job can reuse the same binary
+// with different args + env per target.
+//
+// Environment (postgres target):
 //
 //	DATABASE_URL       Postgres connection string (required)
 //	MIGRATIONS_PATH    File URL pointing to the migrations directory
 //	                   (default: file:///etc/sociopulse/migrations).
+//
+// Environment (clickhouse target):
+//
+//	CLICKHOUSE_DSN              CH DSN; must include x-multi-statement=true
+//	                              for multi-statement migrations.
+//	CLICKHOUSE_MIGRATIONS_PATH  File URL of the CH migrations directory
+//	                              (default: file:///etc/sociopulse/migrations/clickhouse).
 //
 // Exit codes:
 //
@@ -60,19 +77,30 @@ type usageError struct{ msg string }
 
 func (e *usageError) Error() string { return e.msg }
 
-const usageText = `usage: migrator <up|down|status|force> [args]
+const usageText = `usage: migrator [--target=<postgres|clickhouse>] <up|down|status|force> [args]
 
-Subcommands:
+Sub-commands:
   up                   apply all pending migrations
   down                 revert all migrations (dev/test only)
   down --steps=N       revert exactly N steps
   status               print current version and dirty flag
   force <version>      set version + clear dirty flag (manual recovery)
 
-Environment:
-  DATABASE_URL         Postgres DSN (required)
-  MIGRATIONS_PATH      file:// URL of the migrations directory
-                       (default: file:///etc/sociopulse/migrations)
+Targets:
+  --target=postgres    (default) apply Postgres migrations
+  --target=clickhouse  apply ClickHouse migrations
+
+Environment (postgres target):
+  DATABASE_URL                Postgres DSN (required)
+  MIGRATIONS_PATH             file:// URL of the migrations directory
+                              (default: file:///etc/sociopulse/migrations)
+
+Environment (clickhouse target):
+  CLICKHOUSE_DSN              ClickHouse DSN (required); must include
+                              x-multi-statement=true for multi-statement
+                              migrations.
+  CLICKHOUSE_MIGRATIONS_PATH  file:// URL of the CH migrations directory
+                              (default: file:///etc/sociopulse/migrations/clickhouse)
 
 Exit codes:
   0   success
@@ -91,12 +119,6 @@ func main() {
 		}
 	}
 
-	dsn := os.Getenv("DATABASE_URL")
-	migPath := os.Getenv("MIGRATIONS_PATH")
-	if migPath == "" {
-		migPath = defaultMigrationsPath
-	}
-
 	logger, err := zap.NewProduction()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "init zap: %v\n", err)
@@ -104,7 +126,11 @@ func main() {
 	}
 	defer func() { _ = logger.Sync() }()
 
-	if err := run(os.Args[1:], dsn, migPath, os.Stdout); err != nil {
+	// Pull --target=<name> off the front of argv (or from any position).
+	// Default target is "postgres" so existing invocations keep working.
+	target, args, err := resolveTarget(os.Args[1:])
+	if err != nil {
+		// resolveTarget only emits *usageError; route to exit 1.
 		var ue *usageError
 		if errors.As(err, &ue) {
 			logger.Error("migrator usage error", zap.Error(err))
@@ -114,6 +140,60 @@ func main() {
 		logger.Error("migrator failed", zap.Error(err))
 		os.Exit(2)
 	}
+
+	dsn, migPath := loadTargetEnv(target)
+
+	// Per-target empty-DSN check: produces a message that points at the
+	// right env var ("DATABASE_URL is empty" vs "CLICKHOUSE_DSN is empty"),
+	// which beats run()'s generic check in operator usefulness. The check
+	// in run() stays as defense-in-depth + a TestRun_RequiresDSN unit test.
+	if dsn == "" {
+		envName := "DATABASE_URL"
+		if target == targetClickHouse {
+			envName = envClickHouseDSN
+		}
+		ue := &usageError{msg: envName + " is empty"}
+		logger.Error("migrator usage error", zap.Error(ue))
+		fmt.Fprint(os.Stderr, usageText)
+		os.Exit(1)
+	}
+
+	if err := run(args, dsn, migPath, os.Stdout); err != nil {
+		var ue *usageError
+		if errors.As(err, &ue) {
+			logger.Error("migrator usage error", zap.Error(err))
+			fmt.Fprint(os.Stderr, usageText)
+			os.Exit(1)
+		}
+		logger.Error("migrator failed", zap.Error(err))
+		os.Exit(2)
+	}
+}
+
+// loadTargetEnv selects DSN + migrations-path env vars per target.
+// Each target uses a distinct env-var pair so a misconfigured deployment
+// fails loudly (e.g. "DATABASE_URL is empty") instead of silently picking
+// the wrong DSN. The empty-string check that drives that error lives in
+// run(), keeping main()'s wiring small and exhaustive.
+func loadTargetEnv(target string) (dsn, migPath string) {
+	switch target {
+	case targetClickHouse:
+		dsn = os.Getenv(envClickHouseDSN)
+		migPath = os.Getenv(envClickHousePath)
+		if migPath == "" {
+			migPath = defaultClickHouseMigrationsPath
+		}
+	default:
+		// targetPostgres or any other value resolveTarget would have
+		// rejected; the default branch keeps the wiring exhaustive
+		// without forcing exhaustive-switch noise on a 2-value enum.
+		dsn = os.Getenv("DATABASE_URL")
+		migPath = os.Getenv("MIGRATIONS_PATH")
+		if migPath == "" {
+			migPath = defaultMigrationsPath
+		}
+	}
+	return dsn, migPath
 }
 
 // run is the testable entrypoint. args is the slice without the program name.

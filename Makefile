@@ -183,6 +183,44 @@ migrate-create: ## Create a new migration pair: NAME=add_users_table
 	echo "Created migrations/$${next}_$(NAME).up.sql"; \
 	echo "Created migrations/$${next}_$(NAME).down.sql"
 
+# ----- ClickHouse migrations (analytics) -----
+# CH migrations live in migrations/clickhouse/. Apply against
+# CLICKHOUSE_DSN; default DSN points at the dev compose stack
+# (see make dev-up PROFILE=analytics). x-multi-statement=true is
+# required by golang-migrate's CH driver to split multi-statement
+# migrations on `;`.
+
+CLICKHOUSE_DSN ?= clickhouse://app:devpass@localhost:9000/sociopulse?x-multi-statement=true
+CH_MIGRATIONS_PATH ?= file://$(PWD)/migrations/clickhouse
+
+.PHONY: migrate-ch-up
+migrate-ch-up: ## Apply all pending CH migrations against $$CLICKHOUSE_DSN
+	CLICKHOUSE_DSN='$(CLICKHOUSE_DSN)' CLICKHOUSE_MIGRATIONS_PATH='$(CH_MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator --target=clickhouse up
+
+.PHONY: migrate-ch-down
+migrate-ch-down: ## Revert all CH migrations (DEV ONLY)
+	CLICKHOUSE_DSN='$(CLICKHOUSE_DSN)' CLICKHOUSE_MIGRATIONS_PATH='$(CH_MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator --target=clickhouse down
+
+.PHONY: migrate-ch-status
+migrate-ch-status: ## Print the current CH migration version + dirty flag
+	CLICKHOUSE_DSN='$(CLICKHOUSE_DSN)' CLICKHOUSE_MIGRATIONS_PATH='$(CH_MIGRATIONS_PATH)' \
+	  $(GO) run ./cmd/migrator --target=clickhouse status
+
+.PHONY: migrate-ch-create
+migrate-ch-create: ## Create a new CH migration pair: NAME=add_some_table
+	@if [ -z "$(NAME)" ]; then \
+	  echo "ERROR: NAME is required, e.g. make migrate-ch-create NAME=add_some_table"; \
+	  exit 1; \
+	fi
+	@mkdir -p migrations/clickhouse
+	@last=$$(ls migrations/clickhouse/ 2>/dev/null | grep -E '^[0-9]{6}_' | sed -E 's/^([0-9]{6})_.*/\1/' | sort -n | tail -1); \
+	if [ -z "$$last" ]; then next=000001; else next=$$(printf '%06d' $$((10#$$last + 1))); fi; \
+	touch migrations/clickhouse/$${next}_$(NAME).up.sql migrations/clickhouse/$${next}_$(NAME).down.sql; \
+	echo "Created migrations/clickhouse/$${next}_$(NAME).up.sql"; \
+	echo "Created migrations/clickhouse/$${next}_$(NAME).down.sql"
+
 # ──────────────────────────── proto codegen ───────────────────────────────────
 # Plugins are pinned via go.mod `tool` directive (Go 1.24+). `go tool` resolves
 # the binary from the module cache without installing anything globally — the
