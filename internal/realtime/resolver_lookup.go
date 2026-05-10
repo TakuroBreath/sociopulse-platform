@@ -104,10 +104,48 @@ func (emptyProjectResolver) Get(_ context.Context, _ string) (rtapi.ResolvedTena
 	return rtapi.ResolvedTenant{}, rtapi.ErrCrossTenantSubscribe
 }
 
+// resolveCallResolverFromLocator picks the production call resolver
+// adapter when cmd/api has registered it; otherwise returns the
+// emptyCallResolver fallback that rejects every cross-tenant lookup.
+// Mirrors the behaviour of resolveResolversFromLocator. Plan 11.4 Task 7.
+func resolveCallResolverFromLocator(locator modules.ServiceLocator, logger *zap.Logger) rtapi.CallResolver {
+	if logger == nil {
+		logger = zap.NewNop()
+	}
+	if locator == nil {
+		logger.Info("realtime resolvers: call — locator missing, using empty fallback")
+		return emptyCallResolver{}
+	}
+	v, ok := locator.Lookup(rtapi.LocatorCallResolver)
+	if !ok {
+		logger.Info("realtime resolvers: CallResolver missing, using empty fallback (degraded boot)")
+		return emptyCallResolver{}
+	}
+	r, ok := v.(rtapi.CallResolver)
+	if !ok {
+		logger.Warn("realtime resolvers: CallResolver registered with wrong type",
+			zap.String("got_type", fmt.Sprintf("%T", v)),
+		)
+		return emptyCallResolver{}
+	}
+	return r
+}
+
+// emptyCallResolver mirrors emptyUserResolver / emptyProjectResolver
+// for the call dimension. Returned when cmd/api hasn't wired the
+// recording adapter; preserves the security envelope by failing closed.
+type emptyCallResolver struct{}
+
+// Get returns ErrCrossTenantSubscribe for every input.
+func (emptyCallResolver) Get(_ context.Context, _ string) (rtapi.ResolvedTenant, error) {
+	return rtapi.ResolvedTenant{}, rtapi.ErrCrossTenantSubscribe
+}
+
 // Compile-time interface checks. Keeping these next to the
 // implementations means a port signature change breaks the build at
 // the empty fallback, not far away in the consumer.
 var (
 	_ rtapi.UserResolver    = emptyUserResolver{}
 	_ rtapi.ProjectResolver = emptyProjectResolver{}
+	_ rtapi.CallResolver    = emptyCallResolver{}
 )

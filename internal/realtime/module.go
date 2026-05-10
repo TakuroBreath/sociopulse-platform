@@ -98,17 +98,29 @@ type Module struct {
 	logger   *zap.Logger
 	hub      *service.Hub
 	presence *service.RedisPresenceTracker
+	// cachedUsers is retained as a Module field so the NATS-driven
+	// cache invalidator (Plan 11.4 Task 6/7) can bind its Invalidate
+	// method as the user-side eviction callback. Built in Register,
+	// never mutated after. Plan 11.4 Task 7.
+	cachedUsers *service.CachedUserResolver
 	// cachedProjects is retained as a Module field so the
 	// NATS-driven cache invalidator (Plan 11.3 Task 3) can bind its
 	// Invalidate method as the project-side eviction callback. Built
 	// in Register, never mutated after.
 	cachedProjects *service.CachedProjectResolver
+	// cachedCalls is retained as a Module field so the NATS-driven
+	// cache invalidator can bind its Invalidate method as the
+	// call-side eviction callback (Plan 11.4 Task 6/7). Built in
+	// Register, never mutated after.
+	cachedCalls *service.CachedCallResolver
 	// cacheInvalidator is the NATS subscription that evicts stale
-	// project entries from cachedProjects on
-	// tenant.*.crm.project.status_changed events. nil when
-	// d.Subscriber wasn't supplied OR when the underlying Subscribe
-	// failed (we WARN + fall back to TTL-only invalidation rather
-	// than failing module Register). Plan 11.3 Task 3.
+	// project / user / call entries from the matching Cached*Resolver
+	// on tenant.*.crm.project.status_changed,
+	// tenant.*.auth.user.deleted, and tenant.*.recording.call.deleted
+	// events. nil when d.Subscriber wasn't supplied OR when the
+	// underlying Subscribe failed (we WARN + fall back to TTL-only
+	// invalidation rather than failing module Register). Plan 11.3
+	// Task 3 + Plan 11.4 Task 6/7.
 	cacheInvalidator *events.CacheInvalidator
 	replicaID        string
 	registered       bool
@@ -191,11 +203,22 @@ func (m *Module) Register(d modules.Deps) error {
 	rawUsers, rawProjects := resolveResolversFromLocator(d.Locator, logger)
 	cachedUsers := service.NewCachedUserResolver(rawUsers, 0)
 	cachedProjects := service.NewCachedProjectResolver(rawProjects, 0)
-	// Retain cachedProjects as a Module field so the NATS-driven
-	// cache invalidator wired below can bind .Invalidate as the
-	// project-side eviction callback (Plan 11.3 Task 3).
+	// Retain cachedUsers / cachedProjects as Module fields so the
+	// NATS-driven cache invalidator wired below can bind .Invalidate
+	// as the user/project-side eviction callbacks (Plan 11.3 Task 3 +
+	// Plan 11.4 Task 7).
+	m.cachedUsers = cachedUsers
 	m.cachedProjects = cachedProjects
-	rbac := service.NewTopicRBACWithResolvers(cachedUsers, cachedProjects)
+
+	// Plan 11.4 Task 7: resolve the optional CallResolver. Falls back
+	// to emptyCallResolver{} when cmd/api hasn't wired the recording
+	// adapter (degraded boot) — emptyCallResolver rejects every
+	// cross-tenant lookup, which is strictly safer than no check.
+	rawCalls := resolveCallResolverFromLocator(d.Locator, logger)
+	cachedCalls := service.NewCachedCallResolver(rawCalls, 0)
+	m.cachedCalls = cachedCalls
+
+	rbac := service.NewTopicRBACWithCallResolver(cachedUsers, cachedProjects, cachedCalls)
 
 	// Hub-level metrics + per-connection metrics. Both are registered
 	// on the shared registry so dashboards can correlate
@@ -264,6 +287,8 @@ func (m *Module) Register(d modules.Deps) error {
 		invalidator := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
 			Subscriber:        d.Subscriber,
 			ProjectInvalidate: cachedProjects.Invalidate,
+			UserInvalidate:    cachedUsers.Invalidate, // Plan 11.4 Task 7
+			CallInvalidate:    cachedCalls.Invalidate, // Plan 11.4 Task 7
 			Metrics:           cacheInvalidatorMetrics,
 			Logger:            logger.Named("cache_invalidator"),
 		})
@@ -282,7 +307,11 @@ func (m *Module) Register(d modules.Deps) error {
 		} else {
 			m.cacheInvalidator = invalidator
 			logger.Info("realtime: cache invalidator started",
-				zap.String("subject", events.SubjectProjectStatus),
+				zap.Strings("subjects", []string{
+					events.SubjectProjectStatus,
+					events.SubjectUserDeleted,
+					events.SubjectRecordingCallDeleted,
+				}),
 			)
 		}
 	}

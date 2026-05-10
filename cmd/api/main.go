@@ -319,6 +319,7 @@ func run(ctx context.Context, configDir string) error {
 		return err
 	}
 	registerRealtimeResolvers(locator, logger)
+	registerCallResolver(locator, logger) // Plan 11.4 Task 7
 	consumers := modules.Registry{Modules: []modules.Module{
 		realtimeModule,
 	}}

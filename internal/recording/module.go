@@ -38,6 +38,7 @@ import (
 	authmod "github.com/sociopulse/platform/internal/auth"
 	authapi "github.com/sociopulse/platform/internal/auth/api"
 	"github.com/sociopulse/platform/internal/modules"
+	rapi "github.com/sociopulse/platform/internal/recording/api"
 	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/grpcserver"
 	"github.com/sociopulse/platform/internal/recording/metrics"
@@ -51,6 +52,11 @@ import (
 // stashes the constructed rapi.RecordingService. Plan 12.2 / 12.3
 // modules look it up here when they need to call Commit / Get / etc.
 const LocatorRecordingService = "recording.RecordingService"
+
+// LocatorCallTenantLookup is the locator key for the BypassRLS
+// call_id → tenant_id lookup port. cmd/api adapts this to
+// rtapi.CallResolver. Plan 11.4 Task 7.
+const LocatorCallTenantLookup = "recording.CallTenantLookup"
 
 // Config groups the construction-time parameters of the module.
 //
@@ -158,6 +164,11 @@ func (m *Module) Register(d modules.Deps) error {
 	})
 	if d.Locator != nil {
 		d.Locator.Register(LocatorRecordingService, svc)
+		// Plan 11.4 Task 7: publish the BypassRLS call_id → tenant_id
+		// lookup port so cmd/api's callResolverAdapter can wire the
+		// realtime CallResolver. *PostgresStore satisfies the port via
+		// internal/recording/store/lookup.go (Plan 11.4 Task 4).
+		d.Locator.Register(LocatorCallTenantLookup, rapi.CallTenantLookup(pgStore))
 	}
 
 	// Plan 12.3 Task 5: mount HTTP routes when a router is supplied. Auth
