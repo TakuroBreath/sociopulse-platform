@@ -17,11 +17,17 @@
 
 ---
 
-## Amendments (post-execution)
+## Amendments (post-execution 2026-05-10)
 
-_To be filled at close-out per `docs/architecture/09-agent-workflow-improvements.md` #2._
+The plan as written was followed verbatim with three minor adaptations during execution:
 
-`## Amendments: none`
+- **2026-05-10 — Task 1 test-fake naming.** Plan template referenced `newRecordingOutboxWriter` / `newFakeUserStoreWithTenant`; the actual `internal/auth/service/user_service_test.go` file uses internal `package service` with existing fakes named `fakeStore` / `fakeAudit` / `fakeTxRunner`. Implementer adapted to match: introduced `fakeOutbox` / `newFakeOutbox()` mirroring the existing fake pattern; extended `fakeTxRunner.lastRolledBack()`; updated the existing `newSvc(t)` 3-tuple to a 4-tuple `(*UserService, *fakeStore, *fakeAudit, *fakeOutbox)`. All 22 existing call sites updated. **Spec semantics unchanged** — same behaviour, just consistent local naming.
+
+- **2026-05-10 — Task 1 reviewer fixups (commit `dd9be37`).** Code-quality reviewer flagged: (a) IMPORTANT — stale package-level comment in `internal/auth/api/events.go` claimed "auth does not publish events on its own subjects" — now contradicted by the new `SubjectUserDeleted` block in the same file; (b) MINOR — `TestUserService_Archive_Idempotent` did not pin the outbox-row count post-Plan-11.4. Both fixed inline (~13 lines docs+tests, zero behavior change) per re-review proportionality (`docs/architecture/09-agent-workflow-improvements.md` #7).
+
+- **2026-05-10 — Task 4 sentinel name.** Plan template said use `store.ErrInvalidArgument` OR define one. The existing `internal/recording/store/` package does not define such a sentinel; the canonical "invalid input" sentinel is `rapi.ErrInvalidInput` (api-level). For the nil-callID guard in `LookupTenant`, implementer used a plain `fmt.Errorf("recording.store.LookupTenant: nil callID")` without a sentinel — calls from `cmd/api/recording_resolver.go::Get` fold any error into `ErrCrossTenantSubscribe` via the realtime layer's `verifyTenant` helper, so a dedicated sentinel is unnecessary at the store boundary. Reviewer noted this as MINOR + acceptable.
+
+No spec contradictions; no migrations changed; no ADR contradictions.
 
 ---
 

@@ -182,3 +182,65 @@ These bullets were populated when `v0.0.12-realtime` shipped. Future plans inher
 23. **`internal/dialer/fsm.RefreshPresence` is exported but not wired.** Same story — intended as Plan 11 work, deferred. Need a gin middleware on operator routes so the Heartbeat watchdog only triggers on ungraceful disconnect.
 
 24. **Listen-in v1 (silent mode + audit) is still deferred to Plan 08.** Plan 11 Decision 5 locked this in; Plan 08 (FreeSWITCH cluster) is a prerequisite. Plan 11 Task 7's listen-in handlers return 503 + `telephony.bridge.offline` until then.
+
+---
+
+## Plan 11.4 Production lessons (post-execution 2026-05-10, `v0.0.20-auth-user-deleted-callresolver`)
+
+These bullets capture what we actually learned executing Plan 11.4 — closing the auth.user.deleted carry-over from 11.3 + the CallResolver carry-over from 11.2.
+
+### Architecture & API discipline
+
+25. **Optional callback fields preserve degraded boot.** `*CacheInvalidator` now has 3 callback config fields: `ProjectInvalidate` (REQUIRED — preserves Plan 11.3 contract; nil panics) plus new `UserInvalidate` and `CallInvalidate` (OPTIONAL — nil → skip Subscribe + INFO log). This shape lets cmd/api boot with auth-only or recording-only or both, without changing the invalidator's surface. Mistake to avoid: making the new ones REQUIRED would break degraded test boots.
+
+26. **Metric label evolution is breaking but the project has no external dashboards yet.** `realtime_cache_invalidations_total{result}` → `{subject, result}`, plus `empty_project_id` → uniform `empty_id`. Documented inline in `metrics.go`. If we had Grafana dashboards subscribed to this metric, the rename would be a coordinated migration; in v1 it's just internal evolution. **Standing rule for future plans:** when adding labels to bounded counters, the old query stops returning data — flag this as a breaking change in the milestone description.
+
+27. **Empty-fallback chain is the security envelope on degraded boot.** `emptyCallResolver{}` + `emptyUserResolver{}` + `emptyProjectResolver{}` all return `ErrCrossTenantSubscribe` for every input. When cmd/api hasn't wired the real adapter, the cache layer caches "always reject" entries — the system fails CLOSED rather than open. This is the difference between "no check" and "explicit deny" — pick deny for security-sensitive ports.
+
+28. **The 4 close-out task pattern is an integration-validation lens, not a code-extension.** Task 7 was 90% wiring (cmd/api adapter + module.go binding + 3 method values) and 10% new code. The reviewer's end-to-end behavioural property check (`tenant.X.recording.call.deleted` → `handleCall` → `cachedCalls.Invalidate` → next `CallResolver.Get` re-queries) was the actual deliverable — confirming the chain is connected. For future closing-wiring tasks, structure the review around the END-TO-END flow, not just file-by-file diff.
+
+### Outbox pattern (auth's first NATS subject)
+
+29. **`outbox.Writer.Append` works inside `WithTenant Tx` even when the table is owned by `tenancy_admin`.** `event_outbox` is owned by `tenancy_admin`; `app` retains full CRUD grants (Plan 03 setup). So a `WithTenant Tx { store.X + writeAudit + outbox.Append }` triple commits atomically without role-switching. Plan 12.1 verified this against migrations 000001 + 000002 + 000009; Plan 11.4 confirmed it for the auth path. Reusable rule: any module wanting to publish lifecycle events follows this exact triple, no surprises.
+
+30. **`UserDeletedEvent` payload is opaque-UUIDs only.** `{UserID, TenantID, DeletedAt unix-seconds, Reason "archived"|"hard_deleted"}`. NO phone, email, login, full_name on the bus. The PII discipline scales: any future `tenant.<t>.auth.user.<verb>` subject MUST follow the same shape. The cache invalidator only needs the `user_id` to drop a cache entry — it does NOT need any of the deleted user's PII.
+
+31. **Constructor signature evolution requires updating every test call site.** Adding `outboxWriter outbox.Writer` between `auditLogger` and `clock` in `NewUserService` — 22 existing test call sites. The implementer used the existing test-file's `newSvc(t)` helper (which now returns a 4-tuple) to localise the impact. Pattern: a single `newSvc(t)` constructor in test code makes future signature changes a 1-line edit instead of N edits.
+
+### Resolver cache (third dimension)
+
+32. **`CachedCallResolver` lives in its own file by design.** `internal/realtime/service/resolver_cache.go` is at 287 lines (User + Project mirrors). Adding the third copy would push past 400 lines in the same file — harder to hold in working memory. Lesson: split when adding the THIRD copy, not the second; reuse the unexported `cachedResolverEntry` + `defaultResolverTTL` + `resolverInnerTimeout` from the original file. Future agents touching the resolver cache need to read both files to understand the full triplet.
+
+33. **`stubResolver` in `rbac_test.go` is generic — same struct satisfies all three resolver ports.** The `Get(ctx, id) → (ResolvedTenant, error)` signature is the SAME for User / Project / Call resolvers. The existing helper at `rbac_test.go:26-30` works for the new dimension without modification. Reusable rule: when adding a new resolver, check the test helper FIRST — odds are it's already generic.
+
+34. **Plan 11.2 Task 3 IMPORTANT I-1 (singleflight ctx-bleed) is now regression-tested for THREE dimensions.** `context.WithoutCancel(ctx) + context.WithTimeout(5s)` inside the singleflight closure is the canonical fix. Each `Cached*Resolver` has its own `Test*_LeaderCtxCancelDoesNotPoisonDuplicates`. If the 4th resolver dimension ever lands (e.g. `RecordingResolver` for full recording metadata vs. just tenant), it MUST carry the same regression guard.
+
+### Recording-side BypassRLS lookup
+
+35. **`tenancy_admin` SELECT grant on `call_recordings`** was added by Plan 12.4 migration 000011. Plan 11.4 Task 4's `LookupTenant` BypassRLS SELECT relies on it — verify-before-assert step caught no surprises. Future cross-tenant lookups on recording tables must verify the same grant or add a new migration if the table is a different one (e.g. a hypothetical `recording_artifacts` would need its own grant).
+
+36. **`recording.api.CallTenantLookup` is intentionally separate from `RecordingService.Get`.** The latter requires `tenantID` at the boundary; the former takes only `callID` and resolves via BypassRLS. Keeping them separate keeps the public RecordingService surface stable (HTTP + gRPC consumers don't see a new method). Reusable rule: when adding a tiny cross-tenant lookup, prefer a NEW narrow port over expanding an existing service interface.
+
+37. **The cross-tenant integration test ACTUALLY exercises BypassRLS.** `TestPostgresStore_LookupTenant_BypassRLS_CrossTenant` seeds the row under tenantA, then enters `pool.WithTenant(tenantB, ...)` and calls `LookupTenant(callA)` from inside that scope. If the impl had used a regular tenant-scoped connection, RLS would hide the row and the test would FAIL. This test is the difference between "lookup compiles" and "lookup actually works cross-tenant".
+
+### Pipeline & review
+
+38. **2-stage review per task + final-implementation review caught everything.** Across 7 tasks: 0 CRITICAL + 0 IMPORTANT (the one IMPORTANT was a stale doc fixup landed inline in `dd9be37`) + ~6 MINOR (most deferred). 28 new tests / 28 t.Parallel() calls — perfect 1:1. Final reviewer (independent) reproduced the canonical commands and confirmed all 6 CI jobs would pass. **The pipeline pattern's value compounds**: each task's reviewer learns from the prior tasks' findings, so the lessons-learned hierarchy stays current.
+
+39. **Re-review proportionality (`09-agent-workflow-improvements.md` #7) saved 2 review-rounds.** Task 1 had 1 IMPORTANT (stale package comment, doc-only) + 1 meaningful MINOR (idempotent test outbox-count pin). Total ~13 lines, no behavior change. Controller fixed inline in `dd9be37` — no full re-review needed. Heuristic worked as designed: 6-30 lines + doc/test only = single re-review or skip.
+
+40. **Gopls cache pollution is a real and consistent pattern across all 7 tasks.** Every task triggered `<new-diagnostics>` warnings claiming the just-added function/constant was undefined. Every time, `go build ./...` was clean and tests passed. Standing rule from CLAUDE.md workflow #5 worked exactly as documented: "If those pass, the IDE diagnostics are noise." Reusable telemetry: the controller wasted 0 minutes investigating these — the canonical commands resolved every false-positive in <30 seconds each.
+
+### Carry-overs from prior plans (NOW CLOSED in Plan 11.4)
+
+41. **Plan 11.2 Task 5 NIT M-3 — wire-string scrub on `FrameSubscribeErr.Reason`** — was carried over to Plan 11.3 Task 1 and CLOSED there. Not re-opened in 11.4.
+
+42. **Plan 11.3 deferred: auth user-deleted cache invalidation** — CLOSED by Plan 11.4 Task 1 (auth publishes) + Task 6 (CacheInvalidator subscribes) + Task 7 (cmd/api binds `cachedUsers.Invalidate`).
+
+43. **Plan 11.2 deferred: CallResolver (Plan 12 dependency)** — CLOSED by Plan 11.4 Tasks 2-5 + 7. The wiring depends on Plan 12.4 having shipped (`v0.0.19-recording-workers`); now it's all live.
+
+### Carry-overs still open (NOT closed in 11.4)
+
+44. **Plan 11.1 carry-overs** (`internal/telephony/nats_bridge`, `dialer.SnapshotPubSub` NATS upgrade, `dialer.fsm.RefreshPresence` middleware) — still pending. Not in scope for 11.4.
+
+45. **Plan 11.2 listen-in cleanup hooks (Plan 11 Task 10.2)** — still deferred until Plan 08 (FreeSWITCH cluster) lands.
