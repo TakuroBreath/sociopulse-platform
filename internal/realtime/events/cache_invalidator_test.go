@@ -31,8 +31,10 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
+	authapi "github.com/sociopulse/platform/internal/auth/api"
 	crmapi "github.com/sociopulse/platform/internal/crm/api"
 	"github.com/sociopulse/platform/internal/realtime/events"
+	rapi "github.com/sociopulse/platform/internal/recording/api"
 )
 
 // fakeProjectInvalidator captures Invalidate(string) calls so tests
@@ -106,7 +108,10 @@ func TestCacheInvalidator_ProjectStatusChangedTriggersInvalidate(t *testing.T) {
 
 	require.InDelta(t, 1.0,
 		counterValue(t, reg, "realtime_cache_invalidations_total",
-			map[string]string{"result": "ok"}), 0.0001)
+			map[string]string{
+				"subject": events.SubjectProjectStatus,
+				"result":  "ok",
+			}), 0.0001)
 }
 
 // TestCacheInvalidator_MalformedPayloadTicksParseError verifies the
@@ -137,7 +142,10 @@ func TestCacheInvalidator_MalformedPayloadTicksParseError(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		v := counterValue(t, reg, "realtime_cache_invalidations_total",
-			map[string]string{"result": "parse_error"})
+			map[string]string{
+				"subject": events.SubjectProjectStatus,
+				"result":  "parse_error",
+			})
 		return v >= 1.0
 	}, 2*time.Second, 10*time.Millisecond,
 		"malformed payload must tick parse_error metric")
@@ -148,8 +156,9 @@ func TestCacheInvalidator_MalformedPayloadTicksParseError(t *testing.T) {
 
 // TestCacheInvalidator_EmptyProjectIDTicksEmptyMetric exercises the
 // defensive branch: a status_changed payload with a zero-UUID ProjectID
-// must NOT call Invalidate but must tick the empty_project_id label so
-// the bug is observable on dashboards.
+// must NOT call Invalidate but must tick the empty_id label so the bug
+// is observable on dashboards. Plan 11.4 Task 6 renamed the result
+// label value from "empty_project_id" to the uniform "empty_id".
 func TestCacheInvalidator_EmptyProjectIDTicksEmptyMetric(t *testing.T) {
 	t.Parallel()
 
@@ -182,10 +191,13 @@ func TestCacheInvalidator_EmptyProjectIDTicksEmptyMetric(t *testing.T) {
 
 	require.Eventually(t, func() bool {
 		v := counterValue(t, reg, "realtime_cache_invalidations_total",
-			map[string]string{"result": "empty_project_id"})
+			map[string]string{
+				"subject": events.SubjectProjectStatus,
+				"result":  "empty_id",
+			})
 		return v >= 1.0
 	}, 2*time.Second, 10*time.Millisecond,
-		"empty project_id must tick the empty_project_id metric")
+		"empty project_id must tick the empty_id metric")
 
 	assert.Empty(t, target.Calls(),
 		"empty project_id must NOT call ProjectInvalidate")
@@ -289,3 +301,193 @@ func TestCacheInvalidator_DefaultQueueGroup(t *testing.T) {
 // package-level var so multiple tests can errors.Is against it
 // without re-constructing it per test.
 var errBoom = errors.New("subscribe boom")
+
+// fakeCallInvalidator captures Invalidate(string) calls so tests can
+// assert on the CallIDs the invalidator forwarded.
+type fakeCallInvalidator struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeCallInvalidator) Invalidate(callID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, callID)
+}
+
+func (f *fakeCallInvalidator) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+// fakeUserInvalidator mirrors fakeCallInvalidator for user_id.
+type fakeUserInvalidator struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (f *fakeUserInvalidator) Invalidate(userID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, userID)
+}
+
+func (f *fakeUserInvalidator) Calls() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make([]string, len(f.calls))
+	copy(out, f.calls)
+	return out
+}
+
+// TestCacheInvalidator_RecordingCallDeletedTriggersCallInvalidate verifies
+// that publishing tenant.<t>.recording.call.deleted routes the CallID
+// to the call invalidator.
+func TestCacheInvalidator_RecordingCallDeletedTriggersCallInvalidate(t *testing.T) {
+	t.Parallel()
+
+	bus := &fakeBus{}
+	pTarget := &fakeProjectInvalidator{}
+	cTarget := &fakeCallInvalidator{}
+	reg := prometheus.NewRegistry()
+	metrics := events.RegisterCacheInvalidatorMetrics(reg)
+
+	inv := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
+		Subscriber:        bus,
+		ProjectInvalidate: pTarget.Invalidate,
+		CallInvalidate:    cTarget.Invalidate,
+		Metrics:           metrics,
+		Logger:            zaptest.NewLogger(t),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, inv.Start(ctx))
+	t.Cleanup(inv.Stop)
+
+	tenantID := uuid.New()
+	callID := uuid.New()
+	recordingID := uuid.New()
+	payload, err := json.Marshal(rapi.RecordingCallDeletedEvent{
+		RecordingID: recordingID,
+		CallID:      callID,
+		TenantID:    tenantID,
+		DeletedAt:   time.Now().Unix(),
+		Reason:      "retention",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, bus.Fire(rapi.SubjectRecordingCallDeletedFor(tenantID), payload))
+
+	require.Eventually(t, func() bool {
+		return len(cTarget.Calls()) >= 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"CallInvalidate must fire on recording.call.deleted")
+
+	assert.Contains(t, cTarget.Calls(), callID.String())
+	assert.Empty(t, pTarget.Calls(),
+		"ProjectInvalidate must not fire on a recording event")
+
+	require.InDelta(t, 1.0,
+		counterValue(t, reg, "realtime_cache_invalidations_total",
+			map[string]string{
+				"subject": events.SubjectRecordingCallDeleted,
+				"result":  "ok",
+			}), 0.0001)
+}
+
+// TestCacheInvalidator_AuthUserDeletedTriggersUserInvalidate verifies
+// that publishing tenant.<t>.auth.user.deleted routes the UserID to
+// the user invalidator.
+func TestCacheInvalidator_AuthUserDeletedTriggersUserInvalidate(t *testing.T) {
+	t.Parallel()
+
+	bus := &fakeBus{}
+	uTarget := &fakeUserInvalidator{}
+	pTarget := &fakeProjectInvalidator{}
+	reg := prometheus.NewRegistry()
+	metrics := events.RegisterCacheInvalidatorMetrics(reg)
+
+	inv := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
+		Subscriber:        bus,
+		ProjectInvalidate: pTarget.Invalidate,
+		UserInvalidate:    uTarget.Invalidate,
+		Metrics:           metrics,
+		Logger:            zaptest.NewLogger(t),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, inv.Start(ctx))
+	t.Cleanup(inv.Stop)
+
+	tenantID := uuid.New()
+	userID := uuid.New()
+	payload, err := json.Marshal(authapi.UserDeletedEvent{
+		UserID:    userID,
+		TenantID:  tenantID,
+		DeletedAt: time.Now().Unix(),
+		Reason:    "archived",
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, bus.Fire(authapi.SubjectUserDeletedFor(tenantID), payload))
+
+	require.Eventually(t, func() bool {
+		return len(uTarget.Calls()) >= 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"UserInvalidate must fire on auth.user.deleted")
+
+	assert.Contains(t, uTarget.Calls(), userID.String())
+
+	require.InDelta(t, 1.0,
+		counterValue(t, reg, "realtime_cache_invalidations_total",
+			map[string]string{
+				"subject": events.SubjectUserDeleted,
+				"result":  "ok",
+			}), 0.0001)
+}
+
+// TestCacheInvalidator_NilUserInvalidate_SkipsAuthSubscription —
+// degraded boot path: no user invalidator wired, so the auth
+// subscription is NOT registered. Publishing the auth event must be a
+// no-op and the project subscription must remain functional.
+func TestCacheInvalidator_NilUserInvalidate_SkipsAuthSubscription(t *testing.T) {
+	t.Parallel()
+
+	bus := &fakeBus{}
+	pTarget := &fakeProjectInvalidator{}
+	reg := prometheus.NewRegistry()
+	metrics := events.RegisterCacheInvalidatorMetrics(reg)
+
+	inv := events.NewCacheInvalidator(events.CacheInvalidatorConfig{
+		Subscriber:        bus,
+		ProjectInvalidate: pTarget.Invalidate,
+		// UserInvalidate intentionally omitted (nil)
+		// CallInvalidate intentionally omitted (nil)
+		Metrics: metrics,
+		Logger:  zaptest.NewLogger(t),
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	require.NoError(t, inv.Start(ctx))
+	t.Cleanup(inv.Stop)
+
+	// Project subscription still works.
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	payload, err := json.Marshal(crmapi.ProjectStatusChangedEvent{
+		ProjectID: projectID,
+		TenantID:  tenantID,
+		OldStatus: crmapi.StatusActive,
+		NewStatus: crmapi.StatusArchived,
+		ChangedAt: time.Now(),
+	})
+	require.NoError(t, err)
+	require.NoError(t, bus.Fire(crmapi.SubjectProjectStatusFor(tenantID), payload))
+
+	require.Eventually(t, func() bool {
+		return len(pTarget.Calls()) >= 1
+	}, 2*time.Second, 10*time.Millisecond)
+}

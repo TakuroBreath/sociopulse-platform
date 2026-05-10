@@ -107,19 +107,30 @@ func (m *Metrics) observeFanout(count int) {
 }
 
 // CacheInvalidatorMetrics is the per-handler counter set surfaced
-// on /metrics for *CacheInvalidator (Plan 11.3 Task 3). Nil-tolerated
-// — observe is a no-op on a nil receiver, matching the rest of the
-// realtime metrics types.
+// on /metrics for *CacheInvalidator. Plan 11.4 Task 6 expanded the
+// label set from {result} alone to {subject, result} — the same
+// counter family covers all three subscription dimensions.
 //
-// Separated from *Metrics so a future invalidator that doesn't share
-// the dispatcher's lifecycle can be wired/un-wired independently
-// (e.g. a degraded boot that opts out of the JetStream subscriber
-// would still need the rest of *Metrics).
+// Bounded label combinations:
+//   - subject ∈ {SubjectProjectStatus, SubjectUserDeleted, SubjectRecordingCallDeleted}
+//   - result ∈ {"ok", "parse_error", "empty_id"}
+//
+// 9 cells total. The "empty_project_id" label value used in Plan 11.3
+// Task 3 is renamed to "empty_id" — uniform across subjects. Operators
+// updating dashboards: the previous query read by result alone; after
+// the bump query by subject="tenant.*.crm.project.status_changed".
+//
+// Nil-tolerated — observe is a no-op on a nil receiver, matching the
+// rest of the realtime metrics types. Separated from *Metrics so a
+// future invalidator that doesn't share the dispatcher's lifecycle
+// can be wired/un-wired independently (e.g. a degraded boot that
+// opts out of the JetStream subscriber would still need the rest
+// of *Metrics).
 type CacheInvalidatorMetrics struct {
 	// invalidations counts dispatched invalidation messages,
-	// labelled by outcome ∈ {"ok", "parse_error", "empty_project_id"}.
-	// Bounded label set — every code path in CacheInvalidator.handle
-	// maps to exactly one of these strings.
+	// labelled by (subject, result). Bounded label set — every
+	// code path in CacheInvalidator.handle{Project,User,Call}
+	// maps to exactly one (subject, result) cell.
 	invalidations *prometheus.CounterVec
 }
 
@@ -140,20 +151,20 @@ func RegisterCacheInvalidatorMetrics(reg prometheus.Registerer) *CacheInvalidato
 		invalidations: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "realtime_cache_invalidations_total",
-				Help: "Number of resolver-cache invalidations dispatched, labelled by outcome (ok / parse_error / empty_project_id).",
+				Help: "Number of resolver-cache invalidations dispatched, labelled by subject and outcome (ok / parse_error / empty_id).",
 			},
-			[]string{"result"},
+			[]string{"subject", "result"},
 		),
 	}
 	reg.MustRegister(m.invalidations)
 	return m
 }
 
-// observe ticks the result-labelled counter. nil-safe so callers
-// with no metrics wired (tests / degraded boot) keep working.
-func (m *CacheInvalidatorMetrics) observe(result string) {
+// observe ticks the (subject, result)-labelled counter. nil-safe so
+// callers with no metrics wired (tests / degraded boot) keep working.
+func (m *CacheInvalidatorMetrics) observe(subject, result string) {
 	if m == nil || m.invalidations == nil {
 		return
 	}
-	m.invalidations.WithLabelValues(result).Inc()
+	m.invalidations.WithLabelValues(subject, result).Inc()
 }
