@@ -45,7 +45,7 @@ type chDSNs struct {
 // the container; callers don't manage it.
 func startClickHouse(t *testing.T) chDSNs {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), 90*time.Second)
 	defer cancel()
 
 	ch, err := tcclickhouse.Run(ctx, chImage,
