@@ -28,38 +28,59 @@ import (
 // fakeProjectService records calls and returns canned values. Pointer
 // returns mirror the interface contract; an injected error replaces
 // the canned return on the next call.
+//
+// Plan 13.2.5 Task 1: every :id method records the callerTenantID
+// argument so integration tests can confirm the handler forwards
+// claims.TenantID; resolveRet/resolveErr/matchTenant power the
+// tenant.RequireSameTenant middleware's resolver.
 type fakeProjectService struct {
-	createIn      crmapi.CreateProjectInput
-	createRet     crmapi.Project
-	createErr     error
-	getCalls      []uuid.UUID
-	getRet        crmapi.Project
-	getErr        error
-	listIn        crmapi.ListProjectsFilter
-	listRet       crmapi.ListProjectsResult
-	listErr       error
-	updateID      uuid.UUID
-	updateIn      crmapi.UpdateProjectInput
-	updateRet     crmapi.Project
-	updateErr     error
-	pauseID       uuid.UUID
-	pauseErr      error
-	resumeID      uuid.UUID
-	resumeErr     error
-	archiveID     uuid.UUID
-	archiveErr    error
-	progressID    uuid.UUID
-	progressRet   crmapi.ProjectProgress
-	progressErr   error
-	assignID      uuid.UUID
-	assignOps     []uuid.UUID
-	assignErr     error
-	unassignID    uuid.UUID
-	unassignOp    uuid.UUID
-	unassignErr   error
-	listMembersID uuid.UUID
-	listMembers   []crmapi.ProjectMember
-	listMembErr   error
+	createIn          crmapi.CreateProjectInput
+	createRet         crmapi.Project
+	createErr         error
+	getCalls          []uuid.UUID
+	getCaller         uuid.UUID
+	getRet            crmapi.Project
+	getErr            error
+	listIn            crmapi.ListProjectsFilter
+	listRet           crmapi.ListProjectsResult
+	listErr           error
+	updateCaller      uuid.UUID
+	updateID          uuid.UUID
+	updateIn          crmapi.UpdateProjectInput
+	updateRet         crmapi.Project
+	updateErr         error
+	pauseCaller       uuid.UUID
+	pauseID           uuid.UUID
+	pauseErr          error
+	resumeCaller      uuid.UUID
+	resumeID          uuid.UUID
+	resumeErr         error
+	archiveCaller     uuid.UUID
+	archiveID         uuid.UUID
+	archiveErr        error
+	progressCaller    uuid.UUID
+	progressID        uuid.UUID
+	progressRet       crmapi.ProjectProgress
+	progressErr       error
+	assignCaller      uuid.UUID
+	assignID          uuid.UUID
+	assignOps         []uuid.UUID
+	assignErr         error
+	unassignCaller    uuid.UUID
+	unassignID        uuid.UUID
+	unassignOp        uuid.UUID
+	unassignErr       error
+	listMembersCaller uuid.UUID
+	listMembersID     uuid.UUID
+	listMembers       []crmapi.ProjectMember
+	listMembErr       error
+	resolveCalls      []uuid.UUID
+	resolveRet        uuid.UUID
+	resolveErr        error
+	// matchTenant is the default tenant the resolver reports when
+	// resolveRet is unset. Test fixtures point this at validator.claims.TenantID
+	// so the middleware accepts every request without per-test wiring.
+	matchTenant *uuid.UUID
 }
 
 func (f *fakeProjectService) Create(_ context.Context, in crmapi.CreateProjectInput) (*crmapi.Project, error) {
@@ -70,7 +91,8 @@ func (f *fakeProjectService) Create(_ context.Context, in crmapi.CreateProjectIn
 	cp := f.createRet
 	return &cp, nil
 }
-func (f *fakeProjectService) Get(_ context.Context, id uuid.UUID) (*crmapi.Project, error) {
+func (f *fakeProjectService) Get(_ context.Context, callerTenantID, id uuid.UUID) (*crmapi.Project, error) {
+	f.getCaller = callerTenantID
 	f.getCalls = append(f.getCalls, id)
 	if f.getErr != nil {
 		return nil, f.getErr
@@ -86,7 +108,8 @@ func (f *fakeProjectService) List(_ context.Context, in crmapi.ListProjectsFilte
 	cp := f.listRet
 	return &cp, nil
 }
-func (f *fakeProjectService) Update(_ context.Context, id uuid.UUID, in crmapi.UpdateProjectInput) (*crmapi.Project, error) {
+func (f *fakeProjectService) Update(_ context.Context, callerTenantID, id uuid.UUID, in crmapi.UpdateProjectInput) (*crmapi.Project, error) {
+	f.updateCaller = callerTenantID
 	f.updateID = id
 	f.updateIn = in
 	if f.updateErr != nil {
@@ -95,19 +118,23 @@ func (f *fakeProjectService) Update(_ context.Context, id uuid.UUID, in crmapi.U
 	cp := f.updateRet
 	return &cp, nil
 }
-func (f *fakeProjectService) Pause(_ context.Context, id uuid.UUID) error {
+func (f *fakeProjectService) Pause(_ context.Context, callerTenantID, id uuid.UUID) error {
+	f.pauseCaller = callerTenantID
 	f.pauseID = id
 	return f.pauseErr
 }
-func (f *fakeProjectService) Resume(_ context.Context, id uuid.UUID) error {
+func (f *fakeProjectService) Resume(_ context.Context, callerTenantID, id uuid.UUID) error {
+	f.resumeCaller = callerTenantID
 	f.resumeID = id
 	return f.resumeErr
 }
-func (f *fakeProjectService) Archive(_ context.Context, id uuid.UUID) error {
+func (f *fakeProjectService) Archive(_ context.Context, callerTenantID, id uuid.UUID) error {
+	f.archiveCaller = callerTenantID
 	f.archiveID = id
 	return f.archiveErr
 }
-func (f *fakeProjectService) GetProgress(_ context.Context, id uuid.UUID) (*crmapi.ProjectProgress, error) {
+func (f *fakeProjectService) GetProgress(_ context.Context, callerTenantID, id uuid.UUID) (*crmapi.ProjectProgress, error) {
+	f.progressCaller = callerTenantID
 	f.progressID = id
 	if f.progressErr != nil {
 		return nil, f.progressErr
@@ -115,47 +142,74 @@ func (f *fakeProjectService) GetProgress(_ context.Context, id uuid.UUID) (*crma
 	cp := f.progressRet
 	return &cp, nil
 }
-func (f *fakeProjectService) Assign(_ context.Context, id uuid.UUID, ops []uuid.UUID) error {
+func (f *fakeProjectService) Assign(_ context.Context, callerTenantID, id uuid.UUID, ops []uuid.UUID) error {
+	f.assignCaller = callerTenantID
 	f.assignID = id
 	f.assignOps = ops
 	return f.assignErr
 }
-func (f *fakeProjectService) Unassign(_ context.Context, id, opID uuid.UUID) error {
+func (f *fakeProjectService) Unassign(_ context.Context, callerTenantID, id, opID uuid.UUID) error {
+	f.unassignCaller = callerTenantID
 	f.unassignID = id
 	f.unassignOp = opID
 	return f.unassignErr
 }
-func (f *fakeProjectService) ListMembers(_ context.Context, id uuid.UUID) ([]crmapi.ProjectMember, error) {
+func (f *fakeProjectService) ListMembers(_ context.Context, callerTenantID, id uuid.UUID) ([]crmapi.ProjectMember, error) {
+	f.listMembersCaller = callerTenantID
 	f.listMembersID = id
 	if f.listMembErr != nil {
 		return nil, f.listMembErr
 	}
 	return f.listMembers, nil
 }
+func (f *fakeProjectService) ResolveTenant(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	f.resolveCalls = append(f.resolveCalls, id)
+	if f.resolveErr != nil {
+		return uuid.Nil, f.resolveErr
+	}
+	if f.resolveRet != uuid.Nil {
+		return f.resolveRet, nil
+	}
+	if f.matchTenant != nil {
+		return *f.matchTenant, nil
+	}
+	return uuid.Nil, nil
+}
 
 // fakeRespondentService records calls and returns canned values.
+//
+// Plan 13.2.5 Task 1: Get/GetWithPhone/Delete record callerTenantID
+// and the resolver supports the new tenant.RequireSameTenant
+// middleware path.
 type fakeRespondentService struct {
-	createIn          crmapi.CreateRespondentInput
-	createRet         crmapi.Respondent
-	createErr         error
-	getCalls          []uuid.UUID
-	getRet            crmapi.Respondent
-	getErr            error
-	getWithPhoneCalls []uuid.UUID
-	getWithPhoneRet   crmapi.Respondent
-	getWithPhoneErr   error
-	searchIn          crmapi.SearchRespondentsFilter
-	searchRet         crmapi.SearchRespondentsResult
-	searchErr         error
-	deleteID          uuid.UUID
-	deleteRet         crmapi.DeletionRequest
-	deleteErr         error
-	importIn          crmapi.ImportRequest
-	importRet         crmapi.ImportTicket
-	importErr         error
-	statusJobID       string
-	statusRet         crmapi.ImportStatus
-	statusErr         error
+	createIn           crmapi.CreateRespondentInput
+	createRet          crmapi.Respondent
+	createErr          error
+	getCaller          uuid.UUID
+	getCalls           []uuid.UUID
+	getRet             crmapi.Respondent
+	getErr             error
+	getWithPhoneCaller uuid.UUID
+	getWithPhoneCalls  []uuid.UUID
+	getWithPhoneRet    crmapi.Respondent
+	getWithPhoneErr    error
+	searchIn           crmapi.SearchRespondentsFilter
+	searchRet          crmapi.SearchRespondentsResult
+	searchErr          error
+	deleteCaller       uuid.UUID
+	deleteID           uuid.UUID
+	deleteRet          crmapi.DeletionRequest
+	deleteErr          error
+	importIn           crmapi.ImportRequest
+	importRet          crmapi.ImportTicket
+	importErr          error
+	statusJobID        string
+	statusRet          crmapi.ImportStatus
+	statusErr          error
+	resolveCalls       []uuid.UUID
+	resolveRet         uuid.UUID
+	resolveErr         error
+	matchTenant        *uuid.UUID
 }
 
 func (f *fakeRespondentService) Create(_ context.Context, in crmapi.CreateRespondentInput) (*crmapi.Respondent, error) {
@@ -166,7 +220,8 @@ func (f *fakeRespondentService) Create(_ context.Context, in crmapi.CreateRespon
 	cp := f.createRet
 	return &cp, nil
 }
-func (f *fakeRespondentService) Get(_ context.Context, id uuid.UUID) (*crmapi.Respondent, error) {
+func (f *fakeRespondentService) Get(_ context.Context, callerTenantID, id uuid.UUID) (*crmapi.Respondent, error) {
+	f.getCaller = callerTenantID
 	f.getCalls = append(f.getCalls, id)
 	if f.getErr != nil {
 		return nil, f.getErr
@@ -174,7 +229,8 @@ func (f *fakeRespondentService) Get(_ context.Context, id uuid.UUID) (*crmapi.Re
 	cp := f.getRet
 	return &cp, nil
 }
-func (f *fakeRespondentService) GetWithPhone(_ context.Context, id uuid.UUID) (*crmapi.Respondent, error) {
+func (f *fakeRespondentService) GetWithPhone(_ context.Context, callerTenantID, id uuid.UUID) (*crmapi.Respondent, error) {
+	f.getWithPhoneCaller = callerTenantID
 	f.getWithPhoneCalls = append(f.getWithPhoneCalls, id)
 	if f.getWithPhoneErr != nil {
 		return nil, f.getWithPhoneErr
@@ -190,13 +246,27 @@ func (f *fakeRespondentService) Search(_ context.Context, in crmapi.SearchRespon
 	cp := f.searchRet
 	return &cp, nil
 }
-func (f *fakeRespondentService) Delete(_ context.Context, id uuid.UUID) (*crmapi.DeletionRequest, error) {
+func (f *fakeRespondentService) Delete(_ context.Context, callerTenantID, id uuid.UUID) (*crmapi.DeletionRequest, error) {
+	f.deleteCaller = callerTenantID
 	f.deleteID = id
 	if f.deleteErr != nil {
 		return nil, f.deleteErr
 	}
 	cp := f.deleteRet
 	return &cp, nil
+}
+func (f *fakeRespondentService) ResolveTenant(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	f.resolveCalls = append(f.resolveCalls, id)
+	if f.resolveErr != nil {
+		return uuid.Nil, f.resolveErr
+	}
+	if f.resolveRet != uuid.Nil {
+		return f.resolveRet, nil
+	}
+	if f.matchTenant != nil {
+		return *f.matchTenant, nil
+	}
+	return uuid.Nil, nil
 }
 func (f *fakeRespondentService) Import(_ context.Context, req crmapi.ImportRequest) (*crmapi.ImportTicket, error) {
 	f.importIn = req
@@ -282,6 +352,12 @@ func newFixture(t *testing.T) *fixture {
 		tenantID: tenantID,
 		userID:   userID,
 	}
+	// Plan 13.2.5 Task 1: default the resolvers to whatever tenant the
+	// validator's claims currently report. Every test that authenticates
+	// passes the tenant.RequireSameTenant middleware automatically.
+	// Cross-tenant tests override resolveRet to force a mismatch.
+	f.projects.matchTenant = &f.validator.claims.TenantID
+	f.respond.matchTenant = &f.validator.claims.TenantID
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
 		Logger:     nil,
@@ -1172,4 +1248,85 @@ func TestMount_PanicsOnNilDeps(t *testing.T) {
 			})
 		})
 	}
+}
+
+// =============================================================================
+// Plan 13.2.5 Task 1 — cross-tenant guard on admin :id routes
+// =============================================================================
+
+// TestProjectHandler_AdminArchive_CrossTenantReturns404 verifies the
+// flagship security fix from Plan 13.2.5: Tenant A admin attempting
+// to archive a project belonging to Tenant B receives 404 (existence-
+// probe defence) and the service is NEVER called.
+func TestProjectHandler_AdminArchive_CrossTenantReturns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	otherTenant := uuid.New()
+	// Disable matchTenant so the resolver returns the pinned
+	// cross-tenant value.
+	f.projects.matchTenant = nil
+	f.projects.resolveRet = otherTenant
+
+	target := uuid.New()
+	rec := f.doAuth(t, stdhttp.MethodPost,
+		fmt.Sprintf("/api/projects/%s/archive", target), nil)
+
+	assert.Equal(t, stdhttp.StatusNotFound, rec.Code,
+		"cross-tenant admin :id must yield 404")
+	assert.Empty(t, rec.Body.String(),
+		"404 mismatch response carries no body")
+	assert.Equal(t, uuid.Nil, f.projects.archiveID,
+		"Archive must never be called on a cross-tenant attempt")
+	assert.Equal(t, uuid.Nil, f.projects.archiveCaller)
+	require.Len(t, f.projects.resolveCalls, 1)
+	assert.Equal(t, target, f.projects.resolveCalls[0])
+}
+
+// TestProjectHandler_AdminMutations_PassClaimsTenantID confirms the
+// handlers forward claims.TenantID (not a row-resolved tenant) to
+// every mutating service method. Locks in the defence-in-depth
+// contract.
+func TestProjectHandler_AdminMutations_PassClaimsTenantID(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	callerTenant := f.tenantID
+	target := uuid.New()
+	f.projects.updateRet = crmapi.Project{ID: target, TenantID: callerTenant}
+
+	// PATCH /:id
+	rec := f.doAuth(t, stdhttp.MethodPatch,
+		"/api/projects/"+target.String(),
+		transporthttp.UpdateProjectRequest{})
+	require.Equal(t, stdhttp.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	assert.Equal(t, callerTenant, f.projects.updateCaller)
+
+	// POST /:id/pause
+	rec = f.doAuth(t, stdhttp.MethodPost,
+		"/api/projects/"+target.String()+"/pause", nil)
+	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
+	assert.Equal(t, callerTenant, f.projects.pauseCaller)
+
+	// POST /:id/archive
+	rec = f.doAuth(t, stdhttp.MethodPost,
+		"/api/projects/"+target.String()+"/archive", nil)
+	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
+	assert.Equal(t, callerTenant, f.projects.archiveCaller)
+}
+
+// TestRespondentHandler_AdminDelete_CrossTenantReturns404 verifies
+// the cross-tenant guard on the respondent admin DELETE endpoint.
+func TestRespondentHandler_AdminDelete_CrossTenantReturns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.respond.matchTenant = nil
+	f.respond.resolveRet = uuid.New() // different tenant
+
+	target := uuid.New()
+	rec := f.doAuth(t, stdhttp.MethodDelete,
+		"/api/respondents/"+target.String(), nil)
+
+	assert.Equal(t, stdhttp.StatusNotFound, rec.Code)
+	assert.Empty(t, rec.Body.String())
+	assert.Equal(t, uuid.Nil, f.respond.deleteCaller,
+		"Delete must never be called on a cross-tenant attempt")
 }

@@ -1,10 +1,15 @@
 package http
 
 import (
+	"context"
+	"errors"
+
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	authapi "github.com/sociopulse/platform/internal/auth/api"
 	authmw "github.com/sociopulse/platform/pkg/middleware/auth"
+	tenantmw "github.com/sociopulse/platform/pkg/middleware/tenant"
 )
 
 // Mount registers every /api/auth route on the supplied gin
@@ -44,11 +49,34 @@ func Mount(group *gin.RouterGroup, deps Deps) {
 	admin.Use(requireRole(deps.RBAC, authapi.RoleAdmin))
 	admin.POST("", h.createUser)
 	admin.GET("", h.listUsers)
-	admin.GET("/:id", h.getUser)
-	admin.PATCH("/:id/roles", h.updateRoles)
-	admin.POST("/:id/archive", h.archiveUser)
-	admin.POST("/:id/restore", h.restoreUser)
-	admin.POST("/:id/reset_password", h.resetPassword)
+
+	// Plan 13.2.5 Task 1 — cross-tenant guard on every :id route.
+	// The middleware verifies claims.TenantID owns the user id BEFORE
+	// the handler runs (404 on mismatch — existence-probe defence).
+	// Service methods still take callerTenantID as an explicit param
+	// so RLS rejects cross-tenant rows even if this chain is broken.
+	sameTenant := tenantmw.RequireSameTenant(userTenantResolver(deps.Users))
+	admin.GET("/:id", sameTenant, h.getUser)
+	admin.PATCH("/:id/roles", sameTenant, h.updateRoles)
+	admin.POST("/:id/archive", sameTenant, h.archiveUser)
+	admin.POST("/:id/restore", sameTenant, h.restoreUser)
+	admin.POST("/:id/reset_password", sameTenant, h.resetPassword)
+}
+
+// userTenantResolver wraps UserService.ResolveTenant for the
+// tenant.RequireSameTenant middleware. ErrUserNotFound is translated to
+// the middleware's sentinel so the response is a 404 with no body.
+func userTenantResolver(users authapi.UserService) tenantmw.ResolveTenantFn {
+	return func(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+		t, err := users.ResolveTenant(ctx, id)
+		if err != nil {
+			if errors.Is(err, authapi.ErrUserNotFound) {
+				return uuid.Nil, tenantmw.ErrNotFound
+			}
+			return uuid.Nil, err
+		}
+		return t, nil
+	}
 }
 
 // mustNotBeNil verifies every required collaborator. We panic so a

@@ -50,30 +50,33 @@ type fakeProjectService struct{}
 func (fakeProjectService) Create(context.Context, crmapi.CreateProjectInput) (*crmapi.Project, error) {
 	panic("not invoked")
 }
-func (fakeProjectService) Get(context.Context, uuid.UUID) (*crmapi.Project, error) {
+func (fakeProjectService) Get(context.Context, uuid.UUID, uuid.UUID) (*crmapi.Project, error) {
 	panic("not invoked")
 }
 func (fakeProjectService) List(context.Context, crmapi.ListProjectsFilter) (*crmapi.ListProjectsResult, error) {
 	panic("not invoked")
 }
-func (fakeProjectService) Update(context.Context, uuid.UUID, crmapi.UpdateProjectInput) (*crmapi.Project, error) {
+func (fakeProjectService) Update(context.Context, uuid.UUID, uuid.UUID, crmapi.UpdateProjectInput) (*crmapi.Project, error) {
 	panic("not invoked")
 }
-func (fakeProjectService) Pause(context.Context, uuid.UUID) error  { panic("not invoked") }
-func (fakeProjectService) Resume(context.Context, uuid.UUID) error { panic("not invoked") }
-func (fakeProjectService) Archive(context.Context, uuid.UUID) error {
+func (fakeProjectService) Pause(context.Context, uuid.UUID, uuid.UUID) error  { panic("not invoked") }
+func (fakeProjectService) Resume(context.Context, uuid.UUID, uuid.UUID) error { panic("not invoked") }
+func (fakeProjectService) Archive(context.Context, uuid.UUID, uuid.UUID) error {
 	panic("not invoked")
 }
-func (fakeProjectService) GetProgress(context.Context, uuid.UUID) (*crmapi.ProjectProgress, error) {
+func (fakeProjectService) GetProgress(context.Context, uuid.UUID, uuid.UUID) (*crmapi.ProjectProgress, error) {
 	panic("not invoked")
 }
-func (fakeProjectService) Assign(context.Context, uuid.UUID, []uuid.UUID) error {
+func (fakeProjectService) Assign(context.Context, uuid.UUID, uuid.UUID, []uuid.UUID) error {
 	panic("not invoked")
 }
-func (fakeProjectService) Unassign(context.Context, uuid.UUID, uuid.UUID) error {
+func (fakeProjectService) Unassign(context.Context, uuid.UUID, uuid.UUID, uuid.UUID) error {
 	panic("not invoked")
 }
-func (fakeProjectService) ListMembers(context.Context, uuid.UUID) ([]crmapi.ProjectMember, error) {
+func (fakeProjectService) ListMembers(context.Context, uuid.UUID, uuid.UUID) ([]crmapi.ProjectMember, error) {
+	panic("not invoked")
+}
+func (fakeProjectService) ResolveTenant(context.Context, uuid.UUID) (uuid.UUID, error) {
 	panic("not invoked")
 }
 

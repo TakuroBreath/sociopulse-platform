@@ -245,29 +245,32 @@ type crmServiceStub struct{}
 func (crmServiceStub) Create(_ context.Context, _ crmapi.CreateProjectInput) (*crmapi.Project, error) {
 	return nil, errors.New("stub")
 }
-func (crmServiceStub) Get(_ context.Context, _ uuid.UUID) (*crmapi.Project, error) {
+func (crmServiceStub) Get(_ context.Context, _, _ uuid.UUID) (*crmapi.Project, error) {
 	return nil, errors.New("stub")
 }
 func (crmServiceStub) List(_ context.Context, _ crmapi.ListProjectsFilter) (*crmapi.ListProjectsResult, error) {
 	return nil, errors.New("stub")
 }
-func (crmServiceStub) Update(_ context.Context, _ uuid.UUID, _ crmapi.UpdateProjectInput) (*crmapi.Project, error) {
+func (crmServiceStub) Update(_ context.Context, _, _ uuid.UUID, _ crmapi.UpdateProjectInput) (*crmapi.Project, error) {
 	return nil, errors.New("stub")
 }
-func (crmServiceStub) Pause(_ context.Context, _ uuid.UUID) error   { return errors.New("stub") }
-func (crmServiceStub) Resume(_ context.Context, _ uuid.UUID) error  { return errors.New("stub") }
-func (crmServiceStub) Archive(_ context.Context, _ uuid.UUID) error { return errors.New("stub") }
-func (crmServiceStub) GetProgress(_ context.Context, _ uuid.UUID) (*crmapi.ProjectProgress, error) {
+func (crmServiceStub) Pause(_ context.Context, _, _ uuid.UUID) error   { return errors.New("stub") }
+func (crmServiceStub) Resume(_ context.Context, _, _ uuid.UUID) error  { return errors.New("stub") }
+func (crmServiceStub) Archive(_ context.Context, _, _ uuid.UUID) error { return errors.New("stub") }
+func (crmServiceStub) GetProgress(_ context.Context, _, _ uuid.UUID) (*crmapi.ProjectProgress, error) {
 	return &crmapi.ProjectProgress{TargetCount: 0}, nil
 }
-func (crmServiceStub) Assign(_ context.Context, _ uuid.UUID, _ []uuid.UUID) error {
+func (crmServiceStub) Assign(_ context.Context, _, _ uuid.UUID, _ []uuid.UUID) error {
 	return errors.New("stub")
 }
-func (crmServiceStub) Unassign(_ context.Context, _ uuid.UUID, _ uuid.UUID) error {
+func (crmServiceStub) Unassign(_ context.Context, _, _, _ uuid.UUID) error {
 	return errors.New("stub")
 }
-func (crmServiceStub) ListMembers(_ context.Context, _ uuid.UUID) ([]crmapi.ProjectMember, error) {
+func (crmServiceStub) ListMembers(_ context.Context, _, _ uuid.UUID) ([]crmapi.ProjectMember, error) {
 	return nil, errors.New("stub")
+}
+func (crmServiceStub) ResolveTenant(_ context.Context, _ uuid.UUID) (uuid.UUID, error) {
+	return uuid.Nil, errors.New("stub")
 }
 
 // Compile-time check: crmapi.ProjectService satisfies service.CrmReader

@@ -215,21 +215,26 @@ func (s *ProjectService) Create(ctx context.Context, in api.CreateProjectInput) 
 	return &saved, nil
 }
 
-// Get implements api.ProjectService.Get. The lookup uses a BypassRLS
-// transaction because the caller has not (necessarily) supplied a
-// tenant context — admin tooling routinely needs to resolve a project
-// id to its tenant before any per-tenant flow. This mirrors
-// UserService.Get from auth/service.
+// Get implements api.ProjectService.Get. Looks the project up inside
+// callerTenantID's RLS scope. A row owned by a different tenant
+// surfaces as ErrProjectNotFound (RLS hides it) — by design.
+//
+// Plan 13.2.5 Task 1: the transport-layer RequireSameTenant middleware
+// rejects cross-tenant attempts upstream; this method's per-tenant
+// scope is defence in depth.
 //
 // Quotas / Assignments are NOT populated by this method in Task 1;
 // Plan 06 Task 2 fills those slices. For now Get returns the row-level
 // fields only.
-func (s *ProjectService) Get(ctx context.Context, id uuid.UUID) (*api.Project, error) {
+func (s *ProjectService) Get(ctx context.Context, callerTenantID, id uuid.UUID) (*api.Project, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get project: caller tenant id required")
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: get project: id required")
 	}
 	var p api.Project
-	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
 		var err error
 		p, err = s.store.GetByID(ctx, tx, id)
 		return err
@@ -241,6 +246,26 @@ func (s *ProjectService) Get(ctx context.Context, id uuid.UUID) (*api.Project, e
 		return nil, fmt.Errorf("crm/service: get project: %w", err)
 	}
 	return &p, nil
+}
+
+// ResolveTenant implements api.ProjectService.ResolveTenant. Returns
+// the owning tenant id for a project via a BypassRLS lookup — used by
+// the transport-layer tenant.RequireSameTenant middleware to compare
+// against the caller's claims.TenantID before the handler runs.
+// Returns ErrProjectNotFound when no row matches id.
+//
+// This is the only sanctioned BypassRLS resolver in ProjectService
+// after Plan 13.2.5 Task 1: every mutation method takes callerTenantID
+// as an explicit parameter and skips the resolve step entirely.
+func (s *ProjectService) ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("crm/service: resolve tenant: id required")
+	}
+	p, err := s.lookupProject(ctx, id)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return p.TenantID, nil
 }
 
 // List implements api.ProjectService.List. Limit/Offset are clamped to
@@ -312,11 +337,11 @@ func validateCreateInput(in api.CreateProjectInput) error {
 
 // Update implements api.ProjectService.Update.
 //
-// Resolves the project's tenant via a BypassRLS GetByID, then opens a
-// per-tenant transaction (RLS in effect) and runs the partial-update.
-// An empty patch is a true no-op: the service short-circuits before
-// even opening the transaction so the audit trail stays clean (no
-// "updated" row when nothing changed).
+// Plan 13.2.5 Task 1: callerTenantID is an explicit defence-in-depth
+// parameter; the transport-layer RequireSameTenant middleware has
+// already verified it owns id. An empty patch is a true no-op: the
+// service short-circuits before opening the transaction so the audit
+// trail stays clean.
 //
 // Archived projects are rejected with ErrProjectArchived so callers
 // don't accidentally mutate a soft-deleted row. The Update SQL itself
@@ -324,10 +349,13 @@ func validateCreateInput(in api.CreateProjectInput) error {
 // clearer sentinel than a generic "not found".
 //
 // One audit row "crm.project.updated" is emitted on success carrying
-// the diff payload (the keys that were actually patched). The
-// transaction commits the row write and the audit row together — the
-// service inherits that durability guarantee from writeAudit.
-func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, in api.UpdateProjectInput) (*api.Project, error) {
+// the diff payload. The transaction commits the row write and the
+// audit row together — the service inherits that durability guarantee
+// from writeAudit.
+func (s *ProjectService) Update(ctx context.Context, callerTenantID, id uuid.UUID, in api.UpdateProjectInput) (*api.Project, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: update project: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: update project: %w", api.ErrInvalidArgument)
 	}
@@ -340,24 +368,28 @@ func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, in api.Update
 		SurveyID:    in.SurveyID,
 	}
 
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if current.ArchivedAt != nil {
-		return nil, api.ErrProjectArchived
-	}
-	// Empty patch: short-circuit so we don't bump updated_at or audit a non-change.
-	if patch.IsEmpty() {
-		return &current, nil
-	}
-
-	var saved api.Project
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		var err error
-		saved, err = s.store.Update(ctx, tx, id, patch)
-		if err != nil {
-			return err
+	var (
+		current api.Project
+		saved   api.Project
+	)
+	// Single per-tenant tx: GetByID + archived-check + Update + audit.
+	// Cross-tenant rows are invisible (RLS) — surfaces as ErrProjectNotFound.
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		var ierr error
+		current, ierr = s.store.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if current.ArchivedAt != nil {
+			return api.ErrProjectArchived
+		}
+		if patch.IsEmpty() {
+			saved = current
+			return nil
+		}
+		saved, ierr = s.store.Update(ctx, tx, id, patch)
+		if ierr != nil {
+			return ierr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
 			TenantID: saved.TenantID,
@@ -371,6 +403,10 @@ func (s *ProjectService) Update(ctx context.Context, id uuid.UUID, in api.Update
 			return nil, err
 		}
 		return nil, fmt.Errorf("crm/service: update project: %w", err)
+	}
+	// Empty-patch short-circuit: do not publish an event for a non-change.
+	if patch.IsEmpty() {
+		return &saved, nil
 	}
 	s.publishEvent(ctx, api.SubjectProjectUpdatedFor(saved.TenantID), api.ProjectUpdatedEvent{
 		ProjectID: saved.ID,
@@ -411,16 +447,16 @@ func changedFieldNames(in api.UpdateProjectInput) []string {
 // State machine: Active→Paused commits and audits, Paused→Paused is a
 // silent no-op (idempotent), Archived is rejected with ErrProjectArchived
 // (terminal state guard).
-func (s *ProjectService) Pause(ctx context.Context, id uuid.UUID) error {
-	return s.transitionStatus(ctx, id, api.StatusPaused, "crm.project.paused")
+func (s *ProjectService) Pause(ctx context.Context, callerTenantID, id uuid.UUID) error {
+	return s.transitionStatus(ctx, callerTenantID, id, api.StatusPaused, "crm.project.paused")
 }
 
 // Resume implements api.ProjectService.Resume: Paused → Active.
 //
 // Symmetrical to Pause — Paused→Active commits/audits, Active→Active is
 // a silent no-op, Archived is rejected.
-func (s *ProjectService) Resume(ctx context.Context, id uuid.UUID) error {
-	return s.transitionStatus(ctx, id, api.StatusActive, "crm.project.resumed")
+func (s *ProjectService) Resume(ctx context.Context, callerTenantID, id uuid.UUID) error {
+	return s.transitionStatus(ctx, callerTenantID, id, api.StatusActive, "crm.project.resumed")
 }
 
 // Archive implements api.ProjectService.Archive: terminal transition.
@@ -428,38 +464,34 @@ func (s *ProjectService) Resume(ctx context.Context, id uuid.UUID) error {
 // Active|Paused → Archived commits/audits, Archived→Archived is a
 // silent no-op (terminal idempotency). archived_at is stamped at the
 // service clock so the timestamp matches the audit row exactly.
-func (s *ProjectService) Archive(ctx context.Context, id uuid.UUID) error {
-	return s.transitionStatus(ctx, id, api.StatusArchived, "crm.project.archived")
+func (s *ProjectService) Archive(ctx context.Context, callerTenantID, id uuid.UUID) error {
+	return s.transitionStatus(ctx, callerTenantID, id, api.StatusArchived, "crm.project.archived")
 }
 
 // transitionStatus is the shared engine for Pause/Resume/Archive. It
-// resolves the project, runs the state-machine guard against the
-// current status, and (when the transition is real, not a no-op) opens
-// a per-tenant transaction to write the new status + audit row in one
-// commit.
+// reads the row under callerTenantID's RLS scope, runs the state-
+// machine guard against the current status, and (when the transition
+// is real) writes the new status + audit row in the same tx.
 //
-// Idempotency rules (locked in via the user prompt):
+// Plan 13.2.5 Task 1: the entire read+write runs inside one
+// WithTenant(callerTenantID, ...) — RLS rejects rows owned by other
+// tenants as ErrProjectNotFound. The transport-layer middleware has
+// already done the same check at the front door; this is defence in
+// depth.
+//
+// Idempotency rules:
 //
 //	target == current         -> silent no-op (no SQL, no audit)
 //	current == archived       -> ErrProjectArchived (unless target=archived,
 //	                             which is the no-op above)
 //	target  == archived       -> stamp archived_at at the service clock
 //	any other transition path -> proceed.
-func (s *ProjectService) transitionStatus(ctx context.Context, id uuid.UUID, target api.ProjectStatus, action string) error {
+func (s *ProjectService) transitionStatus(ctx context.Context, callerTenantID, id uuid.UUID, target api.ProjectStatus, action string) error {
+	if callerTenantID == uuid.Nil {
+		return fmt.Errorf("crm/service: %s: caller tenant id required: %w", action, api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return fmt.Errorf("crm/service: %s: %w", action, api.ErrInvalidArgument)
-	}
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return err
-	}
-	// Idempotent: same state → silent no-op.
-	if current.Status == target {
-		return nil
-	}
-	// Archived is terminal for non-Archive targets.
-	if current.Status == api.StatusArchived {
-		return api.ErrProjectArchived
 	}
 
 	var archivedAt *time.Time
@@ -468,32 +500,49 @@ func (s *ProjectService) transitionStatus(ctx context.Context, id uuid.UUID, tar
 		archivedAt = &ts
 	}
 
-	from := current.Status
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		_, err := s.store.UpdateStatus(ctx, tx, id, target, archivedAt)
-		if err != nil {
-			return err
+	var (
+		current api.Project
+		isNoop  bool
+	)
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		var ierr error
+		current, ierr = s.store.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if current.Status == target {
+			isNoop = true
+			return nil
+		}
+		if current.Status == api.StatusArchived {
+			return api.ErrProjectArchived
+		}
+		if _, ierr = s.store.UpdateStatus(ctx, tx, id, target, archivedAt); ierr != nil {
+			return ierr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: current.TenantID,
+			TenantID: callerTenantID,
 			Action:   action,
 			Target:   "project:" + id.String(),
 			Payload: map[string]any{
-				"from": string(from),
+				"from": string(current.Status),
 				"to":   string(target),
 			},
 		})
 	})
 	if err != nil {
-		if errors.Is(err, api.ErrProjectNotFound) {
+		if errors.Is(err, api.ErrProjectNotFound) || errors.Is(err, api.ErrProjectArchived) {
 			return err
 		}
 		return fmt.Errorf("crm/service: %s: %w", action, err)
 	}
-	s.publishEvent(ctx, api.SubjectProjectStatusFor(current.TenantID), api.ProjectStatusChangedEvent{
+	if isNoop {
+		return nil
+	}
+	s.publishEvent(ctx, api.SubjectProjectStatusFor(callerTenantID), api.ProjectStatusChangedEvent{
 		ProjectID:  id,
-		TenantID:   current.TenantID,
-		OldStatus:  from,
+		TenantID:   callerTenantID,
+		OldStatus:  current.Status,
 		NewStatus:  target,
 		ChangedAt:  s.clock().UTC(),
 		ArchivedAt: archivedAt,
@@ -503,33 +552,33 @@ func (s *ProjectService) transitionStatus(ctx context.Context, id uuid.UUID, tar
 
 // GetProgress implements api.ProjectService.GetProgress.
 //
-// Reads only — no audit row, no event publish. Resolves tenant via
-// BypassRLS GetByID, then runs AggregateProgress through a per-tenant
-// tx so RLS still scopes the underlying respondents/calls reads.
+// Reads only — no audit row, no event publish. Runs under
+// callerTenantID's RLS scope so the underlying respondents/calls
+// reads are tenant-scoped automatically; a cross-tenant id surfaces
+// as ErrProjectNotFound (RLS hides the row).
 //
 // Derived metrics (PercentDone, PaceLast24h, ETACompletion) are
-// computed here from the raw counters the store returns. The plan
-// source builds these in a separate helper; we inline them since the
-// math is small (3 lines) and the alternative is a one-method file.
-//
-// PaceLast24h and ETACompletion are stubbed in v1 — the calls table
-// exists per migrations/000001 but isn't yet populated by any module
-// (Plan 08+ owns the dialer). Returning 0/nil is honest — the
-// dashboard renders "—" until calls flow.
-func (s *ProjectService) GetProgress(ctx context.Context, id uuid.UUID) (*api.ProjectProgress, error) {
+// computed here from the raw counters. PaceLast24h and ETACompletion
+// are stubbed in v1 (Plan 08+ owns the dialer); the dashboard renders
+// "—" until calls flow.
+func (s *ProjectService) GetProgress(ctx context.Context, callerTenantID, id uuid.UUID) (*api.ProjectProgress, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get progress: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: get progress: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return nil, err
-	}
 
 	var prog api.ProjectProgress
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		var err error
-		prog, err = s.store.AggregateProgress(ctx, tx, id)
-		return err
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		// Existence check inside the same tx so a missing row surfaces
+		// as ErrProjectNotFound rather than an empty aggregate.
+		if _, ierr := s.store.GetByID(ctx, tx, id); ierr != nil {
+			return ierr
+		}
+		var ierr error
+		prog, ierr = s.store.AggregateProgress(ctx, tx, id)
+		return ierr
 	})
 	if err != nil {
 		if errors.Is(err, api.ErrProjectNotFound) {
@@ -554,21 +603,24 @@ func (s *ProjectService) GetProgress(ctx context.Context, id uuid.UUID) (*api.Pr
 // were inserted) so the audit trail has a 1:1 mapping with member-
 // joined events. Operators that were already members are silently
 // skipped — no audit row, no error.
-func (s *ProjectService) Assign(ctx context.Context, id uuid.UUID, operatorIDs []uuid.UUID) error {
+func (s *ProjectService) Assign(ctx context.Context, callerTenantID, id uuid.UUID, operatorIDs []uuid.UUID) error {
+	if callerTenantID == uuid.Nil {
+		return fmt.Errorf("crm/service: assign: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	dedup, err := s.validateAssignInput(id, operatorIDs)
 	if err != nil {
 		return err
 	}
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return err
-	}
-	if current.ArchivedAt != nil {
-		return api.ErrProjectArchived
-	}
 
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		return s.applyAssign(ctx, tx, id, current.TenantID, dedup)
+	err = s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		current, ierr := s.store.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if current.ArchivedAt != nil {
+			return api.ErrProjectArchived
+		}
+		return s.applyAssign(ctx, tx, id, callerTenantID, dedup)
 	})
 	if err != nil {
 		if errors.Is(err, api.ErrProjectNotFound) || errors.Is(err, api.ErrProjectArchived) {
@@ -644,25 +696,29 @@ func (s *ProjectService) applyAssign(ctx context.Context, tx postgres.Tx, id, te
 // store returns deleted=false for unknown operators, in which case we
 // silently no-op — no error, no audit). Archived projects still allow
 // Unassign to support cleanup of soft-deleted projects' rosters.
-func (s *ProjectService) Unassign(ctx context.Context, id uuid.UUID, operatorID uuid.UUID) error {
+func (s *ProjectService) Unassign(ctx context.Context, callerTenantID, id uuid.UUID, operatorID uuid.UUID) error {
+	if callerTenantID == uuid.Nil {
+		return fmt.Errorf("crm/service: unassign: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil || operatorID == uuid.Nil {
 		return fmt.Errorf("crm/service: unassign: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return err
-	}
 
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		deleted, err := s.store.UnassignOperator(ctx, tx, id, operatorID)
-		if err != nil {
-			return err
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		// Existence check inside the same tx so a missing/cross-tenant
+		// row surfaces as ErrProjectNotFound rather than a silent no-op.
+		if _, ierr := s.store.GetByID(ctx, tx, id); ierr != nil {
+			return ierr
+		}
+		deleted, ierr := s.store.UnassignOperator(ctx, tx, id, operatorID)
+		if ierr != nil {
+			return ierr
 		}
 		if !deleted {
 			return nil
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: current.TenantID,
+			TenantID: callerTenantID,
 			Action:   "crm.project.member_unassigned",
 			Target:   "user:" + operatorID.String(),
 			Payload: map[string]any{
@@ -682,26 +738,33 @@ func (s *ProjectService) Unassign(ctx context.Context, id uuid.UUID, operatorID 
 
 // ListMembers implements api.ProjectService.ListMembers.
 //
-// Pure read — no audit row, no event publish. Resolves tenant via
-// BypassRLS GetByID, then issues the join through a per-tenant tx so
-// the users-table read is RLS-scoped (a tenant cannot enumerate
-// another's users via a stale project_assignments row).
-func (s *ProjectService) ListMembers(ctx context.Context, id uuid.UUID) ([]api.ProjectMember, error) {
+// Pure read — no audit row, no event publish. Runs under
+// callerTenantID's RLS scope so the underlying users-table join is
+// tenant-scoped automatically (a tenant cannot enumerate another's
+// users via a stale project_assignments row).
+func (s *ProjectService) ListMembers(ctx context.Context, callerTenantID, id uuid.UUID) ([]api.ProjectMember, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: list members: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: list members: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupProject(ctx, id)
-	if err != nil {
-		return nil, err
-	}
 
 	var members []api.ProjectMember
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		var err error
-		members, err = s.store.ListMembers(ctx, tx, id)
-		return err
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		// Existence check so a cross-tenant id (RLS-hidden) surfaces as
+		// ErrProjectNotFound rather than an empty member list.
+		if _, ierr := s.store.GetByID(ctx, tx, id); ierr != nil {
+			return ierr
+		}
+		var ierr error
+		members, ierr = s.store.ListMembers(ctx, tx, id)
+		return ierr
 	})
 	if err != nil {
+		if errors.Is(err, api.ErrProjectNotFound) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("crm/service: list members: %w", err)
 	}
 	return members, nil

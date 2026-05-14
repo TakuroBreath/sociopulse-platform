@@ -116,15 +116,18 @@ func (f *fakeCache) Set(_ context.Context, key string, value []byte, _ time.Dura
 // fakeCrm is a test double for service.CrmReader. ProgressByProjectID
 // holds the configured response; missing entries return (nil, nil)
 // meaning "project not found" — matching the production
-// crm.api.ProjectService.GetProgress contract.
+// crm.api.ProjectService.GetProgress contract (Plan 13.2.5 Task 1:
+// callerTenantID is the explicit first argument).
 type fakeCrm struct {
 	ProgressByProjectID map[uuid.UUID]*crmapi.ProjectProgress
 	Err                 error
 	Calls               int
+	LastCaller          uuid.UUID
 }
 
-func (f *fakeCrm) GetProgress(_ context.Context, projectID uuid.UUID) (*crmapi.ProjectProgress, error) {
+func (f *fakeCrm) GetProgress(_ context.Context, callerTenantID, projectID uuid.UUID) (*crmapi.ProjectProgress, error) {
 	f.Calls++
+	f.LastCaller = callerTenantID
 	if f.Err != nil {
 		return nil, f.Err
 	}

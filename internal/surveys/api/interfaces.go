@@ -7,6 +7,14 @@ import (
 )
 
 // SurveyService is the public CRUD surface for surveys + versions.
+//
+// Plan 13.2.5 Task 1: every :id method reads the caller's tenant id
+// from the context (set by the transport via WithTenantID — the
+// JWT-driven population) and runs RLS-scoped. The transport layer
+// chains tenant.RequireSameTenant which calls ResolveTenant on each
+// admin route; service methods themselves do not BypassRLS for the
+// :id lookup any more (defence in depth — RLS would reject the row
+// anyway if the middleware were removed).
 type SurveyService interface {
 	// Create allocates a new survey container; it has no versions until SaveVersion.
 	Create(ctx context.Context, in CreateSurveyInput) (uuid.UUID, error)
@@ -29,6 +37,11 @@ type SurveyService interface {
 	GetActiveVersion(ctx context.Context, surveyID uuid.UUID) (Version, error)
 	// ListVersions returns every version of the survey, newest first.
 	ListVersions(ctx context.Context, surveyID uuid.UUID) ([]Version, error)
+	// ResolveTenant returns the owning tenant id for a survey. Used by
+	// the transport-layer tenant.RequireSameTenant middleware to
+	// compare against the caller's claims.TenantID. Returns ErrNotFound
+	// when the id does not exist.
+	ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 }
 
 // VersionStore is the persistence surface for versions, lifted out so the

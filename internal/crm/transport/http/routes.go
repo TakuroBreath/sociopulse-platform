@@ -1,14 +1,18 @@
 package http
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 	"go.uber.org/zap"
 
 	authapi "github.com/sociopulse/platform/internal/auth/api"
 	crmapi "github.com/sociopulse/platform/internal/crm/api"
 	authmw "github.com/sociopulse/platform/pkg/middleware/auth"
+	tenantmw "github.com/sociopulse/platform/pkg/middleware/tenant"
 )
 
 // Deps captures the collaborators that handlers need. Logger may be
@@ -44,39 +48,84 @@ func Mount(group *gin.RouterGroup, deps Deps) {
 	authed := group.Group("")
 	authed.Use(authmw.JWTMiddleware(deps.Validator))
 
-	// Projects — read endpoints (operator+).
+	// Plan 13.2.5 Task 1 — cross-tenant guards.
+	// projectSameTenant verifies the caller's tenant owns the
+	// :id-from-URL project before the handler runs (404 on mismatch).
+	// Same for respondents on /respondents/:id.
+	projectSameTenant := tenantmw.RequireSameTenant(projectTenantResolver(deps.Projects))
+	respondentSameTenant := tenantmw.RequireSameTenant(respondentTenantResolver(deps.Respondent))
+
+	// Projects — read endpoints (operator+). All :id reads chain the
+	// cross-tenant guard so an operator from Tenant A cannot probe
+	// for Tenant B project ids (the BypassRLS Get would otherwise
+	// return the row).
 	projects := authed.Group("/projects")
 	projects.GET("", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.listProjects)
-	projects.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.getProject)
-	projects.GET("/:id/progress", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.getProjectProgress)
-	projects.GET("/:id/members", requireAnyRole(authapi.RoleSupervisor, authapi.RoleAdmin), h.listProjectMembers)
+	projects.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), projectSameTenant, h.getProject)
+	projects.GET("/:id/progress", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), projectSameTenant, h.getProjectProgress)
+	projects.GET("/:id/members", requireAnyRole(authapi.RoleSupervisor, authapi.RoleAdmin), projectSameTenant, h.listProjectMembers)
 
-	// Projects — admin write endpoints.
+	// Projects — admin write endpoints. Every :id mutation chains the
+	// cross-tenant guard.
 	adminProjects := authed.Group("/projects")
 	adminProjects.Use(requireAdminRole())
 	adminProjects.POST("", h.createProject)
-	adminProjects.PATCH("/:id", h.updateProject)
-	adminProjects.POST("/:id/pause", h.pauseProject)
-	adminProjects.POST("/:id/resume", h.resumeProject)
-	adminProjects.POST("/:id/archive", h.archiveProject)
-	adminProjects.POST("/:id/assign", h.assignOperators)
-	adminProjects.DELETE("/:id/operators/:opID", h.unassignOperator)
+	adminProjects.PATCH("/:id", projectSameTenant, h.updateProject)
+	adminProjects.POST("/:id/pause", projectSameTenant, h.pauseProject)
+	adminProjects.POST("/:id/resume", projectSameTenant, h.resumeProject)
+	adminProjects.POST("/:id/archive", projectSameTenant, h.archiveProject)
+	adminProjects.POST("/:id/assign", projectSameTenant, h.assignOperators)
+	adminProjects.DELETE("/:id/operators/:opID", projectSameTenant, h.unassignOperator)
 
 	// Respondents within a project — admin creates / imports, all roles search.
-	adminProjects.POST("/:id/respondents", h.createRespondent)
-	adminProjects.POST("/:id/respondents/import", h.importRespondents)
-	projects.GET("/:id/respondents", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.searchRespondents)
+	// The :id is a project id; same cross-tenant guard applies.
+	adminProjects.POST("/:id/respondents", projectSameTenant, h.createRespondent)
+	adminProjects.POST("/:id/respondents/import", projectSameTenant, h.importRespondents)
+	projects.GET("/:id/respondents", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), projectSameTenant, h.searchRespondents)
 
-	// Respondents — by id.
+	// Respondents — by respondent id.
 	respondents := authed.Group("/respondents")
-	respondents.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.getRespondent)
-	respondents.GET("/:id/with-phone", requireAdminRole(), h.getRespondentWithPhone)
-	respondents.DELETE("/:id", requireAdminRole(), h.deleteRespondent)
+	respondents.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), respondentSameTenant, h.getRespondent)
+	respondents.GET("/:id/with-phone", requireAdminRole(), respondentSameTenant, h.getRespondentWithPhone)
+	respondents.DELETE("/:id", requireAdminRole(), respondentSameTenant, h.deleteRespondent)
 
-	// Imports — admin.
+	// Imports — admin. job_id is an opaque async-job ticket (not a
+	// row id); status lookup is tenant-scoped inside the service.
 	imports := authed.Group("/imports")
 	imports.Use(requireAdminRole())
 	imports.GET("/:job_id", h.getImportStatus)
+}
+
+// projectTenantResolver wraps ProjectService.ResolveTenant for the
+// tenant.RequireSameTenant middleware. Translates the module sentinel
+// into the middleware's ErrNotFound so the response is a clean 404
+// with no body.
+func projectTenantResolver(p crmapi.ProjectService) tenantmw.ResolveTenantFn {
+	return func(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+		t, err := p.ResolveTenant(ctx, id)
+		if err != nil {
+			if errors.Is(err, crmapi.ErrProjectNotFound) {
+				return uuid.Nil, tenantmw.ErrNotFound
+			}
+			return uuid.Nil, err
+		}
+		return t, nil
+	}
+}
+
+// respondentTenantResolver wraps RespondentService.ResolveTenant for
+// the tenant.RequireSameTenant middleware.
+func respondentTenantResolver(r crmapi.RespondentService) tenantmw.ResolveTenantFn {
+	return func(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+		t, err := r.ResolveTenant(ctx, id)
+		if err != nil {
+			if errors.Is(err, crmapi.ErrRespondentNotFound) {
+				return uuid.Nil, tenantmw.ErrNotFound
+			}
+			return uuid.Nil, err
+		}
+		return t, nil
+	}
 }
 
 // mustNotBeNil verifies every required collaborator. We panic so a

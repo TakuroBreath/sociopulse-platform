@@ -25,6 +25,17 @@ type Authenticator interface {
 }
 
 // UserService is the public CRUD surface for users (admin endpoints).
+//
+// Plan 13.2.5 Task 1 contract change: every admin :id method takes
+// callerTenantID as an explicit defence-in-depth parameter. The
+// transport-layer tenant.RequireSameTenant middleware verifies the
+// caller's claims.TenantID owns id BEFORE calling these methods; the
+// service then operates strictly inside callerTenantID's RLS scope.
+// Even if a future endpoint forgets the middleware, the explicit
+// param documents intent and the WithTenant tx rejects the row via
+// RLS. Self-service endpoints (Get/ChangePassword/me-*) keep the
+// short signature because the caller's own user id is already tenant-
+// scoped via JWT and there is no :id taken from the URL.
 type UserService interface {
 	// Create creates a user and returns the auto-generated initial password.
 	// The user is forced to change it on first login (MustChangePwd=true).
@@ -32,17 +43,29 @@ type UserService interface {
 	// List returns one page of users plus the unfiltered total count.
 	List(ctx context.Context, in ListUsersInput) (users []User, totalCount int64, err error)
 	// Get returns the user with the given ID, or ErrInvalidCredentials-equivalent NotFound.
+	// The /me endpoint passes the caller's own UserID (already tenant-scoped via JWT);
+	// admin lookups go through GetByTenant which requires the caller's tenant.
 	Get(ctx context.Context, id uuid.UUID) (User, error)
-	// UpdateRole replaces the user's roles atomically.
-	UpdateRole(ctx context.Context, id uuid.UUID, roles []Role) (User, error)
+	// GetByTenant returns the user with the given ID under callerTenantID's RLS scope.
+	// Returns ErrUserNotFound when the row does not exist in callerTenantID — this
+	// includes the case where the row exists in a different tenant (cross-tenant
+	// 404 indistinguishability is enforced by the transport middleware too).
+	GetByTenant(ctx context.Context, callerTenantID, id uuid.UUID) (User, error)
+	// UpdateRole replaces the user's roles atomically inside callerTenantID's scope.
+	UpdateRole(ctx context.Context, callerTenantID, id uuid.UUID, roles []Role) (User, error)
 	// Archive sets ArchivedAt and revokes all sessions for the user.
-	Archive(ctx context.Context, id uuid.UUID) error
+	Archive(ctx context.Context, callerTenantID, id uuid.UUID) error
 	// Restore clears ArchivedAt.
-	Restore(ctx context.Context, id uuid.UUID) error
+	Restore(ctx context.Context, callerTenantID, id uuid.UUID) error
 	// ResetPassword issues a new auto-generated password and forces a change on next login.
-	ResetPassword(ctx context.Context, id uuid.UUID) (tempPassword string, err error)
+	ResetPassword(ctx context.Context, callerTenantID, id uuid.UUID) (tempPassword string, err error)
 	// ChangePassword verifies oldPassword then sets newPassword.
+	// Self-service: id is always the caller's own user id (already tenant-scoped via JWT).
 	ChangePassword(ctx context.Context, id uuid.UUID, oldPassword, newPassword string) error
+	// ResolveTenant returns the owning tenant id for a user. Used by the
+	// transport-layer tenant.RequireSameTenant middleware to compare against
+	// claims.TenantID. Returns ErrUserNotFound when the id does not exist.
+	ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 }
 
 // SessionRevoker is the surface used by force-logout-all and admin tooling.

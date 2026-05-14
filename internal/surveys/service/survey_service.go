@@ -232,18 +232,26 @@ func (s *SurveyService) Create(ctx context.Context, in api.CreateSurveyInput) (u
 	return saved.ID, nil
 }
 
-// Get implements api.SurveyService.Get. Uses BypassRLS so admin
-// tooling can resolve a survey id to its tenant before any per-tenant
-// flow.
+// Get implements api.SurveyService.Get.
+//
+// Plan 13.2.5 Task 1: looks the row up inside the caller's tenant
+// scope (from the context-bound tenant id). A cross-tenant row is
+// invisible (RLS) — surfaces as ErrNotFound. The transport-layer
+// tenant.RequireSameTenant middleware also guards the route; this
+// per-tenant tx is defence in depth.
 func (s *SurveyService) Get(ctx context.Context, id uuid.UUID) (api.Survey, error) {
 	if id == uuid.Nil {
 		return api.Survey{}, fmt.Errorf("surveys/service: get: %w", api.ErrInvalidArgument)
 	}
+	tenantID, err := tenantIDFromContext(ctx)
+	if err != nil {
+		return api.Survey{}, err
+	}
 	var out api.Survey
-	err := s.tx.BypassRLS(ctx, func(tx postgres.Tx) error {
-		var err error
-		out, err = s.surveys.GetByID(ctx, tx, id)
-		return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		var ierr error
+		out, ierr = s.surveys.GetByID(ctx, tx, id)
+		return ierr
 	})
 	if err != nil {
 		if errors.Is(err, api.ErrNotFound) {
@@ -252,6 +260,25 @@ func (s *SurveyService) Get(ctx context.Context, id uuid.UUID) (api.Survey, erro
 		return api.Survey{}, fmt.Errorf("surveys/service: get: %w", err)
 	}
 	return out, nil
+}
+
+// ResolveTenant implements api.SurveyService.ResolveTenant. Returns
+// the owning tenant id via a BypassRLS lookup so the transport-layer
+// tenant.RequireSameTenant middleware can compare against the caller's
+// claims.TenantID before the handler runs. Returns ErrNotFound when
+// no row matches.
+//
+// This is the only sanctioned BypassRLS resolver in SurveyService
+// after Plan 13.2.5 Task 1.
+func (s *SurveyService) ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("surveys/service: resolve tenant: id required")
+	}
+	sv, err := s.lookupSurvey(ctx, id)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return sv.TenantID, nil
 }
 
 // List implements api.SurveyService.List. The tenant scope comes from
@@ -284,14 +311,20 @@ func (s *SurveyService) List(ctx context.Context, filter api.ListFilter) ([]api.
 	return rows, nil
 }
 
-// Update implements api.SurveyService.Update. Resolves the survey's
-// tenant via a BypassRLS GetByID, then opens a per-tenant transaction
-// (RLS in effect) and runs the partial-update.
+// Update implements api.SurveyService.Update.
+//
+// Plan 13.2.5 Task 1: reads + writes all happen inside one
+// WithTenant(callerTenantID, ...) tx. A cross-tenant row surfaces as
+// ErrNotFound (RLS hides it).
 func (s *SurveyService) Update(ctx context.Context, id uuid.UUID, in api.UpdateSurveyInput) error {
 	if id == uuid.Nil {
 		return fmt.Errorf("surveys/service: update: %w", api.ErrInvalidArgument)
 	}
 	if err := validateUpdateInput(in); err != nil {
+		return err
+	}
+	tenantID, err := tenantIDFromContext(ctx)
+	if err != nil {
 		return err
 	}
 	patch := api.SurveyPatch{
@@ -300,21 +333,20 @@ func (s *SurveyService) Update(ctx context.Context, id uuid.UUID, in api.UpdateS
 		PrimaryMode: in.PrimaryMode,
 	}
 
-	current, err := s.lookupSurvey(ctx, id)
-	if err != nil {
-		return err
-	}
-	if current.Status == api.StatusArchived {
-		return api.ErrSurveyArchived
-	}
-	if patch.IsEmpty() {
-		return nil
-	}
-
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		saved, err := s.surveys.Update(ctx, tx, id, patch)
-		if err != nil {
-			return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		current, ierr := s.surveys.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if current.Status == api.StatusArchived {
+			return api.ErrSurveyArchived
+		}
+		if patch.IsEmpty() {
+			return nil
+		}
+		saved, ierr := s.surveys.Update(ctx, tx, id, patch)
+		if ierr != nil {
+			return ierr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
 			TenantID: saved.TenantID,
@@ -341,22 +373,26 @@ func (s *SurveyService) Archive(ctx context.Context, id uuid.UUID) error {
 	if id == uuid.Nil {
 		return fmt.Errorf("surveys/service: archive: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupSurvey(ctx, id)
+	tenantID, err := tenantIDFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	// Idempotent: already archived → silent no-op.
-	if current.Status == api.StatusArchived {
-		return nil
-	}
 
 	at := s.clock().UTC()
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		if err := s.surveys.Archive(ctx, tx, id, at); err != nil {
-			return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		current, ierr := s.surveys.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if current.Status == api.StatusArchived {
+			// Idempotent: already archived → silent no-op.
+			return nil
+		}
+		if ierr := s.surveys.Archive(ctx, tx, id, at); ierr != nil {
+			return ierr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: current.TenantID,
+			TenantID: tenantID,
 			Action:   "surveys.archived",
 			Target:   "survey:" + id.String(),
 			Payload: map[string]any{
@@ -400,19 +436,23 @@ func (s *SurveyService) SaveVersion(ctx context.Context, surveyID uuid.UUID, sch
 		return api.Version{}, &api.ValidationError{Report: convertReport(report)}
 	}
 
-	current, err := s.lookupSurvey(ctx, surveyID)
+	tenantID, err := tenantIDFromContext(ctx)
 	if err != nil {
 		return api.Version{}, err
 	}
-	if current.Status == api.StatusArchived {
-		return api.Version{}, api.ErrSurveyArchived
-	}
 
 	var saved api.Version
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		next, err := s.computeNextVersion(ctx, tx, surveyID, minor)
-		if err != nil {
-			return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		current, ierr := s.surveys.GetByID(ctx, tx, surveyID)
+		if ierr != nil {
+			return ierr
+		}
+		if current.Status == api.StatusArchived {
+			return api.ErrSurveyArchived
+		}
+		next, ierr := s.computeNextVersion(ctx, tx, surveyID, minor)
+		if ierr != nil {
+			return ierr
 		}
 		candidate := api.Version{
 			SurveyID: surveyID,
@@ -423,12 +463,12 @@ func (s *SurveyService) SaveVersion(ctx context.Context, surveyID uuid.UUID, sch
 		if actor := actorIDFromContext(ctx); actor != nil {
 			candidate.CreatedBy = *actor
 		}
-		saved, err = s.versions.Insert(ctx, tx, candidate)
-		if err != nil {
-			return err
+		saved, ierr = s.versions.Insert(ctx, tx, candidate)
+		if ierr != nil {
+			return ierr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: current.TenantID,
+			TenantID: tenantID,
 			Action:   "surveys.version_saved",
 			Target:   "version:" + saved.ID.String(),
 			Payload: map[string]any{
@@ -445,7 +485,7 @@ func (s *SurveyService) SaveVersion(ctx context.Context, surveyID uuid.UUID, sch
 		return api.Version{}, fmt.Errorf("surveys/service: save version: %w", err)
 	}
 
-	s.publishEvent(ctx, api.SubjectVersionSavedFor(current.TenantID), api.VersionSavedEvent{
+	s.publishEvent(ctx, api.SubjectVersionSavedFor(tenantID), api.VersionSavedEvent{
 		SurveyID:  surveyID,
 		VersionID: saved.ID,
 		Major:     saved.Major,
@@ -512,17 +552,21 @@ func (s *SurveyService) Activate(ctx context.Context, surveyID, versionID uuid.U
 	if surveyID == uuid.Nil || versionID == uuid.Nil {
 		return fmt.Errorf("surveys/service: activate: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupSurvey(ctx, surveyID)
+	tenantID, err := tenantIDFromContext(ctx)
 	if err != nil {
 		return err
 	}
-	if current.Status == api.StatusArchived {
-		return api.ErrSurveyArchived
-	}
 
 	at := s.clock().UTC()
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		return s.applyActivate(ctx, tx, current.TenantID, surveyID, versionID, at)
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		current, ierr := s.surveys.GetByID(ctx, tx, surveyID)
+		if ierr != nil {
+			return ierr
+		}
+		if current.Status == api.StatusArchived {
+			return api.ErrSurveyArchived
+		}
+		return s.applyActivate(ctx, tx, tenantID, surveyID, versionID, at)
 	})
 	if errors.Is(err, errAlreadyActive) {
 		return nil
@@ -534,7 +578,7 @@ func (s *SurveyService) Activate(ctx context.Context, surveyID, versionID uuid.U
 		}
 		return fmt.Errorf("surveys/service: activate: %w", err)
 	}
-	s.publishEvent(ctx, api.SubjectVersionActivatedFor(current.TenantID), api.VersionActivatedEvent{
+	s.publishEvent(ctx, api.SubjectVersionActivatedFor(tenantID), api.VersionActivatedEvent{
 		SurveyID:  surveyID,
 		VersionID: versionID,
 	})
@@ -612,19 +656,22 @@ func (s *SurveyService) GetActiveVersion(ctx context.Context, surveyID uuid.UUID
 	if surveyID == uuid.Nil {
 		return api.Version{}, fmt.Errorf("surveys/service: get active version: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupSurvey(ctx, surveyID)
+	tenantID, err := tenantIDFromContext(ctx)
 	if err != nil {
 		return api.Version{}, err
 	}
 
 	var v api.Version
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		var err error
-		v, err = s.versions.GetActive(ctx, tx, surveyID)
-		return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		if _, ierr := s.surveys.GetByID(ctx, tx, surveyID); ierr != nil {
+			return ierr
+		}
+		var ierr error
+		v, ierr = s.versions.GetActive(ctx, tx, surveyID)
+		return ierr
 	})
 	if err != nil {
-		if errors.Is(err, api.ErrNoActiveVersion) {
+		if errors.Is(err, api.ErrNoActiveVersion) || errors.Is(err, api.ErrNotFound) {
 			return api.Version{}, err
 		}
 		return api.Version{}, fmt.Errorf("surveys/service: get active version: %w", err)
@@ -637,18 +684,24 @@ func (s *SurveyService) ListVersions(ctx context.Context, surveyID uuid.UUID) ([
 	if surveyID == uuid.Nil {
 		return nil, fmt.Errorf("surveys/service: list versions: %w", api.ErrInvalidArgument)
 	}
-	current, err := s.lookupSurvey(ctx, surveyID)
+	tenantID, err := tenantIDFromContext(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	var rows []api.Version
-	err = s.tx.WithTenant(ctx, current.TenantID, func(tx postgres.Tx) error {
-		var err error
-		rows, err = s.versions.List(ctx, tx, surveyID)
-		return err
+	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		if _, ierr := s.surveys.GetByID(ctx, tx, surveyID); ierr != nil {
+			return ierr
+		}
+		var ierr error
+		rows, ierr = s.versions.List(ctx, tx, surveyID)
+		return ierr
 	})
 	if err != nil {
+		if errors.Is(err, api.ErrNotFound) {
+			return nil, err
+		}
 		return nil, fmt.Errorf("surveys/service: list versions: %w", err)
 	}
 	return rows, nil

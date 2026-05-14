@@ -1,12 +1,17 @@
 package http
 
 import (
+	"context"
+	"errors"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
 
 	authapi "github.com/sociopulse/platform/internal/auth/api"
+	surveysapi "github.com/sociopulse/platform/internal/surveys/api"
 	authmw "github.com/sociopulse/platform/pkg/middleware/auth"
+	tenantmw "github.com/sociopulse/platform/pkg/middleware/tenant"
 )
 
 // Mount registers every /api/surveys route on the supplied gin
@@ -32,22 +37,44 @@ func Mount(group *gin.RouterGroup, deps Deps) {
 	authed := group.Group("/surveys")
 	authed.Use(authmw.JWTMiddleware(deps.Auth))
 
+	// Plan 13.2.5 Task 1 — cross-tenant guard. Verifies the caller's
+	// tenant owns the :id survey BEFORE the handler runs (404 on
+	// mismatch). Routes that don't operate on a stored row (preview /
+	// validate are stateless) skip the guard — they just sanity-check
+	// the :id is a UUID.
+	sameTenant := tenantmw.RequireSameTenant(surveyTenantResolver(deps.Surveys))
+
 	// Read endpoints (operator+).
 	authed.GET("", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.listSurveys)
-	authed.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.getSurvey)
-	authed.GET("/:id/versions", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.listVersions)
-	authed.GET("/:id/versions/active", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.getActiveVersion)
+	authed.GET("/:id", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), sameTenant, h.getSurvey)
+	authed.GET("/:id/versions", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), sameTenant, h.listVersions)
+	authed.GET("/:id/versions/active", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), sameTenant, h.getActiveVersion)
 	authed.POST("/:id/preview/run", requireAnyRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin), h.previewRun)
 
 	// Admin write endpoints.
 	admin := authed.Group("")
 	admin.Use(requireAdminRole())
 	admin.POST("", h.createSurvey)
-	admin.PATCH("/:id", h.updateSurvey)
-	admin.POST("/:id/archive", h.archiveSurvey)
-	admin.POST("/:id/versions", h.saveVersion)
-	admin.POST("/:id/versions/:version_id/activate", h.activateVersion)
+	admin.PATCH("/:id", sameTenant, h.updateSurvey)
+	admin.POST("/:id/archive", sameTenant, h.archiveSurvey)
+	admin.POST("/:id/versions", sameTenant, h.saveVersion)
+	admin.POST("/:id/versions/:version_id/activate", sameTenant, h.activateVersion)
 	admin.POST("/:id/validate", h.validateSchema)
+}
+
+// surveyTenantResolver wraps SurveyService.ResolveTenant for the
+// tenant.RequireSameTenant middleware.
+func surveyTenantResolver(svc surveysapi.SurveyService) tenantmw.ResolveTenantFn {
+	return func(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+		t, err := svc.ResolveTenant(ctx, id)
+		if err != nil {
+			if errors.Is(err, surveysapi.ErrNotFound) {
+				return uuid.Nil, tenantmw.ErrNotFound
+			}
+			return uuid.Nil, err
+		}
+		return t, nil
+	}
 }
 
 // mustNotBeNil verifies every required collaborator. We panic so a

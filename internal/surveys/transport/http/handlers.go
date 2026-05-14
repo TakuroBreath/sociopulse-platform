@@ -114,13 +114,23 @@ func (h *handlers) listSurveys(c *gin.Context) {
 }
 
 // getSurvey handles GET /api/surveys/:id (operator+).
+//
+// Plan 13.2.5 Task 1: tenant.RequireSameTenant on the route chain
+// has already verified the caller's tenant owns :id. Threading the
+// tenant via withCallerScope so the service runs per-tenant (defence
+// in depth).
 func (h *handlers) getSurvey(c *gin.Context) {
+	claims, ok := claimsOrFail(c, h.deps.Logger)
+	if !ok {
+		return
+	}
 	id, err := parseIDParam(c, "id")
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	s, err := h.deps.Surveys.Get(c.Request.Context(), id)
+	ctx := withCallerScope(c, claims)
+	s, err := h.deps.Surveys.Get(ctx, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -244,12 +254,17 @@ func (h *handlers) activateVersion(c *gin.Context) {
 
 // getActiveVersion handles GET /api/surveys/:id/versions/active (operator+).
 func (h *handlers) getActiveVersion(c *gin.Context) {
+	claims, ok := claimsOrFail(c, h.deps.Logger)
+	if !ok {
+		return
+	}
 	id, err := parseIDParam(c, "id")
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	v, err := h.deps.Surveys.GetActiveVersion(c.Request.Context(), id)
+	ctx := withCallerScope(c, claims)
+	v, err := h.deps.Surveys.GetActiveVersion(ctx, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -259,12 +274,17 @@ func (h *handlers) getActiveVersion(c *gin.Context) {
 
 // listVersions handles GET /api/surveys/:id/versions (operator+).
 func (h *handlers) listVersions(c *gin.Context) {
+	claims, ok := claimsOrFail(c, h.deps.Logger)
+	if !ok {
+		return
+	}
 	id, err := parseIDParam(c, "id")
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	rows, err := h.deps.Surveys.ListVersions(c.Request.Context(), id)
+	ctx := withCallerScope(c, claims)
+	rows, err := h.deps.Surveys.ListVersions(ctx, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return

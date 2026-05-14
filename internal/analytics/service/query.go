@@ -83,11 +83,18 @@ func (a *StoreReaderAdapter) OperatorComparisonsByMV(ctx context.Context, q apia
 // the GetProgress method the analytics service needs — the wider
 // ProjectService surface (Create/Archive/List/...) is irrelevant here.
 //
+// Plan 13.2.5 Task 1: GetProgress now takes callerTenantID as an
+// explicit defence-in-depth parameter. Analytics already has the
+// tenant id on every RegionProgress query (it's in
+// apianalytics.RegionProgressQuery.TenantID — the JWT-validated
+// callerTenantID); threading it through keeps the per-tenant RLS scope
+// intact even when this internal port is used.
+//
 // When the locator has no crm registration at boot, QueryService is
 // constructed with crm=nil and RegionProgress falls back to Plan=0
 // (Plan 13.2 § Q12).
 type CrmReader interface {
-	GetProgress(ctx context.Context, projectID uuid.UUID) (*crmapi.ProjectProgress, error)
+	GetProgress(ctx context.Context, callerTenantID, projectID uuid.UUID) (*crmapi.ProjectProgress, error)
 }
 
 // QueryConfig is the validated runtime configuration for cache TTL
@@ -286,7 +293,7 @@ func (s *QueryService) RegionProgress(ctx context.Context, q apianalytics.Region
 	// error → Plan=0 (Q12 documented fallback).
 	var plan uint64
 	if s.crm != nil {
-		progress, crmErr := s.crm.GetProgress(ctx, q.ProjectID)
+		progress, crmErr := s.crm.GetProgress(ctx, q.TenantID, q.ProjectID)
 		if crmErr != nil {
 			s.logger.Debug("analytics: crm.GetProgress failed — Plan=0",
 				zap.String("tenant_id", q.TenantID.String()),

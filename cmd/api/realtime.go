@@ -165,13 +165,14 @@ func (a *userResolverAdapter) Get(ctx context.Context, userID string) (rtapi.Res
 	return rtapi.ResolvedTenant{TenantID: user.TenantID.String()}, nil
 }
 
-// crmProjectGetter is the tenant-agnostic lookup the resolver uses.
-// crm.ProjectService.Get opens a BypassRLS tx for the same reason as
-// auth.UserService.Get — admin tooling routinely resolves a project
-// id to its tenant before a per-tenant flow. See
-// internal/crm/service/project_service.go::Get.
+// crmProjectGetter is the tenant-agnostic lookup the realtime
+// resolver uses. After Plan 13.2.5 Task 1 the only sanctioned
+// BypassRLS resolver on crm.ProjectService is ResolveTenant — Get is
+// now per-tenant. The realtime resolver is genuinely cross-tenant
+// (its whole purpose is "project_id → tenant_id" for routing), so it
+// uses ResolveTenant.
 type crmProjectGetter interface {
-	Get(ctx context.Context, projectID uuid.UUID) (*crmapi.Project, error)
+	ResolveTenant(ctx context.Context, projectID uuid.UUID) (uuid.UUID, error)
 }
 
 // projectResolverAdapter mirrors userResolverAdapter for project IDs.
@@ -201,26 +202,27 @@ func newProjectResolverAdapterWithMetrics(
 	}
 }
 
-// Get implements rtapi.ProjectResolver.
+// Get implements rtapi.ProjectResolver. Uses the sanctioned
+// cross-tenant BypassRLS resolver (Plan 13.2.5 Task 1).
 func (a *projectResolverAdapter) Get(ctx context.Context, projectID string) (rtapi.ResolvedTenant, error) {
 	id, err := uuid.Parse(projectID)
 	if err != nil {
 		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: parse project_id %q: %w", projectID, err)
 	}
-	proj, err := a.svc.Get(ctx, id)
+	tenantID, err := a.svc.ResolveTenant(ctx, id)
 	if err != nil {
-		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get project %s: %w", id, err)
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: resolve project %s: %w", id, err)
 	}
-	if proj == nil {
-		// Defensive: ProjectService.Get returns (nil, ErrProjectNotFound)
+	if tenantID == uuid.Nil {
+		// Defensive: ResolveTenant returns (uuid.Nil, ErrProjectNotFound)
 		// on miss; we handle the error path above. A nil-without-error
 		// would be a service-layer bug — surface it via metric so the
 		// regression doesn't hide as a legitimate cross-tenant
 		// rejection. Plan 11.3 Task 4.
 		a.bumpInconsistent("project")
-		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: get project %s: nil project returned without error", id)
+		return rtapi.ResolvedTenant{}, fmt.Errorf("cmd/api: resolve project %s: nil tenant returned without error", id)
 	}
-	return rtapi.ResolvedTenant{TenantID: proj.TenantID.String()}, nil
+	return rtapi.ResolvedTenant{TenantID: tenantID.String()}, nil
 }
 
 // Compile-time interface checks for the resolver adapters. Mirrors

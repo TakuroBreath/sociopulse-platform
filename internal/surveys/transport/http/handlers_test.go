@@ -28,35 +28,42 @@ import (
 // fakeSurveyService records calls and returns canned values. Hand-
 // rolled rather than gomock-generated because Plan 05/06 lessons
 // learned § 8 strongly prefer hand-rolled fakes for transport tests.
+//
+// Plan 13.2.5 Task 1: ResolveTenant is the resolver used by the
+// tenant.RequireSameTenant middleware on every admin :id route.
 type fakeSurveyService struct {
-	createIn   surveysapi.CreateSurveyInput
-	createID   uuid.UUID
-	createErr  error
-	getIDs     []uuid.UUID
-	getRet     surveysapi.Survey
-	getErr     error
-	listIn     surveysapi.ListFilter
-	listRet    []surveysapi.Survey
-	listErr    error
-	updateID   uuid.UUID
-	updateIn   surveysapi.UpdateSurveyInput
-	updateErr  error
-	archiveID  uuid.UUID
-	archiveErr error
-	saveSurvey uuid.UUID
-	saveSchema []byte
-	saveMinor  bool
-	saveRet    surveysapi.Version
-	saveErr    error
-	activateS  uuid.UUID
-	activateV  uuid.UUID
-	activErr   error
-	activeID   uuid.UUID
-	activeRet  surveysapi.Version
-	activeErr  error
-	listVerID  uuid.UUID
-	listVerRet []surveysapi.Version
-	listVerErr error
+	createIn     surveysapi.CreateSurveyInput
+	createID     uuid.UUID
+	createErr    error
+	getIDs       []uuid.UUID
+	getRet       surveysapi.Survey
+	getErr       error
+	listIn       surveysapi.ListFilter
+	listRet      []surveysapi.Survey
+	listErr      error
+	updateID     uuid.UUID
+	updateIn     surveysapi.UpdateSurveyInput
+	updateErr    error
+	archiveID    uuid.UUID
+	archiveErr   error
+	saveSurvey   uuid.UUID
+	saveSchema   []byte
+	saveMinor    bool
+	saveRet      surveysapi.Version
+	saveErr      error
+	activateS    uuid.UUID
+	activateV    uuid.UUID
+	activErr     error
+	activeID     uuid.UUID
+	activeRet    surveysapi.Version
+	activeErr    error
+	listVerID    uuid.UUID
+	listVerRet   []surveysapi.Version
+	listVerErr   error
+	resolveCalls []uuid.UUID
+	resolveRet   uuid.UUID
+	resolveErr   error
+	matchTenant  *uuid.UUID
 }
 
 func (f *fakeSurveyService) Create(_ context.Context, in surveysapi.CreateSurveyInput) (uuid.UUID, error) {
@@ -124,6 +131,20 @@ func (f *fakeSurveyService) ListVersions(_ context.Context, surveyID uuid.UUID) 
 		return nil, f.listVerErr
 	}
 	return f.listVerRet, nil
+}
+
+func (f *fakeSurveyService) ResolveTenant(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	f.resolveCalls = append(f.resolveCalls, id)
+	if f.resolveErr != nil {
+		return uuid.Nil, f.resolveErr
+	}
+	if f.resolveRet != uuid.Nil {
+		return f.resolveRet, nil
+	}
+	if f.matchTenant != nil {
+		return *f.matchTenant, nil
+	}
+	return uuid.Nil, nil
 }
 
 // fakeRuntime records preview calls and returns canned values.
@@ -236,6 +257,10 @@ func newFixture(t *testing.T) *fixture {
 		tenantID: tenantID,
 		userID:   userID,
 	}
+	// Plan 13.2.5 Task 1: default the resolver to whatever tenant the
+	// validator's claims currently report. Cross-tenant tests override
+	// resolveRet to force a mismatch.
+	f.surveys.matchTenant = &f.authV.claims.TenantID
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
 		Logger:    nil,

@@ -553,7 +553,7 @@ func TestSurveyService_Get_RoundTrip(t *testing.T) {
 		Name:     "Stored",
 	})
 
-	got, err := svc.Get(context.Background(), stored.ID)
+	got, err := svc.Get(WithTenantID(context.Background(), tenantID), stored.ID)
 	require.NoError(t, err)
 	require.Equal(t, stored.ID, got.ID)
 	require.Equal(t, stored.Name, got.Name)
@@ -564,7 +564,7 @@ func TestSurveyService_Get_RejectsZeroID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.Get(context.Background(), uuid.Nil)
+	_, err := svc.Get(WithTenantID(context.Background(), uuid.New()), uuid.Nil)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -573,7 +573,7 @@ func TestSurveyService_Get_MissingReturnsErrNotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.Get(context.Background(), uuid.New())
+	_, err := svc.Get(WithTenantID(context.Background(), uuid.New()), uuid.New())
 	require.ErrorIs(t, err, api.ErrNotFound)
 }
 
@@ -628,7 +628,7 @@ func TestSurveyService_Update_PartialPatch(t *testing.T) {
 	})
 
 	newName := "Renamed"
-	require.NoError(t, svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{
+	require.NoError(t, svc.Update(WithTenantID(context.Background(), tenantID), stored.ID, api.UpdateSurveyInput{
 		Name: &newName,
 	}))
 
@@ -651,7 +651,7 @@ func TestSurveyService_Update_EmptyPatchIsNoop(t *testing.T) {
 	svc, store, _, audit, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "Stored"})
 
-	require.NoError(t, svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{}))
+	require.NoError(t, svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{}))
 	require.Empty(t, audit.snapshot())
 }
 
@@ -667,7 +667,7 @@ func TestSurveyService_Update_ArchivedReturnsErrSurveyArchived(t *testing.T) {
 	})
 
 	newName := "Renamed"
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{Name: &newName})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{Name: &newName})
 	require.ErrorIs(t, err, api.ErrSurveyArchived)
 }
 
@@ -676,7 +676,7 @@ func TestSurveyService_Update_RejectsZeroID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	err := svc.Update(context.Background(), uuid.Nil, api.UpdateSurveyInput{})
+	err := svc.Update(WithTenantID(context.Background(), uuid.New()), uuid.Nil, api.UpdateSurveyInput{})
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -688,7 +688,7 @@ func TestSurveyService_Update_RejectsLongName(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
 	long := strings.Repeat("a", maxNameLength+1)
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{Name: &long})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{Name: &long})
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -700,7 +700,7 @@ func TestSurveyService_Update_RejectsEmptyName(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
 	empty := ""
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{Name: &empty})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{Name: &empty})
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -712,7 +712,7 @@ func TestSurveyService_Update_RejectsBadMode(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
 	bad := api.PrimaryMode("nope")
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{PrimaryMode: &bad})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{PrimaryMode: &bad})
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -723,7 +723,7 @@ func TestSurveyService_Archive_HappyPath(t *testing.T) {
 	svc, store, _, audit, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "ToArchive"})
 
-	require.NoError(t, svc.Archive(context.Background(), stored.ID))
+	require.NoError(t, svc.Archive(WithTenantID(context.Background(), stored.TenantID), stored.ID))
 
 	require.Equal(t, api.StatusArchived, store.surveys[stored.ID].Status)
 	events := audit.snapshot()
@@ -742,7 +742,7 @@ func TestSurveyService_Archive_AlreadyArchivedIsNoop(t *testing.T) {
 		Status:   api.StatusArchived,
 	})
 
-	require.NoError(t, svc.Archive(context.Background(), stored.ID))
+	require.NoError(t, svc.Archive(WithTenantID(context.Background(), stored.TenantID), stored.ID))
 	require.Empty(t, audit.snapshot())
 }
 
@@ -751,7 +751,7 @@ func TestSurveyService_Archive_RejectsZeroID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	err := svc.Archive(context.Background(), uuid.Nil)
+	err := svc.Archive(WithTenantID(context.Background(), uuid.New()), uuid.Nil)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -760,7 +760,7 @@ func TestSurveyService_Archive_MissingReturnsErrNotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	err := svc.Archive(context.Background(), uuid.New())
+	err := svc.Archive(WithTenantID(context.Background(), uuid.New()), uuid.New())
 	require.ErrorIs(t, err, api.ErrNotFound)
 }
 
@@ -774,7 +774,7 @@ func TestSurveyService_SaveVersion_FirstMajorBump(t *testing.T) {
 	tenantID := uuid.New()
 	stored := store.seed(api.Survey{TenantID: tenantID, Name: "Survey"})
 
-	got, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{"x":1}`), false)
+	got, err := svc.SaveVersion(WithTenantID(context.Background(), tenantID), stored.ID, []byte(`{"x":1}`), false)
 	require.NoError(t, err)
 	require.Equal(t, 1, got.Major)
 	require.Equal(t, 0, got.Minor)
@@ -801,7 +801,7 @@ func TestSurveyService_SaveVersion_MinorBump(t *testing.T) {
 		SurveyID: stored.ID, Major: 1, Minor: 1, Schema: []byte(`{}`),
 	})
 
-	got, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), true)
+	got, err := svc.SaveVersion(WithTenantID(context.Background(), tenantID), stored.ID, []byte(`{}`), true)
 	require.NoError(t, err)
 	require.Equal(t, 1, got.Major)
 	require.Equal(t, 2, got.Minor)
@@ -818,7 +818,7 @@ func TestSurveyService_SaveVersion_MajorBump(t *testing.T) {
 		SurveyID: stored.ID, Major: 1, Minor: 5, Schema: []byte(`{}`),
 	})
 
-	got, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	got, err := svc.SaveVersion(WithTenantID(context.Background(), tenantID), stored.ID, []byte(`{}`), false)
 	require.NoError(t, err)
 	require.Equal(t, 2, got.Major)
 	require.Equal(t, 0, got.Minor)
@@ -839,7 +839,7 @@ func TestSurveyService_SaveVersion_ValidationFailureReturnsValidationError(t *te
 		}},
 	}
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), false)
 	require.Error(t, err)
 	var ve *api.ValidationError
 	require.ErrorAs(t, err, &ve)
@@ -856,7 +856,7 @@ func TestSurveyService_SaveVersion_RejectsEmptySchema(t *testing.T) {
 	svc, store, _, _, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, nil, false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, nil, false)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -866,7 +866,7 @@ func TestSurveyService_SaveVersion_RejectsZeroSurveyID(t *testing.T) {
 
 	svc, _, _, _, _ := newSvc(t)
 
-	_, err := svc.SaveVersion(context.Background(), uuid.Nil, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), uuid.New()), uuid.Nil, []byte(`{}`), false)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -881,7 +881,7 @@ func TestSurveyService_SaveVersion_RejectsArchivedSurvey(t *testing.T) {
 		Status:   api.StatusArchived,
 	})
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), false)
 	require.ErrorIs(t, err, api.ErrSurveyArchived)
 }
 
@@ -903,7 +903,7 @@ func TestSurveyService_Activate_HappyPath(t *testing.T) {
 		SurveyID: stored.ID, Major: 1, Minor: 1, Schema: []byte(`{}`),
 	})
 
-	require.NoError(t, svc.Activate(context.Background(), stored.ID, v2.ID))
+	require.NoError(t, svc.Activate(WithTenantID(context.Background(), tenantID), stored.ID, v2.ID))
 
 	require.False(t, versions.versions[v1.ID].IsActive)
 	require.True(t, versions.versions[v2.ID].IsActive)
@@ -926,7 +926,7 @@ func TestSurveyService_Activate_NoPriorActive(t *testing.T) {
 		SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`),
 	})
 
-	require.NoError(t, svc.Activate(context.Background(), stored.ID, v.ID))
+	require.NoError(t, svc.Activate(WithTenantID(context.Background(), stored.TenantID), stored.ID, v.ID))
 	require.True(t, versions.versions[v.ID].IsActive)
 
 	events := audit.snapshot()
@@ -946,7 +946,7 @@ func TestSurveyService_Activate_AlreadyActiveIsNoop(t *testing.T) {
 		IsActive: true,
 	})
 
-	require.NoError(t, svc.Activate(context.Background(), stored.ID, v.ID))
+	require.NoError(t, svc.Activate(WithTenantID(context.Background(), stored.TenantID), stored.ID, v.ID))
 	require.Empty(t, audit.snapshot())
 }
 
@@ -961,7 +961,7 @@ func TestSurveyService_Activate_VersionFromOtherSurvey(t *testing.T) {
 		SurveyID: survey2.ID, Major: 1, Minor: 0, Schema: []byte(`{}`),
 	})
 
-	err := svc.Activate(context.Background(), survey1.ID, otherV.ID)
+	err := svc.Activate(WithTenantID(context.Background(), uuid.New()), survey1.ID, otherV.ID)
 	require.ErrorIs(t, err, api.ErrVersionNotFound)
 }
 
@@ -971,8 +971,8 @@ func TestSurveyService_Activate_RejectsZeroIDs(t *testing.T) {
 
 	svc, _, _, _, _ := newSvc(t)
 
-	require.ErrorIs(t, svc.Activate(context.Background(), uuid.Nil, uuid.New()), api.ErrInvalidArgument)
-	require.ErrorIs(t, svc.Activate(context.Background(), uuid.New(), uuid.Nil), api.ErrInvalidArgument)
+	require.ErrorIs(t, svc.Activate(WithTenantID(context.Background(), uuid.New()), uuid.Nil, uuid.New()), api.ErrInvalidArgument)
+	require.ErrorIs(t, svc.Activate(WithTenantID(context.Background(), uuid.New()), uuid.New(), uuid.Nil), api.ErrInvalidArgument)
 }
 
 // TestSurveyService_Activate_RejectsArchivedSurvey.
@@ -989,7 +989,7 @@ func TestSurveyService_Activate_RejectsArchivedSurvey(t *testing.T) {
 		SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`),
 	})
 
-	err := svc.Activate(context.Background(), stored.ID, v.ID)
+	err := svc.Activate(WithTenantID(context.Background(), stored.TenantID), stored.ID, v.ID)
 	require.ErrorIs(t, err, api.ErrSurveyArchived)
 }
 
@@ -1000,7 +1000,7 @@ func TestSurveyService_Activate_MissingVersionReturnsErrVersionNotFound(t *testi
 	svc, store, _, _, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
-	err := svc.Activate(context.Background(), stored.ID, uuid.New())
+	err := svc.Activate(WithTenantID(context.Background(), stored.TenantID), stored.ID, uuid.New())
 	require.ErrorIs(t, err, api.ErrVersionNotFound)
 }
 
@@ -1015,7 +1015,7 @@ func TestSurveyService_GetActiveVersion_HappyPath(t *testing.T) {
 		IsActive: true,
 	})
 
-	got, err := svc.GetActiveVersion(context.Background(), stored.ID)
+	got, err := svc.GetActiveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.NoError(t, err)
 	require.True(t, got.IsActive)
 }
@@ -1027,7 +1027,7 @@ func TestSurveyService_GetActiveVersion_NoneReturnsErrNoActiveVersion(t *testing
 	svc, store, _, _, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
-	_, err := svc.GetActiveVersion(context.Background(), stored.ID)
+	_, err := svc.GetActiveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.ErrorIs(t, err, api.ErrNoActiveVersion)
 }
 
@@ -1040,7 +1040,7 @@ func TestSurveyService_ListVersions_NewestFirst(t *testing.T) {
 	versions.seed(api.Version{SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`)})
 	versions.seed(api.Version{SurveyID: stored.ID, Major: 1, Minor: 1, Schema: []byte(`{}`)})
 
-	rows, err := svc.ListVersions(context.Background(), stored.ID)
+	rows, err := svc.ListVersions(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.NoError(t, err)
 	require.Len(t, rows, 2)
 }
@@ -1050,7 +1050,7 @@ func TestSurveyService_ListVersions_RejectsZeroID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.ListVersions(context.Background(), uuid.Nil)
+	_, err := svc.ListVersions(WithTenantID(context.Background(), uuid.New()), uuid.Nil)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -1059,7 +1059,7 @@ func TestSurveyService_GetActiveVersion_RejectsZeroID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.GetActiveVersion(context.Background(), uuid.Nil)
+	_, err := svc.GetActiveVersion(WithTenantID(context.Background(), uuid.New()), uuid.Nil)
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -1068,7 +1068,7 @@ func TestSurveyService_ListVersions_MissingSurvey(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.ListVersions(context.Background(), uuid.New())
+	_, err := svc.ListVersions(WithTenantID(context.Background(), uuid.New()), uuid.New())
 	require.ErrorIs(t, err, api.ErrNotFound)
 }
 
@@ -1077,7 +1077,7 @@ func TestSurveyService_GetActiveVersion_MissingSurvey(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _ := newSvc(t)
-	_, err := svc.GetActiveVersion(context.Background(), uuid.New())
+	_, err := svc.GetActiveVersion(WithTenantID(context.Background(), uuid.New()), uuid.New())
 	require.ErrorIs(t, err, api.ErrNotFound)
 }
 
@@ -1133,7 +1133,7 @@ func TestSurveyService_PublishesEventOnActivate(t *testing.T) {
 	stored := surveys.seed(api.Survey{TenantID: uuid.New(), Name: "Survey"})
 	v := versions.seed(api.Version{SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`)})
 
-	require.NoError(t, svc.Activate(context.Background(), stored.ID, v.ID))
+	require.NoError(t, svc.Activate(WithTenantID(context.Background(), uuid.New()), stored.ID, v.ID))
 	require.Equal(t, 1, pub.calls)
 	require.Contains(t, pub.lastSubject, "surveys.version.activated")
 }
@@ -1170,7 +1170,7 @@ func TestSurveyService_PublishesEventOnSaveVersion(t *testing.T) {
 	svc := NewSurveyService(tx, surveys, versions, &fakeValidator{}, audit, pub, clock)
 	stored := surveys.seed(api.Survey{TenantID: uuid.New(), Name: "Survey"})
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), uuid.New()), stored.ID, []byte(`{}`), false)
 	require.NoError(t, err)
 	require.Equal(t, 1, pub.calls)
 	require.Contains(t, pub.lastSubject, "surveys.version.saved")
@@ -1184,7 +1184,7 @@ func TestSurveyService_DoesNotPublishWhenPublisherNil(t *testing.T) {
 	svc, store, _, _, _ := newSvc(t)
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), false)
 	require.NoError(t, err)
 	// No publisher → nothing to assert; getting here without panic is the
 	// confirmation. (Defensive: also confirm via direct field access.)
@@ -1215,7 +1215,7 @@ func TestSurveyService_Update_StoreErrorWraps(t *testing.T) {
 	store.updateErr = errors.New("boom")
 
 	newName := "X"
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{Name: &newName})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{Name: &newName})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: update")
 }
@@ -1228,7 +1228,7 @@ func TestSurveyService_Archive_StoreErrorWraps(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 	store.archiveErr = errors.New("boom")
 
-	err := svc.Archive(context.Background(), stored.ID)
+	err := svc.Archive(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: archive")
 }
@@ -1241,7 +1241,7 @@ func TestSurveyService_SaveVersion_StoreErrorWraps(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 	versions.insertErr = errors.New("boom")
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), false)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: save version")
 }
@@ -1255,7 +1255,7 @@ func TestSurveyService_Activate_StoreErrorWraps(t *testing.T) {
 	v := versions.seed(api.Version{SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`)})
 	versions.deactivateAllErr = errors.New("boom")
 
-	err := svc.Activate(context.Background(), stored.ID, v.ID)
+	err := svc.Activate(WithTenantID(context.Background(), stored.TenantID), stored.ID, v.ID)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: activate")
 }
@@ -1268,7 +1268,7 @@ func TestSurveyService_GetActiveVersion_StoreErrorWraps(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 	versions.getActiveErr = errors.New("boom")
 
-	_, err := svc.GetActiveVersion(context.Background(), stored.ID)
+	_, err := svc.GetActiveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: get active version")
 }
@@ -1281,7 +1281,7 @@ func TestSurveyService_ListVersions_StoreErrorWraps(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 	versions.listErr = errors.New("boom")
 
-	_, err := svc.ListVersions(context.Background(), stored.ID)
+	_, err := svc.ListVersions(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: list versions")
 }
@@ -1303,7 +1303,7 @@ func TestSurveyService_Get_StoreErrorWraps(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 	store.getByIDErr = errors.New("boom")
 
-	_, err := svc.Get(context.Background(), stored.ID)
+	_, err := svc.Get(WithTenantID(context.Background(), stored.TenantID), stored.ID)
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "surveys/service: get")
 }
@@ -1316,7 +1316,7 @@ func TestSurveyService_Update_TooLongDescription(t *testing.T) {
 	stored := store.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
 	long := strings.Repeat("a", maxDescriptionLength+1)
-	err := svc.Update(context.Background(), stored.ID, api.UpdateSurveyInput{Description: &long})
+	err := svc.Update(WithTenantID(context.Background(), stored.TenantID), stored.ID, api.UpdateSurveyInput{Description: &long})
 	require.ErrorIs(t, err, api.ErrInvalidArgument)
 }
 
@@ -1355,7 +1355,7 @@ func TestSurveyService_SaveVersion_LatestMinorReturnsMinusOne_DefensivePath(t *t
 	// case). The LatestMinor==-1 branch is purely defensive and the
 	// test structure here is the documentation. Confirm the simple
 	// case still works.
-	got, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), true)
+	got, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), true)
 	require.NoError(t, err)
 	require.Equal(t, 1, got.Major)
 	require.Equal(t, 0, got.Minor)
@@ -1436,7 +1436,7 @@ func TestSurveyService_PublishMarshalErrorRoutesToAudit(t *testing.T) {
 	pub.publishErr = errors.New("nats refused")
 
 	stored := surveys.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), uuid.New()), stored.ID, []byte(`{}`), false)
 	require.NoError(t, err)
 	events := audit.snapshot()
 	require.Len(t, events, 2)
@@ -1450,7 +1450,7 @@ func TestSurveyService_LookupSurvey_NonSentinelErrorWraps(t *testing.T) {
 	svc, store, _, _, _ := newSvc(t)
 	store.getByIDErr = errors.New("boom")
 
-	_, err := svc.GetActiveVersion(context.Background(), uuid.New())
+	_, err := svc.GetActiveVersion(WithTenantID(context.Background(), uuid.New()), uuid.New())
 	require.Error(t, err)
 }
 
@@ -1463,7 +1463,7 @@ func TestSurveyService_ComputeNextVersion_LatestMinorErrorBubbles(t *testing.T) 
 	versions.seed(api.Version{SurveyID: stored.ID, Major: 1, Minor: 0, Schema: []byte(`{}`)})
 	versions.latestMinorErr = errors.New("boom")
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), true)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), stored.TenantID), stored.ID, []byte(`{}`), true)
 	require.Error(t, err)
 }
 
@@ -1482,7 +1482,7 @@ func TestSurveyService_PublisherErrorIsNonFatal(t *testing.T) {
 	svc := NewSurveyService(tx, surveys, versions, &fakeValidator{}, audit, pub, clock)
 	stored := surveys.seed(api.Survey{TenantID: uuid.New(), Name: "S"})
 
-	_, err := svc.SaveVersion(context.Background(), stored.ID, []byte(`{}`), false)
+	_, err := svc.SaveVersion(WithTenantID(context.Background(), uuid.New()), stored.ID, []byte(`{}`), false)
 	require.NoError(t, err) // caller-visible: success
 	// Two audit events: surveys.version_saved and the publish-error log.
 	events := audit.snapshot()

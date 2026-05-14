@@ -927,7 +927,7 @@ func TestRespondentService_Get_HappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	got, err := svc.Get(ctx, created.ID)
+	got, err := svc.Get(ctx, tenantID, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, created.ID, got.ID)
 	require.Empty(t, got.Phone, "Get must NOT populate plaintext phone")
@@ -942,7 +942,7 @@ func TestRespondentService_Get_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _, _ := newRespSvc(t)
-	_, err := svc.Get(context.Background(), uuid.Nil)
+	_, err := svc.Get(context.Background(), uuid.New(), uuid.Nil)
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 }
 
@@ -952,7 +952,7 @@ func TestRespondentService_Get_MissingReturnsErrRespondentNotFound(t *testing.T)
 	t.Parallel()
 
 	svc, _, _, _, _, _ := newRespSvc(t)
-	_, err := svc.Get(context.Background(), uuid.New())
+	_, err := svc.Get(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, crmapi.ErrRespondentNotFound)
 }
 
@@ -974,7 +974,7 @@ func TestRespondentService_GetWithPhone_HappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	got, err := svc.GetWithPhone(ctx, created.ID)
+	got, err := svc.GetWithPhone(ctx, tenantID, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, validRussianPhone, got.Phone)
 	require.NotEmpty(t, got.PhoneMasked)
@@ -1006,10 +1006,10 @@ func TestRespondentService_GetWithPhone_DeletedReturnsErrRespondentDeleted(t *te
 	})
 	require.NoError(t, err)
 
-	_, err = svc.Delete(ctx, created.ID)
+	_, err = svc.Delete(ctx, uuid.New(), created.ID)
 	require.NoError(t, err)
 
-	_, err = svc.GetWithPhone(ctx, created.ID)
+	_, err = svc.GetWithPhone(ctx, uuid.New(), created.ID)
 	require.ErrorIs(t, err, crmapi.ErrRespondentDeleted)
 }
 
@@ -1094,7 +1094,7 @@ func TestRespondentService_Delete_HappyPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 
-	dr, err := svc.Delete(ctx, created.ID)
+	dr, err := svc.Delete(ctx, tenantID, created.ID)
 	require.NoError(t, err)
 	require.Equal(t, created.ID, dr.RespondentID)
 
@@ -1125,10 +1125,10 @@ func TestRespondentService_Delete_AlreadyDeletedReturnsErrRespondentDeleted(t *t
 	})
 	require.NoError(t, err)
 
-	_, err = svc.Delete(ctx, created.ID)
+	_, err = svc.Delete(ctx, uuid.New(), created.ID)
 	require.NoError(t, err)
 
-	_, err = svc.Delete(ctx, created.ID)
+	_, err = svc.Delete(ctx, uuid.New(), created.ID)
 	require.ErrorIs(t, err, crmapi.ErrRespondentDeleted)
 }
 
@@ -1137,7 +1137,7 @@ func TestRespondentService_Delete_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _, _ := newRespSvc(t)
-	_, err := svc.Delete(context.Background(), uuid.Nil)
+	_, err := svc.Delete(context.Background(), uuid.New(), uuid.Nil)
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 }
 
@@ -1147,7 +1147,7 @@ func TestRespondentService_Delete_MissingReturnsNotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _, _, _, _ := newRespSvc(t)
-	_, err := svc.Delete(context.Background(), uuid.New())
+	_, err := svc.Delete(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, crmapi.ErrRespondentNotFound)
 }
 

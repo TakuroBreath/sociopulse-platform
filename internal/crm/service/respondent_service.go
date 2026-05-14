@@ -297,19 +297,30 @@ func (s *RespondentService) applyRespondentCreate(ctx context.Context, tx postgr
 // with the masked phone populated; the plaintext Phone field is left
 // empty so an operator-facing handler cannot accidentally leak it.
 //
-// Resolution order: BypassRLS GetByID picks the row regardless of the
-// caller's tenant context (admin tooling routinely needs this), then
-// the service masks the encrypted phone via the per-tenant decrypt +
-// MaskPhone pipeline. Soft-deleted rows return ErrRespondentDeleted —
-// not ErrRespondentNotFound — so the UI can render "this respondent
-// is pending purge" instead of a generic 404.
-func (s *RespondentService) Get(ctx context.Context, id uuid.UUID) (*api.Respondent, error) {
+// Plan 13.2.5 Task 1: looks the row up under callerTenantID's RLS
+// scope. A row owned by a different tenant surfaces as
+// ErrRespondentNotFound (RLS hides it) — indistinguishable from
+// genuine non-existence, by design. Soft-deleted rows still return
+// ErrRespondentDeleted so the UI can render "pending purge" instead
+// of a generic 404.
+func (s *RespondentService) Get(ctx context.Context, callerTenantID, id uuid.UUID) (*api.Respondent, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get respondent: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: get respondent: %w", api.ErrInvalidArgument)
 	}
-	row, err := s.lookupRespondent(ctx, id)
+	var row api.Respondent
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		var ierr error
+		row, ierr = s.store.GetByID(ctx, tx, id)
+		return ierr
+	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, api.ErrRespondentNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("crm/service: get respondent: %w", err)
 	}
 	if row.DeleteAt != nil {
 		return nil, api.ErrRespondentDeleted
@@ -332,24 +343,53 @@ func (s *RespondentService) Get(ctx context.Context, id uuid.UUID) (*api.Respond
 	return &row, nil
 }
 
+// ResolveTenant implements api.RespondentService.ResolveTenant. Returns
+// the owning tenant id via a BypassRLS lookup so the transport-layer
+// tenant.RequireSameTenant middleware can compare against the caller's
+// claims.TenantID before the handler runs. Returns ErrRespondentNotFound
+// when no row matches.
+//
+// This is the only sanctioned BypassRLS resolver in RespondentService
+// after Plan 13.2.5 Task 1.
+func (s *RespondentService) ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("crm/service: resolve tenant: id required")
+	}
+	row, err := s.lookupRespondent(ctx, id)
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return row.TenantID, nil
+}
+
 // GetWithPhone implements api.RespondentService.GetWithPhone. The
 // caller must already have passed an admin RBAC gate at the HTTP
 // layer; this method nevertheless writes one audit row per
 // invocation (action `crm.respondent.read_pii`) so the access trail
 // is complete even for service-internal callers.
 //
-// Returns Phone (plaintext, decrypted via the per-tenant KMS) and
-// PhoneMasked. Soft-deleted rows return ErrRespondentDeleted — admin
-// access to pending-purge rows is allowed via the dedicated path; the
-// public service intentionally rejects them so the audit trail has a
-// clean "this row is gone" signal.
-func (s *RespondentService) GetWithPhone(ctx context.Context, id uuid.UUID) (*api.Respondent, error) {
+// Plan 13.2.5 Task 1: looks the row up under callerTenantID's RLS
+// scope (cross-tenant rows are invisible). Returns Phone (plaintext,
+// decrypted via the per-tenant KMS) and PhoneMasked. Soft-deleted
+// rows return ErrRespondentDeleted.
+func (s *RespondentService) GetWithPhone(ctx context.Context, callerTenantID, id uuid.UUID) (*api.Respondent, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: get with phone: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: get with phone: %w", api.ErrInvalidArgument)
 	}
-	row, err := s.lookupRespondent(ctx, id)
+	var row api.Respondent
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		var ierr error
+		row, ierr = s.store.GetByID(ctx, tx, id)
+		return ierr
+	})
 	if err != nil {
-		return nil, err
+		if errors.Is(err, api.ErrRespondentNotFound) {
+			return nil, err
+		}
+		return nil, fmt.Errorf("crm/service: get with phone: %w", err)
 	}
 	if row.DeleteAt != nil {
 		return nil, api.ErrRespondentDeleted
@@ -453,31 +493,39 @@ func (s *RespondentService) Search(ctx context.Context, f api.SearchRespondentsF
 // row "crm.respondent.deleted" inside the same transaction so the
 // trail is durable iff the soft-delete committed.
 //
+// Plan 13.2.5 Task 1: the entire read+write runs inside one
+// WithTenant(callerTenantID, ...) — RLS rejects rows owned by other
+// tenants as ErrRespondentNotFound.
+//
 // Idempotency: a second Delete on the same id returns
-// ErrRespondentDeleted — the first call already stamped deleted_at,
-// the row stays in the soft-delete state until purge.
-func (s *RespondentService) Delete(ctx context.Context, id uuid.UUID) (*api.DeletionRequest, error) {
+// ErrRespondentDeleted — the first call already stamped deleted_at.
+func (s *RespondentService) Delete(ctx context.Context, callerTenantID, id uuid.UUID) (*api.DeletionRequest, error) {
+	if callerTenantID == uuid.Nil {
+		return nil, fmt.Errorf("crm/service: delete respondent: caller tenant id required: %w", api.ErrInvalidArgument)
+	}
 	if id == uuid.Nil {
 		return nil, fmt.Errorf("crm/service: delete respondent: %w", api.ErrInvalidArgument)
-	}
-	row, err := s.lookupRespondent(ctx, id)
-	if err != nil {
-		return nil, err
-	}
-	if row.DeleteAt != nil {
-		return nil, api.ErrRespondentDeleted
 	}
 
 	deleteAt := s.clock().UTC()
 	scheduledPurge := deleteAt.Add(deletionGracePeriod)
 	const reason = "user_request"
 
-	err = s.tx.WithTenant(ctx, row.TenantID, func(tx postgres.Tx) error {
+	var projectID uuid.UUID
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		row, ierr := s.store.GetByID(ctx, tx, id)
+		if ierr != nil {
+			return ierr
+		}
+		if row.DeleteAt != nil {
+			return api.ErrRespondentDeleted
+		}
+		projectID = row.ProjectID
 		if derr := s.store.SoftDelete(ctx, tx, id, reason, deleteAt); derr != nil {
 			return derr
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: row.TenantID,
+			TenantID: callerTenantID,
 			Action:   "crm.respondent.deleted",
 			Target:   "respondent:" + id.String(),
 			Payload: map[string]any{
@@ -490,15 +538,17 @@ func (s *RespondentService) Delete(ctx context.Context, id uuid.UUID) (*api.Dele
 		})
 	})
 	if err != nil {
-		if errors.Is(err, api.ErrRespondentNotFound) {
-			// Lost the race against a concurrent Delete — surface the
-			// same sentinel so callers can distinguish "never existed"
-			// from "already deleted".
-			return nil, api.ErrRespondentDeleted
+		if errors.Is(err, api.ErrRespondentDeleted) || errors.Is(err, api.ErrRespondentNotFound) {
+			// Pre-13.2.5 contract: missing → ErrRespondentNotFound;
+			// already soft-deleted → ErrRespondentDeleted. We forward
+			// both verbatim so existing callers' errors.Is checks keep
+			// working.
+			return nil, err
 		}
 		return nil, fmt.Errorf("crm/service: delete respondent: %w", err)
 	}
 
+	_ = projectID // reserved for future event emission (Plan 11 wire-up)
 	return &api.DeletionRequest{
 		RespondentID: id,
 		DeleteAt:     scheduledPurge,

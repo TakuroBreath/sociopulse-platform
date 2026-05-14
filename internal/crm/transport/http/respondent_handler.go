@@ -62,13 +62,21 @@ func (h *handlers) createRespondent(c *gin.Context) {
 // getRespondent handles GET /api/respondents/:id (operator+).
 // Returns the masked-phone projection — the plaintext phone is never
 // exposed by this path; admins use /respondents/:id/with-phone.
+//
+// Plan 13.2.5 Task 1: tenant.RequireSameTenant on the route chain
+// has already verified the caller's tenant owns :id.
 func (h *handlers) getRespondent(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	r, perr := h.deps.Respondent.Get(c.Request.Context(), id)
+	r, perr := h.deps.Respondent.Get(c.Request.Context(), claims.TenantID, id)
 	if perr != nil {
 		renderError(c, h.deps.Logger, perr)
 		return
@@ -102,7 +110,7 @@ func (h *handlers) getRespondentWithPhone(c *gin.Context) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	r, err := h.deps.Respondent.GetWithPhone(ctx, id)
+	r, err := h.deps.Respondent.GetWithPhone(ctx, claims.TenantID, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -167,7 +175,7 @@ func (h *handlers) deleteRespondent(c *gin.Context) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	dr, err := h.deps.Respondent.Delete(ctx, id)
+	dr, err := h.deps.Respondent.Delete(ctx, claims.TenantID, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return

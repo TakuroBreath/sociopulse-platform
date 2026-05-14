@@ -473,7 +473,7 @@ func TestUserService_UpdateRole_RejectsEmpty(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
 
-	_, err := svc.UpdateRole(context.Background(), id, nil)
+	_, err := svc.UpdateRole(context.Background(), tenantID, id, nil)
 	require.ErrorIs(t, err, authapi.ErrEmptyRoles)
 }
 
@@ -485,7 +485,7 @@ func TestUserService_UpdateRole_HappyPath(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
 
-	updated, err := svc.UpdateRole(context.Background(), id,
+	updated, err := svc.UpdateRole(context.Background(), tenantID, id,
 		[]authapi.Role{authapi.RoleSupervisor, authapi.RoleAdmin},
 	)
 	require.NoError(t, err)
@@ -507,8 +507,8 @@ func TestUserService_Archive_Idempotent(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "ar", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "ar")]
 
-	require.NoError(t, svc.Archive(context.Background(), id))
-	require.NoError(t, svc.Archive(context.Background(), id)) // idempotent
+	require.NoError(t, svc.Archive(context.Background(), tenantID, id))
+	require.NoError(t, svc.Archive(context.Background(), tenantID, id)) // idempotent
 
 	events := audit.snapshot()
 	require.Len(t, events, 2, "every archive call still emits an audit row")
@@ -538,7 +538,7 @@ func TestUserService_Archive_PublishesOutboxEvent(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "to-archive", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	userID := store.loginIndex[loginKey(tenantID, "to-archive")]
 
-	require.NoError(t, svc.Archive(ctx, userID))
+	require.NoError(t, svc.Archive(ctx, tenantID, userID))
 
 	// Audit row is still emitted (Plan 11.4 doesn't remove existing behaviour).
 	events := audit.snapshot()
@@ -587,7 +587,7 @@ func TestUserService_Archive_OutboxAppendErrorRollsBackTx(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "to-archive", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	userID := store.loginIndex[loginKey(tenantID, "to-archive")]
 
-	err := svc.Archive(ctx, userID)
+	err := svc.Archive(ctx, tenantID, userID)
 	require.Error(t, err)
 	require.ErrorIs(t, err, wantErr,
 		"outbox failure must propagate so the WithTenant Tx rolls back")
@@ -603,7 +603,7 @@ func TestUserService_Restore_RejectsNonArchived(t *testing.T) {
 	store.seed(authapi.User{TenantID: tenantID, Login: "u", Roles: []authapi.Role{authapi.RoleOperator}}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
 
-	err := svc.Restore(context.Background(), id)
+	err := svc.Restore(context.Background(), tenantID, id)
 	require.ErrorIs(t, err, authapi.ErrUserNotArchived)
 }
 
@@ -621,7 +621,7 @@ func TestUserService_Restore_ClearsArchivedAt(t *testing.T) {
 	}, "h")
 	id := store.loginIndex[loginKey(tenantID, "u")]
 
-	require.NoError(t, svc.Restore(context.Background(), id))
+	require.NoError(t, svc.Restore(context.Background(), tenantID, id))
 
 	got := store.users[id]
 	require.Nil(t, got.ArchivedAt)
@@ -640,7 +640,7 @@ func TestUserService_ResetPassword_FlipsMustChange(t *testing.T) {
 	id := store.loginIndex[loginKey(tenantID, "u")]
 	store.mustChangePwd[id] = false
 
-	tempPwd, err := svc.ResetPassword(context.Background(), id)
+	tempPwd, err := svc.ResetPassword(context.Background(), tenantID, id)
 	require.NoError(t, err)
 	require.Len(t, tempPwd, 16)
 	require.Equal(t, "fake-hash:"+tempPwd, store.passwordHash[id])
@@ -776,7 +776,7 @@ func TestUserService_Archive_PropagatesUserNotFound(t *testing.T) {
 
 	svc, _, _, _ := newSvc(t)
 
-	err := svc.Archive(context.Background(), uuid.New())
+	err := svc.Archive(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
 }
 
@@ -804,17 +804,25 @@ func TestUserService_ValidationGuards(t *testing.T) {
 	require.NoError(t, err)
 
 	// Get/UpdateRole/Archive/Restore/ResetPassword/ChangePassword all
-	// reject uuid.Nil ids.
+	// reject uuid.Nil ids. The admin :id methods additionally reject
+	// uuid.Nil callerTenantID (Plan 13.2.5 Task 1 defence in depth).
 	_, err = svc.Get(ctx, uuid.Nil)
 	require.Error(t, err)
 
-	_, err = svc.UpdateRole(ctx, uuid.Nil, []authapi.Role{authapi.RoleOperator})
+	tenantID := uuid.New()
+	_, err = svc.UpdateRole(ctx, tenantID, uuid.Nil, []authapi.Role{authapi.RoleOperator})
 	require.Error(t, err)
+	_, err = svc.UpdateRole(ctx, uuid.Nil, uuid.New(), []authapi.Role{authapi.RoleOperator})
+	require.Error(t, err, "uuid.Nil caller tenant id must error")
 
-	require.Error(t, svc.Archive(ctx, uuid.Nil))
-	require.Error(t, svc.Restore(ctx, uuid.Nil))
+	require.Error(t, svc.Archive(ctx, tenantID, uuid.Nil))
+	require.Error(t, svc.Archive(ctx, uuid.Nil, uuid.New()))
+	require.Error(t, svc.Restore(ctx, tenantID, uuid.Nil))
+	require.Error(t, svc.Restore(ctx, uuid.Nil, uuid.New()))
 
-	_, err = svc.ResetPassword(ctx, uuid.Nil)
+	_, err = svc.ResetPassword(ctx, tenantID, uuid.Nil)
+	require.Error(t, err)
+	_, err = svc.ResetPassword(ctx, uuid.Nil, uuid.New())
 	require.Error(t, err)
 
 	require.Error(t, svc.ChangePassword(ctx, uuid.Nil, "old", "new"))
@@ -829,14 +837,17 @@ func TestUserService_PropagatesNotFoundForMissingTargets(t *testing.T) {
 	svc, _, _, _ := newSvc(t)
 	ctx := context.Background()
 
-	// Each method that resolves the tenant before mutating bubbles
-	// ErrUserNotFound when the user is absent.
-	_, err := svc.UpdateRole(ctx, uuid.New(), []authapi.Role{authapi.RoleOperator})
+	// Each method that operates per-tenant bubbles ErrUserNotFound when
+	// the user is absent (or when RLS hides a row owned by a different
+	// tenant — the in-memory fake mirrors that by returning ErrUserNotFound
+	// for ids it does not have).
+	tenantID := uuid.New()
+	_, err := svc.UpdateRole(ctx, tenantID, uuid.New(), []authapi.Role{authapi.RoleOperator})
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
 
-	require.ErrorIs(t, svc.Restore(ctx, uuid.New()), authapi.ErrUserNotFound)
+	require.ErrorIs(t, svc.Restore(ctx, tenantID, uuid.New()), authapi.ErrUserNotFound)
 
-	_, err = svc.ResetPassword(ctx, uuid.New())
+	_, err = svc.ResetPassword(ctx, tenantID, uuid.New())
 	require.ErrorIs(t, err, authapi.ErrUserNotFound)
 
 	// ChangePassword is intentionally NOT in this list — its missing-user
@@ -880,7 +891,7 @@ func TestUserService_PropagatesGenericStoreErrorsAsWrapped(t *testing.T) {
 			name: "UpdateRole",
 			run: func(c ctx) error {
 				c.store.updateRolesErr = wantErr
-				_, err := c.svc.UpdateRole(context.Background(), c.id, []authapi.Role{authapi.RoleSupervisor})
+				_, err := c.svc.UpdateRole(context.Background(), tenantID, c.id, []authapi.Role{authapi.RoleSupervisor})
 				return err
 			},
 		},
@@ -888,14 +899,14 @@ func TestUserService_PropagatesGenericStoreErrorsAsWrapped(t *testing.T) {
 			name: "Archive",
 			run: func(c ctx) error {
 				c.store.archiveErr = wantErr
-				return c.svc.Archive(context.Background(), c.id)
+				return c.svc.Archive(context.Background(), tenantID, c.id)
 			},
 		},
 		{
 			name: "ResetPassword",
 			run: func(c ctx) error {
 				c.store.updatePasswordErr = wantErr
-				_, err := c.svc.ResetPassword(context.Background(), c.id)
+				_, err := c.svc.ResetPassword(context.Background(), tenantID, c.id)
 				return err
 			},
 		},

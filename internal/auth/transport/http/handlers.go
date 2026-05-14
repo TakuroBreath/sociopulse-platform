@@ -281,13 +281,23 @@ func (h *handlers) listUsers(c *gin.Context) {
 }
 
 // getUser handles GET /api/auth/users/:id (admin only).
+//
+// Plan 13.2.5 Task 1: tenant.RequireSameTenant on the route chain
+// has verified the caller's tenant owns :id. We still call the
+// per-tenant variant (GetByTenant) so the read runs under RLS — an
+// explicit defence in depth if the middleware were ever removed.
 func (h *handlers) getUser(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	user, err := h.deps.Users.Get(c.Request.Context(), id)
+	user, err := h.deps.Users.GetByTenant(c.Request.Context(), claims.TenantID, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -297,6 +307,11 @@ func (h *handlers) getUser(c *gin.Context) {
 
 // updateRoles handles PATCH /api/auth/users/:id/roles (admin only).
 func (h *handlers) updateRoles(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
@@ -307,7 +322,7 @@ func (h *handlers) updateRoles(c *gin.Context) {
 		renderBindError(c, err)
 		return
 	}
-	user, err := h.deps.Users.UpdateRole(c.Request.Context(), id, rolesFromStrings(req.Roles))
+	user, err := h.deps.Users.UpdateRole(c.Request.Context(), claims.TenantID, id, rolesFromStrings(req.Roles))
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -317,12 +332,17 @@ func (h *handlers) updateRoles(c *gin.Context) {
 
 // archiveUser handles POST /api/auth/users/:id/archive (admin only).
 func (h *handlers) archiveUser(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	if err := h.deps.Users.Archive(c.Request.Context(), id); err != nil {
+	if err := h.deps.Users.Archive(c.Request.Context(), claims.TenantID, id); err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
 	}
@@ -331,12 +351,17 @@ func (h *handlers) archiveUser(c *gin.Context) {
 
 // restoreUser handles POST /api/auth/users/:id/restore (admin only).
 func (h *handlers) restoreUser(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	if err := h.deps.Users.Restore(c.Request.Context(), id); err != nil {
+	if err := h.deps.Users.Restore(c.Request.Context(), claims.TenantID, id); err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
 	}
@@ -346,12 +371,17 @@ func (h *handlers) restoreUser(c *gin.Context) {
 // resetPassword handles POST /api/auth/users/:id/reset_password
 // (admin only). Returns the freshly-minted temp password.
 func (h *handlers) resetPassword(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	tempPwd, err := h.deps.Users.ResetPassword(c.Request.Context(), id)
+	tempPwd, err := h.deps.Users.ResetPassword(c.Request.Context(), claims.TenantID, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return

@@ -92,13 +92,23 @@ func (h *handlers) listProjects(c *gin.Context) {
 }
 
 // getProject handles GET /api/projects/:id (operator+).
+//
+// Plan 13.2.5 Task 1: tenant.RequireSameTenant on the route chain
+// has already verified the caller's tenant owns :id (404 on
+// mismatch). We still pass claims.TenantID through so the service
+// runs under RLS as defence in depth.
 func (h *handlers) getProject(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	p, err := h.deps.Projects.Get(c.Request.Context(), id)
+	p, err := h.deps.Projects.Get(c.Request.Context(), claims.TenantID, id)
 	if err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
@@ -124,7 +134,7 @@ func (h *handlers) updateProject(c *gin.Context) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	p, err := h.deps.Projects.Update(ctx, id, crmapi.UpdateProjectInput{
+	p, err := h.deps.Projects.Update(ctx, claims.TenantID, id, crmapi.UpdateProjectInput{
 		Name:        req.Name,
 		Customer:    req.Customer,
 		TargetCount: req.TargetCount,
@@ -155,9 +165,9 @@ func (h *handlers) archiveProject(c *gin.Context) {
 }
 
 // projectStateFn is the shared signature of ProjectService.Pause,
-// Resume, and Archive — every state transition takes (ctx, id) and
-// returns error.
-type projectStateFn func(ctx context.Context, id uuid.UUID) error
+// Resume, and Archive — every state transition takes
+// (ctx, callerTenantID, id) and returns error.
+type projectStateFn func(ctx context.Context, callerTenantID, id uuid.UUID) error
 
 // transitionProject is the shared body for Pause/Resume/Archive.
 // Surfaces 204 on success / mapped error otherwise. The call site
@@ -175,7 +185,7 @@ func (h *handlers) transitionProject(c *gin.Context, fn projectStateFn) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	if err := fn(ctx, id); err != nil {
+	if err := fn(ctx, claims.TenantID, id); err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
 	}
@@ -184,12 +194,17 @@ func (h *handlers) transitionProject(c *gin.Context, fn projectStateFn) {
 
 // getProjectProgress handles GET /api/projects/:id/progress (operator+).
 func (h *handlers) getProjectProgress(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	p, perr := h.deps.Projects.GetProgress(c.Request.Context(), id)
+	p, perr := h.deps.Projects.GetProgress(c.Request.Context(), claims.TenantID, id)
 	if perr != nil {
 		renderError(c, h.deps.Logger, perr)
 		return
@@ -215,7 +230,7 @@ func (h *handlers) assignOperators(c *gin.Context) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	if err := h.deps.Projects.Assign(ctx, id, req.OperatorIDs); err != nil {
+	if err := h.deps.Projects.Assign(ctx, claims.TenantID, id, req.OperatorIDs); err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
 	}
@@ -240,7 +255,7 @@ func (h *handlers) unassignOperator(c *gin.Context) {
 		return
 	}
 	ctx := crmservice.WithActorID(c.Request.Context(), claims.UserID)
-	if err := h.deps.Projects.Unassign(ctx, id, opID); err != nil {
+	if err := h.deps.Projects.Unassign(ctx, claims.TenantID, id, opID); err != nil {
 		renderError(c, h.deps.Logger, err)
 		return
 	}
@@ -249,12 +264,17 @@ func (h *handlers) unassignOperator(c *gin.Context) {
 
 // listProjectMembers handles GET /api/projects/:id/members (supervisor+).
 func (h *handlers) listProjectMembers(c *gin.Context) {
+	claims, ok := authmw.ClaimsFromContext(c)
+	if !ok {
+		renderError(c, h.deps.Logger, authapi.ErrTokenInvalid)
+		return
+	}
 	id, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		renderBindError(c, err)
 		return
 	}
-	members, perr := h.deps.Projects.ListMembers(c.Request.Context(), id)
+	members, perr := h.deps.Projects.ListMembers(c.Request.Context(), claims.TenantID, id)
 	if perr != nil {
 		renderError(c, h.deps.Logger, perr)
 		return

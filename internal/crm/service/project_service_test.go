@@ -563,7 +563,7 @@ func TestProjectService_Get_HappyPath(t *testing.T) {
 		TargetCount: 500,
 	})
 
-	got, err := svc.Get(context.Background(), seeded.ID)
+	got, err := svc.Get(context.Background(), tenantID, seeded.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, seeded.ID, got.ID)
@@ -575,7 +575,7 @@ func TestProjectService_Get_NotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.Get(context.Background(), uuid.New())
+	_, err := svc.Get(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
 }
 
@@ -583,7 +583,7 @@ func TestProjectService_Get_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.Get(context.Background(), uuid.Nil)
+	_, err := svc.Get(context.Background(), uuid.New(), uuid.Nil)
 	require.Error(t, err)
 }
 
@@ -593,7 +593,7 @@ func TestProjectService_Get_PropagatesGenericStoreError(t *testing.T) {
 	svc, store, _ := newSvc(t)
 	store.getByIDErr = errors.New("connection refused")
 
-	_, err := svc.Get(context.Background(), uuid.New())
+	_, err := svc.Get(context.Background(), uuid.New(), uuid.New())
 	require.ErrorContains(t, err, "connection refused")
 }
 
@@ -769,21 +769,27 @@ func TestProjectService_TxRunnerSelection(t *testing.T) {
 	require.Equal(t, tenantID, tx.withTenantTenants[0])
 	require.Equal(t, 0, tx.bypassCount)
 
-	// Get uses BypassRLS — admin path.
-	store.seed(crmapi.Project{TenantID: uuid.New(), Code: "G-X", Name: "Get Tx", Status: crmapi.StatusActive})
-	id := uuid.Nil
-	for k := range store.projects {
-		id = k
-		break
-	}
-	_, err = svc.Get(context.Background(), id)
+	// Get now uses WithTenant under callerTenantID's scope (Plan 13.2.5
+	// Task 1 — the cross-tenant guard middleware does the BypassRLS
+	// resolve at the front door via ResolveTenant; the service method
+	// itself runs RLS-scoped).
+	seededProj := store.seed(crmapi.Project{TenantID: tenantID, Code: "G-X", Name: "Get Tx", Status: crmapi.StatusActive})
+	_, err = svc.Get(context.Background(), tenantID, seededProj.ID)
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, tx.bypassCount, 1)
+	require.GreaterOrEqual(t, len(tx.withTenantTenants), 2,
+		"Get now uses WithTenant; expect at least Create+Get tenant scopes")
+
+	// ResolveTenant is the only sanctioned BypassRLS path; calling it
+	// from the test exercises that branch.
+	_, err = svc.ResolveTenant(context.Background(), seededProj.ID)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, tx.bypassCount, 1,
+		"ResolveTenant must use BypassRLS for the cross-tenant lookup")
 
 	// List uses WithTenant.
 	_, err = svc.List(context.Background(), crmapi.ListProjectsFilter{TenantID: tenantID})
 	require.NoError(t, err)
-	require.GreaterOrEqual(t, len(tx.withTenantTenants), 2)
+	require.GreaterOrEqual(t, len(tx.withTenantTenants), 3)
 }
 
 // strPtr / intPtr return short-lived pointers for the patch-fields in
@@ -806,7 +812,7 @@ func TestProjectService_Update_HappyPathOnlyName(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	got, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{
+	got, err := svc.Update(context.Background(), tenantID, seeded.ID, crmapi.UpdateProjectInput{
 		Name: strPtr("Renamed"),
 	})
 	require.NoError(t, err)
@@ -837,7 +843,7 @@ func TestProjectService_Update_NoFieldsIsNoOp(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	got, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{})
+	got, err := svc.Update(context.Background(), tenantID, seeded.ID, crmapi.UpdateProjectInput{})
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, "Untouched", got.Name)
@@ -860,7 +866,7 @@ func TestProjectService_Update_RejectsArchived(t *testing.T) {
 		ArchivedAt: &now,
 	})
 
-	_, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{
+	_, err := svc.Update(context.Background(), tenantID, seeded.ID, crmapi.UpdateProjectInput{
 		Name: strPtr("Cannot"),
 	})
 	require.ErrorIs(t, err, crmapi.ErrProjectArchived)
@@ -871,7 +877,7 @@ func TestProjectService_Update_NotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, audit := newSvc(t)
-	_, err := svc.Update(context.Background(), uuid.New(), crmapi.UpdateProjectInput{
+	_, err := svc.Update(context.Background(), uuid.New(), uuid.New(), crmapi.UpdateProjectInput{
 		Name: strPtr("Ghost"),
 	})
 	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
@@ -882,7 +888,7 @@ func TestProjectService_Update_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.Update(context.Background(), uuid.Nil, crmapi.UpdateProjectInput{
+	_, err := svc.Update(context.Background(), uuid.New(), uuid.Nil, crmapi.UpdateProjectInput{
 		Name: strPtr("X"),
 	})
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
@@ -901,7 +907,7 @@ func TestProjectService_Update_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.updateErr = errors.New("disk full")
 
-	_, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{
+	_, err := svc.Update(context.Background(), tenantID, seeded.ID, crmapi.UpdateProjectInput{
 		Name: strPtr("X"),
 	})
 	require.ErrorContains(t, err, "disk full")
@@ -920,7 +926,7 @@ func TestProjectService_Update_MultiFieldPatchAuditsAllKeys(t *testing.T) {
 		TargetCount: 100,
 	})
 
-	got, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{
+	got, err := svc.Update(context.Background(), tenantID, seeded.ID, crmapi.UpdateProjectInput{
 		Name:        strPtr("Renamed"),
 		Customer:    strPtr("New Customer"),
 		TargetCount: intPtr(2000),
@@ -951,7 +957,7 @@ func TestProjectService_Pause_ActiveTransitions(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	require.NoError(t, svc.Pause(context.Background(), seeded.ID))
+	require.NoError(t, svc.Pause(context.Background(), tenantID, seeded.ID))
 
 	events := audit.snapshot()
 	require.Len(t, events, 1)
@@ -976,7 +982,7 @@ func TestProjectService_Pause_AlreadyPausedIsNoOp(t *testing.T) {
 		Status:   crmapi.StatusPaused,
 	})
 
-	require.NoError(t, svc.Pause(context.Background(), seeded.ID))
+	require.NoError(t, svc.Pause(context.Background(), seeded.TenantID, seeded.ID))
 	require.Empty(t, audit.snapshot(), "idempotent Pause must not emit audit")
 }
 
@@ -993,7 +999,7 @@ func TestProjectService_Pause_OnArchivedRejects(t *testing.T) {
 		ArchivedAt: &now,
 	})
 
-	err := svc.Pause(context.Background(), seeded.ID)
+	err := svc.Pause(context.Background(), seeded.TenantID, seeded.ID)
 	require.ErrorIs(t, err, crmapi.ErrProjectArchived)
 	require.Empty(t, audit.snapshot())
 }
@@ -1011,7 +1017,7 @@ func TestProjectService_Resume_PausedTransitions(t *testing.T) {
 		Status:   crmapi.StatusPaused,
 	})
 
-	require.NoError(t, svc.Resume(context.Background(), seeded.ID))
+	require.NoError(t, svc.Resume(context.Background(), seeded.TenantID, seeded.ID))
 
 	events := audit.snapshot()
 	require.Len(t, events, 1)
@@ -1034,7 +1040,7 @@ func TestProjectService_Resume_AlreadyActiveIsNoOp(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	require.NoError(t, svc.Resume(context.Background(), seeded.ID))
+	require.NoError(t, svc.Resume(context.Background(), seeded.TenantID, seeded.ID))
 	require.Empty(t, audit.snapshot())
 }
 
@@ -1050,7 +1056,7 @@ func TestProjectService_Resume_OnArchivedRejects(t *testing.T) {
 		Status:     crmapi.StatusArchived,
 		ArchivedAt: &now,
 	})
-	err := svc.Resume(context.Background(), seeded.ID)
+	err := svc.Resume(context.Background(), seeded.TenantID, seeded.ID)
 	require.ErrorIs(t, err, crmapi.ErrProjectArchived)
 }
 
@@ -1067,7 +1073,7 @@ func TestProjectService_Archive_ActiveTransitions(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	require.NoError(t, svc.Archive(context.Background(), seeded.ID))
+	require.NoError(t, svc.Archive(context.Background(), seeded.TenantID, seeded.ID))
 
 	events := audit.snapshot()
 	require.Len(t, events, 1)
@@ -1093,7 +1099,7 @@ func TestProjectService_Archive_PausedTransitions(t *testing.T) {
 		Status:   crmapi.StatusPaused,
 	})
 
-	require.NoError(t, svc.Archive(context.Background(), seeded.ID))
+	require.NoError(t, svc.Archive(context.Background(), seeded.TenantID, seeded.ID))
 
 	events := audit.snapshot()
 	require.Len(t, events, 1)
@@ -1114,7 +1120,7 @@ func TestProjectService_Archive_AlreadyArchivedIsNoOp(t *testing.T) {
 		ArchivedAt: &now,
 	})
 
-	require.NoError(t, svc.Archive(context.Background(), seeded.ID), "idempotent on archived")
+	require.NoError(t, svc.Archive(context.Background(), seeded.TenantID, seeded.ID), "idempotent on archived")
 	require.Empty(t, audit.snapshot(), "no-op Archive must not emit audit")
 }
 
@@ -1138,7 +1144,7 @@ func TestProjectService_GetProgress_HappyPath(t *testing.T) {
 		PendingCount:    745,
 	}
 
-	got, err := svc.GetProgress(context.Background(), seeded.ID)
+	got, err := svc.GetProgress(context.Background(), seeded.TenantID, seeded.ID)
 	require.NoError(t, err)
 	require.NotNil(t, got)
 	require.Equal(t, seeded.ID, got.ProjectID)
@@ -1156,7 +1162,7 @@ func TestProjectService_GetProgress_NotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.GetProgress(context.Background(), uuid.New())
+	_, err := svc.GetProgress(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
 }
 
@@ -1176,7 +1182,7 @@ func TestProjectService_GetProgress_ZeroTargetGivesZeroPercent(t *testing.T) {
 		CompletedCount: 0,
 	}
 
-	got, err := svc.GetProgress(context.Background(), seeded.ID)
+	got, err := svc.GetProgress(context.Background(), seeded.TenantID, seeded.ID)
 	require.NoError(t, err)
 	require.Zero(t, got.PercentDone, "no target -> 0%, not divide-by-zero")
 }
@@ -1195,7 +1201,7 @@ func TestProjectService_Assign_HappyPathThreeOperators(t *testing.T) {
 	})
 	op1, op2, op3 := uuid.New(), uuid.New(), uuid.New()
 
-	require.NoError(t, svc.Assign(context.Background(), seeded.ID,
+	require.NoError(t, svc.Assign(context.Background(), seeded.TenantID, seeded.ID,
 		[]uuid.UUID{op1, op2, op3}))
 
 	// One audit row PER added operator.
@@ -1225,7 +1231,7 @@ func TestProjectService_Assign_MergeSemanticsPartialOverlap(t *testing.T) {
 	}}
 	new1, new2 := uuid.New(), uuid.New()
 
-	require.NoError(t, svc.Assign(context.Background(), seeded.ID,
+	require.NoError(t, svc.Assign(context.Background(), seeded.TenantID, seeded.ID,
 		[]uuid.UUID{existing, new1, new2}))
 
 	events := audit.snapshot()
@@ -1250,7 +1256,7 @@ func TestProjectService_Assign_DeduplicatesInput(t *testing.T) {
 	})
 	op := uuid.New()
 
-	require.NoError(t, svc.Assign(context.Background(), seeded.ID,
+	require.NoError(t, svc.Assign(context.Background(), seeded.TenantID, seeded.ID,
 		[]uuid.UUID{op, op, op}))
 	require.Len(t, audit.snapshot(), 1, "duplicate input dedups to one add + one audit")
 	require.Len(t, store.members[seeded.ID], 1)
@@ -1267,7 +1273,7 @@ func TestProjectService_Assign_EmptyOperatorIDsRejected(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	err := svc.Assign(context.Background(), seeded.ID, []uuid.UUID{})
+	err := svc.Assign(context.Background(), seeded.TenantID, seeded.ID, []uuid.UUID{})
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 	require.Empty(t, audit.snapshot())
 }
@@ -1283,7 +1289,7 @@ func TestProjectService_Assign_AllNilIDsRejected(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	err := svc.Assign(context.Background(), seeded.ID, []uuid.UUID{uuid.Nil, uuid.Nil})
+	err := svc.Assign(context.Background(), seeded.TenantID, seeded.ID, []uuid.UUID{uuid.Nil, uuid.Nil})
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 }
 
@@ -1299,7 +1305,7 @@ func TestProjectService_Assign_OnArchivedRejects(t *testing.T) {
 		Status:     crmapi.StatusArchived,
 		ArchivedAt: &now,
 	})
-	err := svc.Assign(context.Background(), seeded.ID, []uuid.UUID{uuid.New()})
+	err := svc.Assign(context.Background(), seeded.TenantID, seeded.ID, []uuid.UUID{uuid.New()})
 	require.ErrorIs(t, err, crmapi.ErrProjectArchived)
 }
 
@@ -1321,7 +1327,7 @@ func TestProjectService_Unassign_HappyPath(t *testing.T) {
 		AssignedAt: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
 	}}
 
-	require.NoError(t, svc.Unassign(context.Background(), seeded.ID, op))
+	require.NoError(t, svc.Unassign(context.Background(), seeded.TenantID, seeded.ID, op))
 
 	events := audit.snapshot()
 	require.Len(t, events, 1)
@@ -1341,7 +1347,7 @@ func TestProjectService_Unassign_NonMemberIsSilentNoOp(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	require.NoError(t, svc.Unassign(context.Background(), seeded.ID, uuid.New()),
+	require.NoError(t, svc.Unassign(context.Background(), seeded.TenantID, seeded.ID, uuid.New()),
 		"unassign of non-member must not error")
 	require.Empty(t, audit.snapshot(), "no audit for no-op unassign")
 }
@@ -1358,10 +1364,10 @@ func TestProjectService_Unassign_NilIDsRejected(t *testing.T) {
 	})
 
 	require.ErrorIs(t,
-		svc.Unassign(context.Background(), uuid.Nil, uuid.New()),
+		svc.Unassign(context.Background(), seeded.TenantID, uuid.Nil, uuid.New()),
 		crmapi.ErrInvalidArgument)
 	require.ErrorIs(t,
-		svc.Unassign(context.Background(), seeded.ID, uuid.Nil),
+		svc.Unassign(context.Background(), seeded.TenantID, seeded.ID, uuid.Nil),
 		crmapi.ErrInvalidArgument)
 }
 
@@ -1383,7 +1389,7 @@ func TestProjectService_ListMembers_HappyPath(t *testing.T) {
 		{OperatorID: op2, AssignedAt: time.Date(2026, 5, 1, 10, 0, 0, 0, time.UTC), Login: "bob", FullName: "Bob"},
 	}
 
-	got, err := svc.ListMembers(context.Background(), seeded.ID)
+	got, err := svc.ListMembers(context.Background(), seeded.TenantID, seeded.ID)
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	require.Equal(t, op1, got[0].OperatorID)
@@ -1399,7 +1405,7 @@ func TestProjectService_ListMembers_NotFound(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.ListMembers(context.Background(), uuid.New())
+	_, err := svc.ListMembers(context.Background(), uuid.New(), uuid.New())
 	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)
 }
 
@@ -1414,7 +1420,7 @@ func TestProjectService_ListMembers_EmptyProjectReturnsEmpty(t *testing.T) {
 		Status:   crmapi.StatusActive,
 	})
 
-	got, err := svc.ListMembers(context.Background(), seeded.ID)
+	got, err := svc.ListMembers(context.Background(), seeded.TenantID, seeded.ID)
 	require.NoError(t, err)
 	require.Empty(t, got)
 }
@@ -1423,7 +1429,7 @@ func TestProjectService_ListMembers_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.ListMembers(context.Background(), uuid.Nil)
+	_, err := svc.ListMembers(context.Background(), uuid.New(), uuid.Nil)
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 }
 
@@ -1439,7 +1445,7 @@ func TestProjectService_ListMembers_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.listMembersErr = errors.New("query timeout")
 
-	_, err := svc.ListMembers(context.Background(), seeded.ID)
+	_, err := svc.ListMembers(context.Background(), seeded.TenantID, seeded.ID)
 	require.ErrorContains(t, err, "query timeout")
 }
 
@@ -1456,7 +1462,7 @@ func TestProjectService_GetProgress_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.progressErr = errors.New("aggregation failed")
 
-	_, err := svc.GetProgress(context.Background(), seeded.ID)
+	_, err := svc.GetProgress(context.Background(), seeded.TenantID, seeded.ID)
 	require.ErrorContains(t, err, "aggregation failed")
 }
 
@@ -1464,7 +1470,7 @@ func TestProjectService_GetProgress_RejectsNilID(t *testing.T) {
 	t.Parallel()
 
 	svc, _, _ := newSvc(t)
-	_, err := svc.GetProgress(context.Background(), uuid.Nil)
+	_, err := svc.GetProgress(context.Background(), uuid.New(), uuid.Nil)
 	require.ErrorIs(t, err, crmapi.ErrInvalidArgument)
 }
 
@@ -1480,7 +1486,7 @@ func TestProjectService_Pause_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.statusErr = errors.New("constraint violation")
 
-	err := svc.Pause(context.Background(), seeded.ID)
+	err := svc.Pause(context.Background(), seeded.TenantID, seeded.ID)
 	require.ErrorContains(t, err, "constraint violation")
 }
 
@@ -1489,7 +1495,7 @@ func TestProjectService_Pause_RejectsNilID(t *testing.T) {
 
 	svc, _, _ := newSvc(t)
 	require.ErrorIs(t,
-		svc.Pause(context.Background(), uuid.Nil),
+		svc.Pause(context.Background(), uuid.New(), uuid.Nil),
 		crmapi.ErrInvalidArgument)
 }
 
@@ -1505,7 +1511,7 @@ func TestProjectService_Assign_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.assignErr = errors.New("deadlock detected")
 
-	err := svc.Assign(context.Background(), seeded.ID, []uuid.UUID{uuid.New()})
+	err := svc.Assign(context.Background(), seeded.TenantID, seeded.ID, []uuid.UUID{uuid.New()})
 	require.ErrorContains(t, err, "deadlock detected")
 }
 
@@ -1521,7 +1527,7 @@ func TestProjectService_Unassign_PropagatesGenericStoreError(t *testing.T) {
 	})
 	store.unassignErr = errors.New("connection reset")
 
-	err := svc.Unassign(context.Background(), seeded.ID, uuid.New())
+	err := svc.Unassign(context.Background(), seeded.TenantID, seeded.ID, uuid.New())
 	require.ErrorContains(t, err, "connection reset")
 }
 
@@ -1537,7 +1543,7 @@ func TestProjectService_Update_PropagatesPropagatedNotFound(t *testing.T) {
 	})
 	store.updateErr = crmapi.ErrProjectNotFound
 
-	_, err := svc.Update(context.Background(), seeded.ID, crmapi.UpdateProjectInput{
+	_, err := svc.Update(context.Background(), seeded.TenantID, seeded.ID, crmapi.UpdateProjectInput{
 		Name: strPtr("X"),
 	})
 	require.ErrorIs(t, err, crmapi.ErrProjectNotFound)

@@ -255,6 +255,11 @@ func (s *UserService) List(ctx context.Context, in authapi.ListUsersInput) ([]au
 // transaction because the caller has not (necessarily) supplied a
 // tenant context — admin tooling routinely needs to resolve a user id
 // to its tenant before any per-tenant flow.
+//
+// Plan 13.2.5 Task 1: this method survives for the /me self-service
+// endpoint where the caller's own UserID is the argument (already
+// tenant-scoped via JWT). Admin :id lookups MUST go through
+// GetByTenant so the request runs under callerTenantID's RLS scope.
 func (s *UserService) Get(ctx context.Context, id uuid.UUID) (authapi.User, error) {
 	if id == uuid.Nil {
 		return authapi.User{}, fmt.Errorf("auth/service: get user: id required")
@@ -274,10 +279,67 @@ func (s *UserService) Get(ctx context.Context, id uuid.UUID) (authapi.User, erro
 	return u, nil
 }
 
+// GetByTenant implements api.UserService.GetByTenant. Looks the user
+// up under callerTenantID's RLS scope. A row owned by a different
+// tenant surfaces as ErrUserNotFound (RLS hides it) — indistinguishable
+// from genuine non-existence, by design. The transport-layer
+// RequireSameTenant middleware should reject the cross-tenant case
+// upstream, but this method is fail-loud defence in depth.
+func (s *UserService) GetByTenant(ctx context.Context, callerTenantID, id uuid.UUID) (authapi.User, error) {
+	if callerTenantID == uuid.Nil {
+		return authapi.User{}, fmt.Errorf("auth/service: get user: caller tenant id required")
+	}
+	if id == uuid.Nil {
+		return authapi.User{}, fmt.Errorf("auth/service: get user: id required")
+	}
+	var u authapi.User
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
+		var err error
+		u, err = s.store.GetByID(ctx, tx, id)
+		return err
+	})
+	if err != nil {
+		if errors.Is(err, authapi.ErrUserNotFound) {
+			return authapi.User{}, err
+		}
+		return authapi.User{}, fmt.Errorf("auth/service: get user: %w", err)
+	}
+	return u, nil
+}
+
+// ResolveTenant implements api.UserService.ResolveTenant. Returns the
+// owning tenant id for a user via a BypassRLS lookup — the
+// transport-layer tenant.RequireSameTenant middleware uses this to
+// compare against the caller's claims.TenantID before the handler
+// runs. Returns ErrUserNotFound when no row matches id.
+//
+// This is the ONLY caller of the BypassRLS-resolve pattern in
+// UserService after Plan 13.2.5 Task 1: every mutation method now
+// takes callerTenantID as an explicit parameter and skips the
+// resolve step entirely. Keeping ResolveTenant as a method (rather
+// than an inline closure inside module.Register) lets the in-memory
+// test fakes reuse the service's existing store fake without
+// re-implementing the BypassRLS path.
+func (s *UserService) ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+	if id == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("auth/service: resolve tenant: id required")
+	}
+	return s.resolveTenant(ctx, id)
+}
+
 // UpdateRole implements api.UserService.UpdateRole. The role list must
 // be non-empty; the DB enforces a CHECK constraint, but we surface a
 // clearer error here.
-func (s *UserService) UpdateRole(ctx context.Context, id uuid.UUID, roles []authapi.Role) (authapi.User, error) {
+//
+// Plan 13.2.5 Task 1: callerTenantID is now an explicit defence-in-
+// depth parameter. The transport-layer tenant.RequireSameTenant
+// middleware verifies callerTenantID owns id before we get here; we
+// run the WithTenant tx in the caller's scope so RLS would still reject
+// a cross-tenant row even if the middleware were forgotten.
+func (s *UserService) UpdateRole(ctx context.Context, callerTenantID, id uuid.UUID, roles []authapi.Role) (authapi.User, error) {
+	if callerTenantID == uuid.Nil {
+		return authapi.User{}, fmt.Errorf("auth/service: update role: caller tenant id required")
+	}
 	if id == uuid.Nil {
 		return authapi.User{}, fmt.Errorf("auth/service: update role: id required")
 	}
@@ -285,13 +347,8 @@ func (s *UserService) UpdateRole(ctx context.Context, id uuid.UUID, roles []auth
 		return authapi.User{}, authapi.ErrEmptyRoles
 	}
 
-	tenantID, err := s.resolveTenant(ctx, id)
-	if err != nil {
-		return authapi.User{}, err
-	}
-
 	var refreshed authapi.User
-	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
 		var err error
 		refreshed, err = s.store.UpdateRoles(ctx, tx, id, roles)
 		if err != nil {
@@ -322,21 +379,20 @@ func (s *UserService) UpdateRole(ctx context.Context, id uuid.UUID, roles []auth
 // appended INSIDE the same WithTenant Tx as the store mutation + audit
 // write — a publish failure rolls all three back together (canonical
 // transactional-outbox semantics).
-func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
+func (s *UserService) Archive(ctx context.Context, callerTenantID, id uuid.UUID) error {
+	if callerTenantID == uuid.Nil {
+		return fmt.Errorf("auth/service: archive: caller tenant id required")
+	}
 	if id == uuid.Nil {
 		return fmt.Errorf("auth/service: archive: id required")
 	}
-	tenantID, err := s.resolveTenant(ctx, id)
-	if err != nil {
-		return err
-	}
 	now := s.clock().UTC()
-	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
 		if err := s.store.Archive(ctx, tx, id); err != nil {
 			return err
 		}
 		if err := s.writeAudit(ctx, auditapi.Event{
-			TenantID: tenantID,
+			TenantID: callerTenantID,
 			Action:   "user.archived",
 			Target:   "user:" + id.String(),
 		}); err != nil {
@@ -344,7 +400,7 @@ func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
 		}
 		payload, err := json.Marshal(authapi.UserDeletedEvent{
 			UserID:    id,
-			TenantID:  tenantID,
+			TenantID:  callerTenantID,
 			DeletedAt: now.Unix(),
 			Reason:    "archived",
 		})
@@ -352,9 +408,9 @@ func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
 			return fmt.Errorf("marshal user_deleted payload: %w", err)
 		}
 		return s.outbox.Append(ctx, tx, outbox.Event{
-			TenantID:    &tenantID,
+			TenantID:    &callerTenantID,
 			AggregateID: &id,
-			Subject:     authapi.SubjectUserDeletedFor(tenantID),
+			Subject:     authapi.SubjectUserDeletedFor(callerTenantID),
 			Payload:     payload,
 		})
 	})
@@ -370,20 +426,19 @@ func (s *UserService) Archive(ctx context.Context, id uuid.UUID) error {
 // Restore implements api.UserService.Restore. Returns
 // ErrUserNotArchived when the user is currently active so callers
 // distinguish that from a transparent no-op.
-func (s *UserService) Restore(ctx context.Context, id uuid.UUID) error {
+func (s *UserService) Restore(ctx context.Context, callerTenantID, id uuid.UUID) error {
+	if callerTenantID == uuid.Nil {
+		return fmt.Errorf("auth/service: restore: caller tenant id required")
+	}
 	if id == uuid.Nil {
 		return fmt.Errorf("auth/service: restore: id required")
 	}
-	tenantID, err := s.resolveTenant(ctx, id)
-	if err != nil {
-		return err
-	}
-	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+	err := s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
 		if err := s.store.Restore(ctx, tx, id); err != nil {
 			return err
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: tenantID,
+			TenantID: callerTenantID,
 			Action:   "user.restored",
 			Target:   "user:" + id.String(),
 		})
@@ -402,13 +457,12 @@ func (s *UserService) Restore(ctx context.Context, id uuid.UUID) error {
 // flips MustChangePwd to true so the user is forced to rotate on next
 // login. Returns the temp password — single-use, must be displayed to
 // the admin once and never persisted by the caller.
-func (s *UserService) ResetPassword(ctx context.Context, id uuid.UUID) (string, error) {
+func (s *UserService) ResetPassword(ctx context.Context, callerTenantID, id uuid.UUID) (string, error) {
+	if callerTenantID == uuid.Nil {
+		return "", fmt.Errorf("auth/service: reset password: caller tenant id required")
+	}
 	if id == uuid.Nil {
 		return "", fmt.Errorf("auth/service: reset password: id required")
-	}
-	tenantID, err := s.resolveTenant(ctx, id)
-	if err != nil {
-		return "", err
 	}
 
 	tempPwd, err := GenerateTempPassword()
@@ -420,12 +474,12 @@ func (s *UserService) ResetPassword(ctx context.Context, id uuid.UUID) (string, 
 		return "", fmt.Errorf("auth/service: hash reset password: %w", err)
 	}
 
-	err = s.tx.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+	err = s.tx.WithTenant(ctx, callerTenantID, func(tx postgres.Tx) error {
 		if err := s.store.UpdatePassword(ctx, tx, id, hash, true); err != nil {
 			return err
 		}
 		return s.writeAudit(ctx, auditapi.Event{
-			TenantID: tenantID,
+			TenantID: callerTenantID,
 			Action:   "user.password_reset",
 			Target:   "user:" + id.String(),
 		})

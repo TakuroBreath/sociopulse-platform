@@ -7,50 +7,75 @@ import (
 )
 
 // ProjectService is the public CRUD surface for projects.
+//
+// Plan 13.2.5 Task 1 contract change: every :id method takes
+// callerTenantID as an explicit defence-in-depth parameter. The
+// transport-layer tenant.RequireSameTenant middleware verifies the
+// caller's claims.TenantID owns the resource BEFORE the service is
+// called; the service then operates strictly inside callerTenantID's
+// RLS scope. Even if a future endpoint forgets the middleware, the
+// explicit param documents intent and the WithTenant tx rejects the
+// row via RLS.
 type ProjectService interface {
 	// Create allocates a new project row and any initial quotas/members.
 	Create(ctx context.Context, in CreateProjectInput) (*Project, error)
-	// Get returns the project with the given ID, or ErrProjectNotFound.
-	Get(ctx context.Context, id uuid.UUID) (*Project, error)
+	// Get returns the project with the given ID under callerTenantID's RLS scope.
+	// Returns ErrProjectNotFound when the row does not exist in callerTenantID.
+	Get(ctx context.Context, callerTenantID, id uuid.UUID) (*Project, error)
 	// List returns one page of projects matching f, plus the total count.
 	List(ctx context.Context, f ListProjectsFilter) (*ListProjectsResult, error)
 	// Update applies the patch fields in in to the project.
-	Update(ctx context.Context, id uuid.UUID, in UpdateProjectInput) (*Project, error)
+	Update(ctx context.Context, callerTenantID, id uuid.UUID, in UpdateProjectInput) (*Project, error)
 	// Pause transitions the project to StatusPaused.
-	Pause(ctx context.Context, id uuid.UUID) error
+	Pause(ctx context.Context, callerTenantID, id uuid.UUID) error
 	// Resume transitions the project from StatusPaused back to StatusActive.
-	Resume(ctx context.Context, id uuid.UUID) error
+	Resume(ctx context.Context, callerTenantID, id uuid.UUID) error
 	// Archive transitions the project to StatusArchived (terminal).
-	Archive(ctx context.Context, id uuid.UUID) error
+	Archive(ctx context.Context, callerTenantID, id uuid.UUID) error
 	// GetProgress returns live counters for the dashboard widget.
-	GetProgress(ctx context.Context, id uuid.UUID) (*ProjectProgress, error)
+	GetProgress(ctx context.Context, callerTenantID, id uuid.UUID) (*ProjectProgress, error)
 	// Assign attaches operators to a project.
-	Assign(ctx context.Context, id uuid.UUID, operatorIDs []uuid.UUID) error
+	Assign(ctx context.Context, callerTenantID, id uuid.UUID, operatorIDs []uuid.UUID) error
 	// Unassign detaches an operator from a project.
-	Unassign(ctx context.Context, id uuid.UUID, operatorID uuid.UUID) error
+	Unassign(ctx context.Context, callerTenantID, id uuid.UUID, operatorID uuid.UUID) error
 	// ListMembers returns the current operator assignments.
-	ListMembers(ctx context.Context, id uuid.UUID) ([]ProjectMember, error)
+	ListMembers(ctx context.Context, callerTenantID, id uuid.UUID) ([]ProjectMember, error)
+	// ResolveTenant returns the owning tenant id for a project. Used by the
+	// transport-layer tenant.RequireSameTenant middleware. Returns
+	// ErrProjectNotFound when the id does not exist.
+	ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 }
 
 // RespondentService is the public surface for respondent CRUD + async import.
+//
+// Plan 13.2.5 Task 1 contract change: Get/GetWithPhone/Delete take
+// callerTenantID as an explicit defence-in-depth parameter. The
+// transport-layer tenant.RequireSameTenant middleware verifies the
+// caller's tenant owns the respondent before the service is called;
+// the service then operates strictly inside callerTenantID's RLS scope.
 type RespondentService interface {
 	// Create inserts a respondent. Phone is normalised and hashed; if the
 	// phone is on DNC the call returns ErrPhoneInDNC.
 	Create(ctx context.Context, in CreateRespondentInput) (*Respondent, error)
 	// Get returns a respondent with the masked phone (operator-safe).
-	Get(ctx context.Context, id uuid.UUID) (*Respondent, error)
+	Get(ctx context.Context, callerTenantID, id uuid.UUID) (*Respondent, error)
 	// GetWithPhone returns a respondent with the raw phone populated.
 	// Restricted to admin role; the call is mirrored to the audit log.
-	GetWithPhone(ctx context.Context, id uuid.UUID) (*Respondent, error)
+	GetWithPhone(ctx context.Context, callerTenantID, id uuid.UUID) (*Respondent, error)
 	// Search returns one page of respondents matching f, plus the total count.
 	Search(ctx context.Context, f SearchRespondentsFilter) (*SearchRespondentsResult, error)
 	// Delete soft-deletes the respondent and schedules the 30-day purge.
-	Delete(ctx context.Context, id uuid.UUID) (*DeletionRequest, error)
+	Delete(ctx context.Context, callerTenantID, id uuid.UUID) (*DeletionRequest, error)
 	// Import enqueues a CSV/XLSX import. Returns a ticket; progress is
 	// observed via GetImportStatus and the import.* NATS events.
 	Import(ctx context.Context, req ImportRequest) (*ImportTicket, error)
 	// GetImportStatus returns the current state of an in-flight or finished import.
 	GetImportStatus(ctx context.Context, jobID string) (*ImportStatus, error)
+	// ResolveTenant returns the owning tenant id for a respondent. Used
+	// by the transport-layer tenant.RequireSameTenant middleware to
+	// compare against the caller's claims.TenantID. Returns
+	// ErrRespondentNotFound when the id does not exist.
+	ResolveTenant(ctx context.Context, id uuid.UUID) (uuid.UUID, error)
 }
 
 // QuotaTracker exposes the live quota counter store. It is hot-path: every

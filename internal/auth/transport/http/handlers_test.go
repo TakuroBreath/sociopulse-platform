@@ -67,10 +67,21 @@ func (f *fakeAuthenticator) ValidateAccessToken(_ context.Context, _ string) (au
 }
 
 // fakeUserService records calls and returns canned values.
+//
+// Plan 13.2.5 Task 1: admin :id methods accept callerTenantID — the
+// fake records it so cross-tenant assertions in the integration tests
+// can verify the handler passed claims.TenantID through correctly.
+// ResolveTenant is also exposed (records the id, returns a configurable
+// tenant/err) so the transport-layer middleware can be exercised under
+// the same fixture.
 type fakeUserService struct {
 	getCalls          []uuid.UUID
 	getRet            authapi.User
 	getErr            error
+	getByTenantCaller uuid.UUID
+	getByTenantID     uuid.UUID
+	getByTenantRet    authapi.User
+	getByTenantErr    error
 	createIn          authapi.CreateUserInput
 	createRetUser     authapi.User
 	createRetTempPwd  string
@@ -79,14 +90,18 @@ type fakeUserService struct {
 	listRet           []authapi.User
 	listTotal         int64
 	listErr           error
+	updateRoleCaller  uuid.UUID
 	updateRoleID      uuid.UUID
 	updateRoleRoles   []authapi.Role
 	updateRoleRetUser authapi.User
 	updateRoleErr     error
+	archiveCaller     uuid.UUID
 	archiveID         uuid.UUID
 	archiveErr        error
+	restoreCaller     uuid.UUID
 	restoreID         uuid.UUID
 	restoreErr        error
+	resetCaller       uuid.UUID
 	resetID           uuid.UUID
 	resetTempPwd      string
 	resetErr          error
@@ -94,6 +109,14 @@ type fakeUserService struct {
 	changePwdOld      string
 	changePwdNew      string
 	changePwdErr      error
+	resolveCalls      []uuid.UUID
+	resolveRet        uuid.UUID
+	resolveErr        error
+	// matchTenant is the default tenant the resolver reports when
+	// resolveRet is unset. Tests that pin a single tenant point this
+	// at the validator's claims.TenantID so the middleware accepts
+	// every request without per-test wiring.
+	matchTenant *uuid.UUID
 }
 
 func (f *fakeUserService) Create(_ context.Context, in authapi.CreateUserInput) (authapi.User, string, error) {
@@ -111,23 +134,41 @@ func (f *fakeUserService) Get(_ context.Context, id uuid.UUID) (authapi.User, er
 	return f.getRet, f.getErr
 }
 
-func (f *fakeUserService) UpdateRole(_ context.Context, id uuid.UUID, roles []authapi.Role) (authapi.User, error) {
+func (f *fakeUserService) GetByTenant(_ context.Context, callerTenantID, id uuid.UUID) (authapi.User, error) {
+	f.getByTenantCaller = callerTenantID
+	f.getByTenantID = id
+	if f.getByTenantErr != nil {
+		return authapi.User{}, f.getByTenantErr
+	}
+	if f.getByTenantRet.ID != uuid.Nil {
+		return f.getByTenantRet, nil
+	}
+	// Default to the same canned row Get returns so existing tests stay
+	// portable until they migrate to the new signature.
+	return f.getRet, f.getErr
+}
+
+func (f *fakeUserService) UpdateRole(_ context.Context, callerTenantID, id uuid.UUID, roles []authapi.Role) (authapi.User, error) {
+	f.updateRoleCaller = callerTenantID
 	f.updateRoleID = id
 	f.updateRoleRoles = roles
 	return f.updateRoleRetUser, f.updateRoleErr
 }
 
-func (f *fakeUserService) Archive(_ context.Context, id uuid.UUID) error {
+func (f *fakeUserService) Archive(_ context.Context, callerTenantID, id uuid.UUID) error {
+	f.archiveCaller = callerTenantID
 	f.archiveID = id
 	return f.archiveErr
 }
 
-func (f *fakeUserService) Restore(_ context.Context, id uuid.UUID) error {
+func (f *fakeUserService) Restore(_ context.Context, callerTenantID, id uuid.UUID) error {
+	f.restoreCaller = callerTenantID
 	f.restoreID = id
 	return f.restoreErr
 }
 
-func (f *fakeUserService) ResetPassword(_ context.Context, id uuid.UUID) (string, error) {
+func (f *fakeUserService) ResetPassword(_ context.Context, callerTenantID, id uuid.UUID) (string, error) {
+	f.resetCaller = callerTenantID
 	f.resetID = id
 	return f.resetTempPwd, f.resetErr
 }
@@ -137,6 +178,24 @@ func (f *fakeUserService) ChangePassword(_ context.Context, id uuid.UUID, oldPwd
 	f.changePwdOld = oldPwd
 	f.changePwdNew = newPwd
 	return f.changePwdErr
+}
+
+func (f *fakeUserService) ResolveTenant(_ context.Context, id uuid.UUID) (uuid.UUID, error) {
+	f.resolveCalls = append(f.resolveCalls, id)
+	if f.resolveErr != nil {
+		return uuid.Nil, f.resolveErr
+	}
+	if f.resolveRet != uuid.Nil {
+		return f.resolveRet, nil
+	}
+	// Default: report the resource is owned by whatever tenant the
+	// fake's reference points at. Set via fixture.matchTenant so
+	// existing per-tenant tests pass the cross-tenant middleware
+	// without each test repeating the wiring.
+	if f.matchTenant != nil {
+		return *f.matchTenant, nil
+	}
+	return uuid.Nil, nil
 }
 
 // fakeTOTPService records calls.
@@ -232,6 +291,12 @@ func newFixture(t *testing.T) *fixture {
 		rbac:      &fakeRBAC{},
 		validator: &fakeValidator{},
 	}
+	// Default the resolver to whatever tenant the validator's claims
+	// currently report — every test that pins claims.TenantID for an
+	// authenticated request automatically passes the
+	// tenant.RequireSameTenant middleware on admin :id routes.
+	// Cross-tenant tests still override resolveRet / resolveErr.
+	f.users.matchTenant = &f.validator.claims.TenantID
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
 		Logger:    nil,
@@ -1178,4 +1243,120 @@ func TestMapAuthError_AdditionalSentinels(t *testing.T) {
 			assert.Equal(t, tc.body, body.Error)
 		})
 	}
+}
+
+// =============================================================================
+// Plan 13.2.5 Task 1 — cross-tenant guard on admin :id routes
+// =============================================================================
+
+// TestUserHandler_AdminArchive_CrossTenantReturns404 verifies the
+// flagship security fix from Plan 13.2.5: Tenant A admin attempting
+// to archive a user belonging to Tenant B receives 404 (existence-
+// probe defence) and the service is NEVER called. This is the
+// canonical regression test for CVE-class issue C1 (cross-tenant
+// breach in admin endpoints).
+func TestUserHandler_AdminArchive_CrossTenantReturns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	callerTenant := uuid.New()
+	otherTenant := uuid.New()
+	f.validator.claims = authapi.Claims{
+		UserID:   uuid.New(),
+		TenantID: callerTenant,
+		Roles:    []authapi.Role{authapi.RoleAdmin},
+	}
+	// Disable the default matchTenant so the resolver returns the
+	// pinned cross-tenant value.
+	f.users.matchTenant = nil
+	f.users.resolveRet = otherTenant
+
+	target := uuid.New()
+	rec := f.doAuth(t, stdhttp.MethodPost,
+		fmt.Sprintf("/api/auth/users/%s/archive", target), nil)
+
+	assert.Equal(t, stdhttp.StatusNotFound, rec.Code,
+		"cross-tenant admin :id must yield 404 — not 403, not 200")
+	assert.Empty(t, rec.Body.String(),
+		"404 mismatch response carries no body so attackers can't enumerate")
+	assert.Equal(t, uuid.Nil, f.users.archiveID,
+		"Archive must never be called on a cross-tenant attempt")
+	assert.Equal(t, uuid.Nil, f.users.archiveCaller,
+		"Archive must never be called on a cross-tenant attempt")
+	require.Len(t, f.users.resolveCalls, 1,
+		"middleware must consult ResolveTenant exactly once")
+	assert.Equal(t, target, f.users.resolveCalls[0])
+}
+
+// TestUserHandler_AdminGet_CrossTenantReturns404 covers the read
+// endpoint. Same logic — Tenant A → Tenant B's :id → 404 without
+// distinguishing from a non-existent id.
+func TestUserHandler_AdminGet_CrossTenantReturns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	callerTenant := uuid.New()
+	otherTenant := uuid.New()
+	f.validator.claims = authapi.Claims{
+		UserID:   uuid.New(),
+		TenantID: callerTenant,
+		Roles:    []authapi.Role{authapi.RoleAdmin},
+	}
+	f.users.matchTenant = nil
+	f.users.resolveRet = otherTenant
+
+	target := uuid.New()
+	rec := f.doAuth(t, stdhttp.MethodGet,
+		"/api/auth/users/"+target.String(), nil)
+
+	assert.Equal(t, stdhttp.StatusNotFound, rec.Code)
+	assert.Empty(t, rec.Body.String())
+	assert.Empty(t, f.users.getCalls,
+		"Get must not be called on a cross-tenant attempt")
+	assert.Equal(t, uuid.Nil, f.users.getByTenantCaller,
+		"GetByTenant must not be called on a cross-tenant attempt")
+}
+
+// TestUserHandler_AdminMutations_PassClaimsTenantID asserts the
+// handler forwards claims.TenantID (and not, e.g., a tenant resolved
+// from the row) to every mutating service method. This locks in the
+// defence-in-depth contract: even if the middleware were stripped, the
+// service would still run under the caller's tenant scope.
+func TestUserHandler_AdminMutations_PassClaimsTenantID(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	callerTenant := uuid.New()
+	f.validator.claims = authapi.Claims{
+		UserID:   uuid.New(),
+		TenantID: callerTenant,
+		Roles:    []authapi.Role{authapi.RoleAdmin},
+	}
+	target := uuid.New()
+	// Default matchTenant points at validator.claims.TenantID so the
+	// middleware accepts every call below.
+	f.users.updateRoleRetUser = authapi.User{ID: target, TenantID: callerTenant}
+
+	// PATCH /:id/roles
+	rec := f.doAuth(t, stdhttp.MethodPatch,
+		fmt.Sprintf("/api/auth/users/%s/roles", target),
+		transporthttp.UpdateRoleRequest{Roles: []string{"operator"}})
+	require.Equal(t, stdhttp.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	assert.Equal(t, callerTenant, f.users.updateRoleCaller)
+
+	// POST /:id/archive
+	rec = f.doAuth(t, stdhttp.MethodPost,
+		fmt.Sprintf("/api/auth/users/%s/archive", target), nil)
+	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
+	assert.Equal(t, callerTenant, f.users.archiveCaller)
+
+	// POST /:id/restore
+	rec = f.doAuth(t, stdhttp.MethodPost,
+		fmt.Sprintf("/api/auth/users/%s/restore", target), nil)
+	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
+	assert.Equal(t, callerTenant, f.users.restoreCaller)
+
+	// POST /:id/reset_password
+	f.users.resetTempPwd = "fresh-pwd"
+	rec = f.doAuth(t, stdhttp.MethodPost,
+		fmt.Sprintf("/api/auth/users/%s/reset_password", target), nil)
+	require.Equal(t, stdhttp.StatusOK, rec.Code, "body=%s", rec.Body.String())
+	assert.Equal(t, callerTenant, f.users.resetCaller)
 }
