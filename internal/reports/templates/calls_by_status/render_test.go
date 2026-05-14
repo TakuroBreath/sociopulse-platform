@@ -1,0 +1,82 @@
+package calls_by_status_test
+
+import (
+	"bytes"
+	"testing"
+	"time"
+
+	"github.com/stretchr/testify/require"
+	"github.com/xuri/excelize/v2"
+
+	analyticsapi "github.com/sociopulse/platform/internal/analytics/api"
+	reportsapi "github.com/sociopulse/platform/internal/reports/api"
+	"github.com/sociopulse/platform/internal/reports/service"
+	tmpl "github.com/sociopulse/platform/internal/reports/templates/calls_by_status"
+)
+
+func sample() service.CallsByStatusData {
+	return service.CallsByStatusData{
+		Window: analyticsapi.Window{
+			From: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+			To:   time.Date(2026, 5, 14, 0, 0, 0, 0, time.UTC),
+		},
+		Result: analyticsapi.CallsResult{
+			Total: 1000, Successful: 500, Failed: 300, Refusals: 200,
+			ByStatus: []analyticsapi.StatusBucket{
+				{Status: "success", Count: 500},
+				{Status: "no_answer", Count: 200},
+				{Status: "refused", Count: 200},
+				{Status: "busy", Count: 100},
+			},
+		},
+	}
+}
+
+func TestRenderXLSX_RoundTripsViaExcelize(t *testing.T) {
+	t.Parallel()
+	res, err := tmpl.RenderXLSX(sample())
+	require.NoError(t, err)
+	require.NotEmpty(t, res.Bytes)
+	require.Contains(t, res.Filename, "calls_by_status_")
+	require.Equal(t, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet", res.MIME)
+	require.Len(t, res.SHA256, 64)
+
+	f, err := excelize.OpenReader(bytes.NewReader(res.Bytes))
+	require.NoError(t, err)
+	defer func() { _ = f.Close() }()
+	v, err := f.GetCellValue("calls_by_status", "A1")
+	require.NoError(t, err)
+	require.Equal(t, "Total", v)
+	v, err = f.GetCellValue("calls_by_status", "A6")
+	require.NoError(t, err)
+	require.Equal(t, "Status", v)
+	v, err = f.GetCellValue("calls_by_status", "A7")
+	require.NoError(t, err)
+	require.Equal(t, "success", v)
+}
+
+func TestRenderCSV_BOMAndRowCount(t *testing.T) {
+	t.Parallel()
+	res, err := tmpl.RenderCSV(sample())
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(res.Bytes, []byte{0xEF, 0xBB, 0xBF}), "expect UTF-8 BOM")
+	require.Equal(t, "text/csv; charset=utf-8", res.MIME)
+	// 4 scalars + 1 blank + 1 header + 4 buckets = 10 newlines
+	require.Equal(t, 10, bytes.Count(res.Bytes, []byte("\n")))
+}
+
+func TestRenderPDF_ValidPrefix(t *testing.T) {
+	t.Parallel()
+	res, err := tmpl.RenderPDF(sample())
+	require.NoError(t, err)
+	require.True(t, bytes.HasPrefix(res.Bytes, []byte("%PDF-")), "expect PDF magic")
+	require.Equal(t, "application/pdf", res.MIME)
+}
+
+func TestRenderPDF_TooManyRowsReturnsErrTooLarge(t *testing.T) {
+	t.Parallel()
+	d := sample()
+	d.Result.ByStatus = make([]analyticsapi.StatusBucket, 5001)
+	_, err := tmpl.RenderPDF(d)
+	require.ErrorIs(t, err, reportsapi.ErrTooLarge)
+}

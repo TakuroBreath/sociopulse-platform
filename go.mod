@@ -24,6 +24,7 @@ require (
 	github.com/prometheus/client_model v0.6.2
 	github.com/redis/go-redis/v9 v9.19.0
 	github.com/santhosh-tekuri/jsonschema/v5 v5.3.1
+	github.com/signintech/gopdf v0.36.0
 	github.com/spf13/viper v1.21.0
 	github.com/stretchr/testify v1.11.1
 	github.com/testcontainers/testcontainers-go v0.42.0
@@ -121,7 +122,9 @@ require (
 	github.com/opencontainers/image-spec v1.1.1 // indirect
 	github.com/paulmach/orb v0.12.0 // indirect
 	github.com/pelletier/go-toml/v2 v2.2.4 // indirect
+	github.com/phpdave11/gofpdi v1.0.14-0.20211212211723-1f10f9844311 // indirect
 	github.com/pierrec/lz4/v4 v4.1.25 // indirect
+	github.com/pkg/errors v0.9.1 // indirect
 	github.com/pmezard/go-difflib v1.0.0 // indirect
 	github.com/power-devops/perfstat v0.0.0-20240221224432-82ca36839d55 // indirect
 	github.com/prometheus/common v0.66.1 // indirect

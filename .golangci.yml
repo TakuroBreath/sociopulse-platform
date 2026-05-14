@@ -198,6 +198,7 @@ linters-settings:
           - "!**/internal/reports/store/**"
           - "!**/internal/reports/events/**"
           - "!**/internal/reports/transport/**"
+          - "!**/internal/reports/templates/**"
           - "!**/internal/reports/module.go"
           - "!**/internal/billing/service/**"
           - "!**/internal/billing/store/**"
