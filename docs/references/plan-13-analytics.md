@@ -277,18 +277,114 @@ the `mv_operator_kpi_daily` materialised view. Document this in
     supported versions. `:latest` floats and breaks reproducibility.
     Bump in a separate plan if a real CVE/feature need arises.
 
-### Plan 13.2 (deferred)
+### Plan 13.2 (resolved at plan-write 2026-05-14)
 
-- **Q4.** Subject for recording.uploaded — reuse `tenant.<t>.recording.commit`
-  or new event? See gotcha above.
+- **Q4.** Subject for recording.uploaded — reuse `tenant.<t>.recording.uploaded` (per-tenant)
+  or new global subject?
+  - **Decision:** subscribe to existing `tenant.*.recording.uploaded` wildcard.
+    Rationale: recording already publishes this per-tenant subject (verified
+    in `internal/recording/service/service.go` via outbox). Adding a second
+    cross-tenant `analytics.recording.uploaded` subject would require a
+    double-publish in recording's Commit Tx — extra complexity for no win.
+    The analytics ingester extracts `tenant_id` from the subject (token 2)
+    rather than relying on payload field. **Caveat:** the existing
+    `RecordingUploadedEvent` payload is missing 4 fields the CH
+    `events_recording_uploaded` table needs (project_id, fs_node, s3_key,
+    encryption_key_alias, event_id). Plan 13.2 Task 1 extends the payload
+    additively (backwards-compatible).
 - **Q5.** Async insert (`clickhouse.WithAsync(true)`) vs `PrepareBatch`?
-  - clickhouse-go v2 supports both; `PrepareBatch` is the canonical
-    pattern for high-throughput; `WithAsync` is server-side buffering.
-  - Will pick at 13.2 with a benchmark.
+  - **Decision:** `PrepareBatch + Append + Send`. Rationale: explicit
+    batching gives us deterministic flush boundaries (count or time),
+    which is essential for the dedup-LRU eviction policy and for
+    pre-shutdown drain. `WithAsync` server-side buffering would
+    silently lose in-flight rows on broker disconnect.
+  - Library API verified via context7 (`/clickhouse/clickhouse-go`):
+    `conn.PrepareBatch(ctx, "INSERT INTO …")` → `batch.Append(col1, col2…)`
+    per row → `batch.Send()` finalises. `defer batch.Close()` required
+    for resource cleanup. `batch.Flush()` is for long-lived batches —
+    Plan 13.2 uses fresh batches per flush, not reused ones.
 - **Q6.** Redis cache invalidation on tenant project rename / delete?
-  - The cache key `analytics:{tenant_id}:{q_hash}` is tenant-scoped
-    but not project-scoped. Project rename = stale name in cached
-    OperatorComparisonRow.DisplayName. Mitigated by short TTL (30s/5min).
+  - **Decision:** rely on short TTL (30s short window / 5min long window).
+    No active invalidation. Rationale: project rename is rare (admin
+    operation, <1/month/tenant in target traffic); cached
+    `OperatorComparisonRow.DisplayName` is stale for at most 5min, which
+    is acceptable for an admin dashboard. Project DELETE is also rare
+    and the dashboard typically re-fetches on navigation; a stale cache
+    on a deleted project is harmless (zero rows = zero rows). If
+    real-time freshness becomes a requirement, a follow-up plan can wire
+    `tenant.<t>.crm.project.deleted` → `del analytics:{tenant_id}:*`
+    pattern unlink (Redis SCAN + DEL).
+- **Q7.** `analytics.event.calls` and `analytics.event.operator_state`
+  cross-tenant subjects — declared in spec §1228-1229 but NOT currently
+  emitted by any producer. Who emits and at what point?
+  - **Decision:** dialer is the producer (per spec). Two integration
+    points needed in this repo:
+    1. **`analytics.event.operator_state`** — appended by
+       `internal/dialer/fsm/audit.go::appendStateLogAndOutbox` ALONGSIDE
+       the existing `tenant.<t>.dialer.op.<op_id>.state` outbox row.
+       The new row carries the denormalised state-change with
+       `duration_in_state_sec` (= previous state's duration delta).
+       The implementer must thread the previous-state timestamp through
+       the Machine to compute the delta — the FSM already tracks
+       transition timestamps in `operator_state_log` rows; reading the
+       PREVIOUS state's ts is the cleanest path.
+    2. **`analytics.event.calls`** — emitted on `EventStatusSubmitted`
+       FSM transition (operator submits status = call genuinely
+       finalised with a known outcome). Plan 13.2 Task 1 adds this hook
+       AND the canonical `tenant.<t>.dialer.call.finalized` row (both
+       were placeholders in `internal/dialer/api/events.go`).
+- **Q8.** `events_calls.hangup_cause` source — FSM commit doesn't have
+  it (FreeSWITCH event lifecycle).
+  - **Decision:** v1 sets `hangup_cause` to empty-string sentinel.
+    Plan 13.2 ingester writes "" when the field is missing on the
+    inbound event. Operator-side analytics (talk_sec, etc.) work; the
+    SIP-cause breakdown report (FR-I QC section) has reduced fidelity
+    until a future plan wires telephony-bridge → analytics. Document
+    this in the new operational caveats section of `docs/architecture/analytics-mv.md`
+    at close-out.
+- **Q9.** `events_calls.region_code` source — FSM commit knows
+  respondent's region only if the Machine has been wired with the
+  respondent row, which it currently isn't.
+  - **Decision:** v1 sets `region_code` to the call's respondent's
+    region IFF the FSM has it on the Machine context (currently null
+    for most paths). Same fidelity caveat as Q8. The
+    `mv_quotas_progress` rollup is partial until respondent data flows
+    through; the dashboard's `RegionProgress` query returns rows for
+    only the regions that have entries — empty regions are silently
+    skipped (no NULLs surface to API consumers).
+- **Q10.** Where does `cmd/worker` get a NATS subscriber? Currently
+  cmd/worker has no NATS infrastructure (PG-leader-only daemons).
+  - **Decision:** add `openNATS` helper to `cmd/worker/main.go` mirroring
+    `cmd/api/main.go`'s `openNATS` (returns publisher+subscriber, both
+    optional). The IngestPipeline is gated by
+    `cfg.Analytics.Enabled && natsSub != nil && chConn != nil` — when
+    any is missing, log WARN and skip (mirrors the recording-workers
+    skip-on-missing-config pattern). cmd/worker grows a thin NATS
+    surface but is still a leader-elected daemon binary at heart.
+- **Q11.** Where does the analytics module live for HTTP vs ingest?
+  - **Decision:** dual-target.
+    - `cmd/api` registers `analytics.Module` which mounts HTTP routes
+      AND constructs MetricsQuery (cmd/api needs ONLY query path; no
+      ingest).
+    - `cmd/worker` constructs IngestPipeline DIRECTLY (no module
+      registration); the pipeline is one of several errgroup runners,
+      same pattern as `recording.RetentionPass`. The
+      `analytics.BuildIngestPipeline(...)` helper lives in
+      `internal/analytics/wire/ingest.go` and accepts the bus +
+      CH conn + logger.
+- **Q12.** `RegionProgress.Plan` field — CH has done counts only;
+  project quota plan lives in Postgres.
+  - **Decision:** Plan 13.2 returns `done` from CH AND queries
+    `crm.api.ProjectService.GetProgress(projectID)` (returns
+    `*ProjectProgress`) to fetch `quota.Plan` total. Note: store-layer
+    `crm.api.ProjectStorePort.AggregateProgress(tx, projectID)` is a
+    sibling method that runs INSIDE a Tx; the analytics port uses the
+    service method (no Tx needed; service handles its own Tx lifecycle). The dashboard's RegionProgress slice is
+    populated server-side by zipping the two. A `crm.api.ProjectService`
+    reference is resolved from `Deps.Locator` at Register time
+    (same pattern as realtime resolves auth+crm). When the locator
+    has no crm registration (minimal-boot path), `Plan=0` is
+    returned with a debug log — frontend treats `Plan=0` as "unknown".
 
 ### Plan 13.3 (deferred)
 
