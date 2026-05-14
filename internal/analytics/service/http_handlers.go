@@ -384,8 +384,9 @@ func handleQueryError(c *gin.Context, logger *zap.Logger, method string, err err
 	case errors.Is(err, apianalytics.ErrTenantRequired):
 		// Defence-in-depth: the handler already returned 401 when claims
 		// were missing. Reaching here means the QueryService received a
-		// zero TenantID despite our extraction — surface as 401 anyway.
-		respondError(c, http.StatusUnauthorized, "analytics.unauthorized", err.Error())
+		// zero TenantID despite our extraction — surface as 401 anyway
+		// with the same message tenantIDFromContext uses for consistency.
+		respondError(c, http.StatusUnauthorized, "analytics.unauthorized", "authentication required")
 	case errors.Is(err, apianalytics.ErrInvalidWindow):
 		respondError(c, http.StatusBadRequest, "analytics.invalid_window", err.Error())
 	default:

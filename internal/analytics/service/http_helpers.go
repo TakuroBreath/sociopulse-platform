@@ -11,10 +11,15 @@
 // `c.Header.Get("X-Tenant-ID")` from the plan template.
 //
 // Error envelope shape: the project uses { "code": "<stable-string>",
-// "message": "<human-readable>" } per pkg/middleware/auth.errorEnvelope
-// and internal/recording/transport/http.ErrorEnvelope. We use the same
-// shape so dashboards / log aggregators can pivot on `code` regardless
-// of which transport issued the response.
+// "message": "<human-readable>" } per internal/recording/transport/http.ErrorEnvelope
+// (the canonical project transport envelope). We mirror that shape so
+// dashboards / log aggregators can pivot on `code` regardless of which
+// transport issued the response.
+//
+// Note: pkg/middleware/auth uses a DIFFERENT `{ "error": "..." }`
+// envelope for its own 401 / 403 paths — this analytics transport
+// deliberately does NOT mirror that shape; the canonical envelope is
+// the recording/transport/http one.
 
 package service
 
