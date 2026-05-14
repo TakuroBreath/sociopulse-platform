@@ -279,17 +279,21 @@ func (k *xorKMS) Encrypt(_ context.Context, tenantID uuid.UUID, scope, rowID str
 }
 
 func (k *xorKMS) Decrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error) {
+	// Authentication-class failures wrap tenancyapi.ErrInvalidArgument so
+	// callers can errors.Is against the sentinel — mirrors the production
+	// KMSResolverImpl.Decrypt contract (returns "%w: aes-gcm open: %w"
+	// wrapping tenancyapi.ErrInvalidArgument; see Plan 13.2.5 Task 6).
 	if len(ciphertext) == 0 || ciphertext[0] != xorKMSHeader {
-		return nil, errors.New("xorKMS: bad header")
+		return nil, fmt.Errorf("%w: xorKMS: bad header", tenancyapi.ErrInvalidArgument)
 	}
 	wantTag := xorAADTag(tenantID, scope, rowID)
 	if len(ciphertext) < 1+len(wantTag) {
-		return nil, errors.New("xorKMS: ciphertext too short")
+		return nil, fmt.Errorf("%w: xorKMS: ciphertext too short", tenancyapi.ErrInvalidArgument)
 	}
 	gotTag := ciphertext[1 : 1+len(wantTag)]
 	for i, b := range gotTag {
 		if b != wantTag[i] {
-			return nil, errors.New("xorKMS: AAD tag mismatch")
+			return nil, fmt.Errorf("%w: xorKMS: AAD tag mismatch", tenancyapi.ErrInvalidArgument)
 		}
 	}
 	body := ciphertext[1+len(wantTag):]
@@ -599,11 +603,15 @@ func TestTOTPService_SecretCiphertextSwap_AcrossUsers_Rejected(t *testing.T) {
 
 	// Confirm against user A: the decrypt call passes (tenant, scope,
 	// userA.ID) as AAD, but the ciphertext was Encrypt'd with userB.ID
-	// in its AAD. Decrypt MUST fail.
+	// in its AAD. Decrypt MUST fail at the AEAD layer and surface as
+	// tenancyapi.ErrInvalidArgument — the sentinel the production
+	// KMSResolverImpl.Decrypt wraps for auth-tag failures. errors.Is
+	// (not Contains on the error string) so a future refactor of either
+	// fake or production wrapper text cannot silently mask the sentinel.
 	err = fx.svc.Confirm(context.Background(), fx.user.ID, "000000")
 	require.Error(t, err, "swap attack must surface as an error, not a successful confirm")
-	require.Contains(t, err.Error(), "kms decrypt",
-		"the failure must come from the KMS decrypt step (AAD mismatch)")
+	require.ErrorIs(t, err, tenancyapi.ErrInvalidArgument,
+		"AAD mismatch MUST surface as tenancyapi.ErrInvalidArgument; got %v", err)
 }
 
 // Confirm on an already-enrolled row is idempotent (no-op).

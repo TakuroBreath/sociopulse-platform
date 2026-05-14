@@ -25,8 +25,19 @@ import (
 	"github.com/sociopulse/platform/internal/recording/metrics"
 	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/recording/store"
+	"github.com/sociopulse/platform/pkg/encryption"
 	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/postgres"
+)
+
+// AAD scopes for the recording flow. Each ciphertext type is bound to a
+// distinct (tenant, scope, callID) tuple via encryption.BuildAAD so that
+// an attacker who swaps either a DEK ciphertext OR an entire S3 object
+// between two calls of the SAME tenant fails the AES-GCM auth tag check.
+// Plan 13.2.5 Task 6.
+const (
+	aadScopeRecordingDEK   = "recording.dek"
+	aadScopeRecordingAudio = "recording.audio"
 )
 
 // Sentinel re-exports keep callers in this package idiomatic without a hop
@@ -226,11 +237,24 @@ func (s *svc) Get(ctx context.Context, tenantID, callID uuid.UUID) (rapi.Recordi
 // Pipeline:
 //  1. Lookup row by (tenantID, callID).
 //  2. Bail if status == 'deleted'.
-//  3. Unwrap DEK via the KMS port, AAD = tenant_id bytes.
+//  3. Unwrap DEK via the KMS port; AAD = BuildAAD(tenantID,
+//     "recording.dek", callID) so a swap of EncryptedDEK between two
+//     calls of the same tenant fails the auth-tag check (Plan 13.2.5
+//     Task 6).
 //  4. GET ciphertext stream from object store.
-//  5. AES-GCM decrypt with AAD = tenant_id bytes (full-buffer for v1).
+//  5. AES-GCM decrypt with AAD = BuildAAD(tenantID, "recording.audio",
+//     callID) — full-buffer for v1. Distinct scope from the DEK AAD
+//     blocks an attacker who swaps an entire S3 object between two
+//     calls of the same tenant.
 //  6. Write recording.accessed audit row (failure → log + metric, NOT a hard fail).
 //  7. Return AudioStream with bytes.Reader over plaintext.
+//
+// Backward compatibility: the cmd/recording-uploader binary that would
+// produce DEK + audio ciphertexts in production is currently a stub
+// (os.Exit(64)) and lands in Plan 14 Task 1. No production rows exist
+// with the old tenant-only AAD, so the refactor is a clean break with
+// no version-byte fallback path — when the uploader ships, it MUST use
+// the same BuildAAD scheme.
 func (s *svc) OpenAudioStream(ctx context.Context, tenantID, callID uuid.UUID, _ *rapi.ByteRange) (rapi.AudioStream, error) {
 	if s.kms == nil || s.objects == nil {
 		return rapi.AudioStream{}, fmt.Errorf("%w: recording crypto/storage not wired", ErrInvalidInput)
@@ -253,9 +277,15 @@ func (s *svc) OpenAudioStream(ctx context.Context, tenantID, callID uuid.UUID, _
 		return rapi.AudioStream{}, ErrAlreadyDeleted
 	}
 
-	aad := []byte(row.TenantID.String())
+	// Bind callID into BOTH AADs. DEK and audio use DISTINCT scopes so
+	// that a row whose EncryptedDEK and AudioObjectKey both got swapped
+	// (a coordinated attack) cannot succeed by chance: the DEK-scope tag
+	// and audio-scope tag are independent hash inputs.
+	callIDStr := row.CallID.String()
+	dekAAD := encryption.BuildAAD(row.TenantID, aadScopeRecordingDEK, callIDStr)
+	audioAAD := encryption.BuildAAD(row.TenantID, aadScopeRecordingAudio, callIDStr)
 
-	dekPlain, err := s.kms.DecryptDEK(ctx, row.KMSKeyID, row.EncryptedDEK, aad)
+	dekPlain, err := s.kms.DecryptDEK(ctx, row.KMSKeyID, row.EncryptedDEK, dekAAD)
 	if err != nil {
 		s.metrics.ObserveAccess(tenantLabel, "kms_error", time.Since(start).Seconds())
 		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio.kms: %w", err)
@@ -272,7 +302,7 @@ func (s *svc) OpenAudioStream(ctx context.Context, tenantID, callID uuid.UUID, _
 	}
 	defer rc.Close()
 
-	plain, err := s.decryptor.Decrypt(ctx, dekPlain, rc, row.BytesSize, aad)
+	plain, err := s.decryptor.Decrypt(ctx, dekPlain, rc, row.BytesSize, audioAAD)
 	if err != nil {
 		s.metrics.ObserveAccess(tenantLabel, "decrypt_error", time.Since(start).Seconds())
 		return rapi.AudioStream{}, fmt.Errorf("recording.open_audio.decrypt: %w", err)

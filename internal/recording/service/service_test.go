@@ -242,9 +242,10 @@ func TestService_OpenAudioStream_KMSWrongAAD(t *testing.T) {
 	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
 
 	// Encrypt the DEK with WRONG aad to simulate a corrupted record.
-	// At Open time the service's AAD = tenant_id won't match, so the
-	// LocalDEKUnwrapper returns ErrDecryptFailed and the service maps
-	// that into "kms_error" + a wrapped error containing "kms".
+	// At Open time the service's AAD = BuildAAD(tenant, "recording.dek",
+	// callID) won't match, so the LocalDEKUnwrapper returns
+	// ErrDecryptFailed and the service maps that into "kms_error" + a
+	// wrapped error containing "kms".
 	aad := []byte("wrong-aad-not-tenant-id")
 	dek := make([]byte, 32)
 	_, err := rand.Read(dek)
@@ -266,8 +267,8 @@ func TestService_OpenAudioStream_KMSWrongAAD(t *testing.T) {
 
 	_, err = svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
 	require.Error(t, err)
-	require.Contains(t, err.Error(), "kms",
-		"error message should reference the KMS step; got %v", err)
+	require.ErrorIs(t, err, crypto.ErrDecryptFailed,
+		"wrong-AAD MUST surface as crypto.ErrDecryptFailed; got %v", err)
 }
 
 func TestService_OpenAudioStream_ObjectMissing(t *testing.T) {
@@ -277,11 +278,13 @@ func TestService_OpenAudioStream_ObjectMissing(t *testing.T) {
 	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
 
 	// Commit normally but DO NOT seed objects — the Get will miss.
-	aad := []byte(tenantID.String())
+	// AAD must match what the service will use at Decrypt time:
+	// BuildAAD(tenant, "recording.dek", callID).
+	dekAAD := encryption.BuildAAD(tenantID, "recording.dek", callID.String())
 	dek := make([]byte, 32)
 	_, err := rand.Read(dek)
 	require.NoError(t, err)
-	encryptedDEK, err := encryption.Encrypt(kek, dek, aad)
+	encryptedDEK, err := encryption.Encrypt(kek, dek, dekAAD)
 	require.NoError(t, err)
 
 	in := newCommitInput(t, tenantID, callID)
@@ -297,6 +300,78 @@ func TestService_OpenAudioStream_ObjectMissing(t *testing.T) {
 	_, err = svc.OpenAudioStream(t.Context(), tenantID, callID, nil)
 	require.True(t, errors.Is(err, rapi.ErrNotFound),
 		"ErrObjectNotFound MUST be hidden behind ErrNotFound; got %v", err)
+}
+
+// TestRecording_DEKCiphertextSwap_AcrossCalls_SameTenant_Rejected is the
+// service-layer demonstration that Plan 13.2.5 Task 6 closes the intra-
+// tenant DEK swap defect on the recording flow. Two calls share a tenant;
+// each Commit registers a recording whose EncryptedDEK was sealed under
+// AAD = BuildAAD(tenant, "recording.dek", callID). An attacker copies
+// call A's EncryptedDEK bytes into call B's row, then asks the service
+// to OpenAudioStream(B). The service's DEK unwrap step uses callID = B
+// in the AAD, but the ciphertext was sealed with callID = A — the AEAD
+// auth tag check MUST fail rather than silently surfacing call A's DEK
+// (which would in turn try to decrypt B's audio under the wrong key and
+// either return garbage or panic the decryptor).
+//
+// Without the fix this test does NOT fail at the AEAD layer: the broken
+// code passed AAD = []byte(tenantID.String()) for both Encrypt and
+// Decrypt, so cross-call DEK swap within the same tenant succeeded all
+// the way through KMS unwrap and was only caught (if at all) by the
+// audio AES-GCM step — and only because the audio AAD bound to the
+// per-call DEK plaintext, not the call identity. The fix binds callID
+// into the DEK envelope itself.
+func TestRecording_DEKCiphertextSwap_AcrossCalls_SameTenant_Rejected(t *testing.T) {
+	t.Parallel()
+	pool := startPGContainer(t)
+	tenantID, callA := seedCall(t, pool)
+	callB := seedCallForTenant(t, pool, tenantID)
+
+	svc, _, objects, kek := buildServiceWithCrypto(t, pool)
+
+	// Both recordings: same tenant, distinct calls, each DEK sealed under
+	// its own (tenant, "recording.dek", callID) AAD via the fixture.
+	commitRecordingWithEncrypted(t, svc, objects, kek, tenantID, callA, []byte("call-A audio"))
+	commitRecordingWithEncrypted(t, svc, objects, kek, tenantID, callB, []byte("call-B audio"))
+
+	// Snapshot call A's stored ciphertext bytes BEFORE we mutate row B,
+	// so the swap is reproducible regardless of pgx column ordering.
+	var dekA []byte
+	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
+		return tx.QueryRow(t.Context(),
+			`SELECT encrypted_dek FROM call_recordings WHERE call_id = $1`, callA,
+		).Scan(&dekA)
+	}))
+	require.NotEmpty(t, dekA, "prerequisite: call A's EncryptedDEK is populated")
+
+	// Snapshot call B's original DEK so we can assert the swap actually
+	// replaced distinct ciphertext bytes (defensive against an accidental
+	// fixture that yields identical envelopes).
+	var dekBOrig []byte
+	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
+		return tx.QueryRow(t.Context(),
+			`SELECT encrypted_dek FROM call_recordings WHERE call_id = $1`, callB,
+		).Scan(&dekBOrig)
+	}))
+	require.NotEqual(t, dekA, dekBOrig,
+		"prerequisite: each call's wrapped DEK must be distinct (BuildAAD bound to callID)")
+
+	// Attacker: replace row B's EncryptedDEK with row A's bytes.
+	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
+		_, err := tx.Exec(t.Context(),
+			`UPDATE call_recordings SET encrypted_dek = $1 WHERE call_id = $2`,
+			dekA, callB,
+		)
+		return err
+	}))
+
+	// Attempt to open call B's audio: the unwrap path uses BuildAAD with
+	// callID = B but the ciphertext was sealed with callID = A. AEAD MUST
+	// fail at the KMS/DEK unwrap layer rather than letting playback proceed.
+	_, err := svc.OpenAudioStream(t.Context(), tenantID, callB, nil)
+	require.Error(t, err, "intra-tenant DEK swap MUST be rejected — got nil error")
+	require.ErrorIs(t, err, crypto.ErrDecryptFailed,
+		"swap rejection MUST surface as crypto.ErrDecryptFailed; got %v", err)
 }
 
 // TestCommit_OutboxPayload_HasAllAnalyticsFields is the Plan 13.2 Task 1
@@ -406,9 +481,14 @@ func buildServiceWithCrypto(t *testing.T, pool *postgres.Pool) (rapi.RecordingSe
 
 // commitRecordingWithEncrypted builds an end-to-end seeded recording.
 //  1. Generate a random DEK (32 bytes).
-//  2. Wrap DEK under the test KEK with AAD = tenant_id (this is what
-//     the ingest-uploader does in production via Yandex KMS).
-//  3. Encrypt the audio payload with the DEK + AAD = tenant_id.
+//  2. Wrap DEK under the test KEK with AAD = BuildAAD(tenant,
+//     "recording.dek", callID). The ingest-uploader (cmd/recording-
+//     uploader, a stub until Plan 14 Task 1) must use the same encoding
+//     in production so the recording service can unwrap.
+//  3. Encrypt the audio payload with the DEK + AAD = BuildAAD(tenant,
+//     "recording.audio", callID). Binding callID into the audio AAD
+//     blocks an attacker who swaps an entire S3 object between two
+//     calls of the same tenant.
 //  4. Seed LocalObjectStore with the ciphertext at the row's
 //     audio_object_key.
 //  5. Call svc.Commit with the wrapped DEK to register the recording.
@@ -424,17 +504,18 @@ func commitRecordingWithEncrypted(
 ) (uuid.UUID, []byte) {
 	t.Helper()
 
-	aad := []byte(tenantID.String())
+	dekAAD := encryption.BuildAAD(tenantID, "recording.dek", callID.String())
+	audioAAD := encryption.BuildAAD(tenantID, "recording.audio", callID.String())
 
-	// 1+2: generate DEK, wrap under KEK.
+	// 1+2: generate DEK, wrap under KEK with the DEK-scope AAD.
 	dek := make([]byte, 32)
 	_, err := rand.Read(dek)
 	require.NoError(t, err)
-	encryptedDEK, err := encryption.Encrypt(kek, dek, aad)
+	encryptedDEK, err := encryption.Encrypt(kek, dek, dekAAD)
 	require.NoError(t, err)
 
-	// 3: encrypt audio under DEK.
-	ciphertext, err := encryption.Encrypt(dek, audio, aad)
+	// 3: encrypt audio under DEK with the audio-scope AAD.
+	ciphertext, err := encryption.Encrypt(dek, audio, audioAAD)
 	require.NoError(t, err)
 
 	// 4: seed object store.
@@ -526,14 +607,26 @@ func seedTenant(t *testing.T, pool *postgres.Pool) uuid.UUID {
 func seedCall(t *testing.T, pool *postgres.Pool) (tenantID, callID uuid.UUID) {
 	t.Helper()
 	tenantID = seedTenant(t, pool)
-	callID = uuid.Must(uuid.NewV7())
+	callID = seedCallForTenant(t, pool, tenantID)
+	return tenantID, callID
+}
+
+// seedCallForTenant inserts a fresh project + call under the supplied
+// tenant. Use when a single test needs two distinct calls in the SAME
+// tenant (e.g. the DEK-swap-rejection check below).
+func seedCallForTenant(t *testing.T, pool *postgres.Pool, tenantID uuid.UUID) uuid.UUID {
+	t.Helper()
+	callID := uuid.Must(uuid.NewV7())
 	projectID := uuid.Must(uuid.NewV7())
 
 	require.NoError(t, pool.WithTenant(t.Context(), tenantID, func(tx postgres.Tx) error {
 		if _, err := tx.Exec(t.Context(),
 			`INSERT INTO projects (id, tenant_id, code, name, status)
 			 VALUES ($1, $2, $3, 'Test Project', 'active')`,
-			projectID, tenantID, "proj-"+projectID.String()[:8],
+			// Full project UUID in the code suffix — when a single tenant
+			// hosts two calls (intra-tenant swap test), the short 8-char
+			// prefix isn't unique across the tightly-clocked UUIDv7s.
+			projectID, tenantID, "proj-"+projectID.String(),
 		); err != nil {
 			return err
 		}
@@ -544,7 +637,7 @@ func seedCall(t *testing.T, pool *postgres.Pool) (tenantID, callID uuid.UUID) {
 		)
 		return err
 	}))
-	return tenantID, callID
+	return callID
 }
 
 func newCommitInput(t *testing.T, tenantID, callID uuid.UUID) rapi.CommitInput {

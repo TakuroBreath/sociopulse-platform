@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -377,17 +378,21 @@ func (k *fakeKMS) Encrypt(_ context.Context, tenantID uuid.UUID, scope, rowID st
 }
 
 func (k *fakeKMS) Decrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error) {
+	// Authentication-class failures wrap tenancyapi.ErrInvalidArgument so
+	// callers can errors.Is against the sentinel — mirrors the production
+	// KMSResolverImpl.Decrypt contract (returns "%w: aes-gcm open: %w"
+	// wrapping tenancyapi.ErrInvalidArgument; see Plan 13.2.5 Task 6).
 	if len(ciphertext) < 4 || string(ciphertext[:4]) != "enc:" {
-		return nil, errors.New("fakeKMS: malformed ciphertext")
+		return nil, fmt.Errorf("%w: fakeKMS: malformed ciphertext", tenancyapi.ErrInvalidArgument)
 	}
 	wantTag := fakeKMSAADTag(tenantID, scope, rowID)
 	if len(ciphertext) < 4+len(wantTag) {
-		return nil, errors.New("fakeKMS: ciphertext too short")
+		return nil, fmt.Errorf("%w: fakeKMS: ciphertext too short", tenancyapi.ErrInvalidArgument)
 	}
 	gotTag := ciphertext[4 : 4+len(wantTag)]
 	for i, b := range gotTag {
 		if b != wantTag[i] {
-			return nil, errors.New("fakeKMS: AAD tag mismatch")
+			return nil, fmt.Errorf("%w: fakeKMS: AAD tag mismatch", tenancyapi.ErrInvalidArgument)
 		}
 	}
 	return ciphertext[4+len(wantTag):], nil
@@ -1244,8 +1249,12 @@ func TestRespondentService_PhoneCiphertextSwap_AcrossRows_Rejected(t *testing.T)
 	// GetWithPhone(A) passes (tenant, "crm.respondent.phone", A.ID) to
 	// Decrypt; the ciphertext was Encrypt'd with B.ID in its AAD — MUST
 	// fail at the AEAD layer rather than silently surfacing B's phone.
+	// errors.Is (not Contains on the error string) so a future refactor
+	// of either the fake or the service's error wrapper text cannot
+	// silently mask the tenancyapi.ErrInvalidArgument sentinel that the
+	// production KMSResolverImpl.Decrypt wraps for AAD-tag failures.
 	_, err = svc.GetWithPhone(ctx, tenantID, a.ID)
 	require.Error(t, err, "swap attack must surface as an error, not B's phone")
-	require.Contains(t, err.Error(), "decrypt",
-		"the failure must come from the KMS decrypt step (AAD mismatch)")
+	require.ErrorIs(t, err, tenancyapi.ErrInvalidArgument,
+		"AAD mismatch MUST surface as tenancyapi.ErrInvalidArgument; got %v", err)
 }
