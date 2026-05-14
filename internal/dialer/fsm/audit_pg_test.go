@@ -15,6 +15,7 @@ package fsm_test
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -33,6 +34,7 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 	"go.uber.org/zap/zaptest"
 
+	analyticsapi "github.com/sociopulse/platform/internal/analytics/api"
 	"github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/dialer/fsm"
 	"github.com/sociopulse/platform/pkg/outbox"
@@ -362,4 +364,229 @@ func TestIntegration_PG_ForceClosesSession(t *testing.T) {
 	require.Equal(t, "offline", rowsOut[1].state)
 	require.NotNil(t, rowsOut[1].reason)
 	require.Equal(t, "heartbeat_lost", *rowsOut[1].reason)
+}
+
+// TestEventStatusSubmitted_EmitsCallFinalizedOutboxRows verifies the
+// Plan 13.2 § Q7 dual-publish on EventStatusSubmitted:
+//  1. tenant.<t>.dialer.call.finalized — per-tenant call-finalisation row.
+//  2. analytics.event.calls — cross-tenant analytics row.
+//
+// Both rows MUST commit in the same Tx as the state-log row so the
+// "call-finalisation rollup is atomic with the FSM transition" invariant
+// holds for downstream subscribers.
+func TestEventStatusSubmitted_EmitsCallFinalizedOutboxRows(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	t.Parallel()
+	pool := startPGContainer(t)
+	rdb := startRedisOnly(t)
+	tenantID, userID, projectID := seedPrereqRows(t, pool)
+
+	mach, err := fsm.New(fsm.Config{
+		Redis:   rdb,
+		PG:      pool,
+		Outbox:  outbox.NewPostgresWriter(),
+		Logger:  zaptest.NewLogger(t),
+		Metrics: fsm.RegisterMetrics(prometheus.NewRegistry()),
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// Drive the FSM ready → dialing → call → status.
+	_, err = mach.StartShift(ctx, api.StartShiftRequest{
+		TenantID: tenantID, OperatorID: userID, ProjectID: projectID,
+	})
+	require.NoError(t, err)
+
+	callID := uuid.New()
+	respondentID := uuid.New()
+	_, err = mach.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: userID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+	_, err = mach.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: userID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+	_, err = mach.RecordCallEnded(ctx, api.CallEndedRequest{
+		TenantID: tenantID, OperatorID: userID, CallID: callID,
+	})
+	require.NoError(t, err)
+
+	// SubmitStatus → status → ready. This is the transition that
+	// emits the call.finalized + analytics.event.calls rows.
+	snap, err := mach.SubmitStatus(ctx, api.SubmitStatusRequest{
+		TenantID:     tenantID,
+		OperatorID:   userID,
+		CallID:       callID,
+		RespondentID: respondentID,
+		Status:       "success",
+	})
+	require.NoError(t, err)
+	require.Equal(t, api.StateReady, snap.State)
+
+	// Read the per-tenant tenant.<t>.dialer.call.finalized row.
+	expectedFinalizedSubject := api.SubjectCallFinalizedFor(tenantID)
+	var finalizedPayloads [][]byte
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		rs, err := tx.Query(ctx, `
+			SELECT payload FROM event_outbox
+			WHERE subject = $1
+			ORDER BY id
+		`, expectedFinalizedSubject)
+		if err != nil {
+			return err
+		}
+		defer rs.Close()
+		for rs.Next() {
+			var p []byte
+			if err := rs.Scan(&p); err != nil {
+				return err
+			}
+			finalizedPayloads = append(finalizedPayloads, p)
+		}
+		return rs.Err()
+	}))
+	require.Len(t, finalizedPayloads, 1, "expected exactly one call.finalized row")
+	var finalizedEvent api.CallFinalizedEvent
+	require.NoError(t, json.Unmarshal(finalizedPayloads[0], &finalizedEvent))
+	require.Equal(t, tenantID, finalizedEvent.TenantID)
+	require.Equal(t, userID, finalizedEvent.OperatorID)
+	require.Equal(t, callID, finalizedEvent.CallID)
+	require.Equal(t, projectID, finalizedEvent.ProjectID)
+	require.Equal(t, respondentID, finalizedEvent.RespondentID)
+	require.Equal(t, "success", finalizedEvent.Status)
+
+	// Read the cross-tenant analytics.event.calls row.
+	var analyticsPayloads [][]byte
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		rs, err := tx.Query(ctx, `
+			SELECT payload FROM event_outbox
+			WHERE subject = $1
+			ORDER BY id
+		`, analyticsapi.SubjectCallsAnalytics)
+		if err != nil {
+			return err
+		}
+		defer rs.Close()
+		for rs.Next() {
+			var p []byte
+			if err := rs.Scan(&p); err != nil {
+				return err
+			}
+			analyticsPayloads = append(analyticsPayloads, p)
+		}
+		return rs.Err()
+	}))
+	require.Len(t, analyticsPayloads, 1, "expected exactly one analytics call row")
+	var analyticsEvent analyticsapi.AnalyticsCallEventPayload
+	require.NoError(t, json.Unmarshal(analyticsPayloads[0], &analyticsEvent))
+	require.Equal(t, tenantID, analyticsEvent.TenantID)
+	require.Equal(t, userID, analyticsEvent.OperatorID)
+	require.Equal(t, callID, analyticsEvent.CallID)
+	require.Equal(t, projectID, analyticsEvent.ProjectID)
+	require.Equal(t, "success", analyticsEvent.Status)
+	require.NotEqual(t, uuid.Nil, analyticsEvent.EventID)
+	require.NotEmpty(t, analyticsEvent.Date)
+	require.False(t, analyticsEvent.TS.IsZero())
+	// Q8/Q9 caveats: v1 ingester accepts empty-string sentinels.
+	require.Equal(t, "", analyticsEvent.HangupCause)
+	require.Equal(t, "", analyticsEvent.RegionCode)
+}
+
+// TestAppendStateLogAndOutbox_AlsoEmitsAnalyticsOpStateRow verifies the
+// Plan 13.2 § Q7 dual-publish: every operator FSM transition writes
+//  1. tenant.<t>.dialer.op.<op_id>.state — the existing per-tenant row.
+//  2. analytics.event.operator_state — the cross-tenant analytics row.
+//
+// Both rows commit in the SAME Postgres transaction so the canonical
+// transactional-outbox guarantee holds for both subjects. The analytics
+// row carries the denormalised state-change with duration_in_state_sec
+// (= previous state's duration delta).
+func TestAppendStateLogAndOutbox_AlsoEmitsAnalyticsOpStateRow(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration test")
+	}
+	t.Parallel()
+	pool := startPGContainer(t)
+	rdb := startRedisOnly(t)
+	tenantID, userID, projectID := seedPrereqRows(t, pool)
+
+	mach, err := fsm.New(fsm.Config{
+		Redis:   rdb,
+		PG:      pool,
+		Outbox:  outbox.NewPostgresWriter(),
+		Logger:  zaptest.NewLogger(t),
+		Metrics: fsm.RegisterMetrics(prometheus.NewRegistry()),
+	})
+	require.NoError(t, err)
+
+	ctx := context.Background()
+
+	// 1. StartShift → ready (1 per-tenant + 1 analytics row).
+	_, err = mach.StartShift(ctx, api.StartShiftRequest{
+		TenantID: tenantID, OperatorID: userID, ProjectID: projectID,
+	})
+	require.NoError(t, err)
+
+	// Sleep a sliver so the next transition's duration_in_state_sec is
+	// computable AND non-zero in seconds (the FSM derives the delta
+	// from the prior operator_state_log row's ts; we don't need a long
+	// wait — any non-zero monotonic-clock delta is fine).
+	time.Sleep(1100 * time.Millisecond)
+
+	// 2. GoPause → pause (1 per-tenant + 1 analytics row).
+	_, err = mach.GoPause(ctx, api.GoPauseRequest{
+		TenantID: tenantID, OperatorID: userID, Reason: "bio_break",
+	})
+	require.NoError(t, err)
+
+	// Read the analytics rows. They are cross-tenant: TenantID is NULL
+	// on the row (denormalised into the payload) so the relay treats them
+	// as a global subject rather than a per-tenant one.
+	var analyticsPayloads [][]byte
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		rs, err := tx.Query(ctx, `
+			SELECT payload FROM event_outbox
+			WHERE subject = $1
+			ORDER BY id
+		`, analyticsapi.SubjectOperatorStateAnalytics)
+		if err != nil {
+			return err
+		}
+		defer rs.Close()
+		for rs.Next() {
+			var p []byte
+			if err := rs.Scan(&p); err != nil {
+				return err
+			}
+			analyticsPayloads = append(analyticsPayloads, p)
+		}
+		return rs.Err()
+	}))
+	require.Len(t, analyticsPayloads, 2, "expected 2 analytics op-state rows (start_shift + go_pause)")
+
+	// Decode each and assert shape.
+	decoded := make([]analyticsapi.AnalyticsOperatorStateEventPayload, len(analyticsPayloads))
+	for i, p := range analyticsPayloads {
+		require.NoError(t, json.Unmarshal(p, &decoded[i]), "row %d payload must decode", i)
+		require.Equal(t, tenantID, decoded[i].TenantID)
+		require.Equal(t, userID, decoded[i].UserID)
+		require.NotEqual(t, uuid.Nil, decoded[i].EventID)
+		require.NotEmpty(t, decoded[i].Date)
+		require.False(t, decoded[i].TS.IsZero())
+		require.NotNil(t, decoded[i].ProjectID, "project_id should be present on ready/pause transitions")
+		require.Equal(t, projectID, *decoded[i].ProjectID)
+	}
+
+	// First row: ready (start_shift) — no prior state-log, so duration
+	// is 0.
+	require.Equal(t, "ready", decoded[0].State)
+	require.Equal(t, uint32(0), decoded[0].DurationInStateSec)
+	// Second row: pause — delta from the ready row's ts. Must be >= 1
+	// (we slept 1.1s above).
+	require.Equal(t, "pause", decoded[1].State)
+	require.GreaterOrEqual(t, decoded[1].DurationInStateSec, uint32(1))
 }

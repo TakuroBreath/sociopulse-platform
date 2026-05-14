@@ -3,11 +3,15 @@ package fsm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
+	analyticsapi "github.com/sociopulse/platform/internal/analytics/api"
 	"github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/postgres"
@@ -26,11 +30,36 @@ type SessionStore interface {
 	CloseSession(ctx context.Context, tx postgres.Tx, sessionID uuid.UUID, occurredAt time.Time) error
 	// AppendStateLog INSERTs one row into operator_state_log inside tx.
 	AppendStateLog(ctx context.Context, tx postgres.Tx, sessionID uuid.UUID, occurredAt time.Time, state api.State, reason string) error
+	// LastStateLog returns the most-recent operator_state_log row for
+	// sessionID. Returns ErrNoStateLog when none exist (the caller is
+	// about to insert the first row for this session). The analytics
+	// dual-publish path (Plan 13.2 § Q7) uses the returned ts to
+	// compute duration_in_state_sec as the delta between the prior
+	// row and the row about to be appended.
+	LastStateLog(ctx context.Context, tx postgres.Tx, sessionID uuid.UUID) (LastStateLogRow, error)
 }
+
+// LastStateLogRow is the projection of operator_state_log used by
+// SessionStore.LastStateLog. Reason is normalised to "" for NULL.
+type LastStateLogRow struct {
+	OccurredAt time.Time
+	State      api.State
+	Reason     string
+}
+
+// ErrNoStateLog is the sentinel returned by SessionStore.LastStateLog
+// when the session has no prior operator_state_log rows.
+var ErrNoStateLog = errors.New("fsm/store: no prior state-log row")
 
 // auditEntry bundles the data needed to record one FSM transition into
 // Postgres + outbox in a single Tx. Every successful transition produces
 // exactly one auditEntry.
+//
+// extraOutbox is an optional hook that runs INSIDE the audit Tx after the
+// canonical (state_log, per-tenant outbox, analytics outbox) rows. Used
+// by the EventStatusSubmitted handler to append the call.finalized outbox
+// rows in the same Tx as the operator state-log row (Plan 13.2 § Q7).
+// When nil, the hook is skipped and the audit Tx commits as before.
 type auditEntry struct {
 	TenantID    uuid.UUID
 	OperatorID  uuid.UUID
@@ -41,6 +70,7 @@ type auditEntry struct {
 	ProjectID   *uuid.UUID
 	CallID      *uuid.UUID
 	PauseReason *string
+	extraOutbox func(ctx context.Context, tx postgres.Tx) error
 }
 
 // pgSessionStore is the default SessionStore implementation. The
@@ -83,6 +113,30 @@ func (pgSessionStore) AppendStateLog(ctx context.Context, tx postgres.Tx, sessio
 		return fmt.Errorf("insert operator_state_log: %w", err)
 	}
 	return nil
+}
+
+// LastStateLog satisfies SessionStore — returns the most-recent prior
+// row for sessionID. Returns ErrNoStateLog for the empty-session case.
+// MUST be called BEFORE AppendStateLog in the same Tx so the row about
+// to be inserted does not shadow the genuine "previous" row.
+func (pgSessionStore) LastStateLog(ctx context.Context, tx postgres.Tx, sessionID uuid.UUID) (LastStateLogRow, error) {
+	const q = `
+		SELECT ts, state, COALESCE(reason, '')
+		FROM operator_state_log
+		WHERE session_id = $1
+		ORDER BY ts DESC
+		LIMIT 1`
+	var r LastStateLogRow
+	var rawState string
+	err := tx.QueryRow(ctx, q, sessionID).Scan(&r.OccurredAt, &rawState, &r.Reason)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return LastStateLogRow{}, ErrNoStateLog
+	}
+	if err != nil {
+		return LastStateLogRow{}, fmt.Errorf("select operator_state_log: %w", err)
+	}
+	r.State = api.State(rawState)
+	return r, nil
 }
 
 // startSessionAndAudit opens a per-tenant transaction that:
@@ -180,14 +234,34 @@ func (m *Machine) auditTransition(
 	return nil
 }
 
-// appendStateLogAndOutbox writes the operator_state_log row + the
-// outbox event in tx. Pulled out so the three call sites (start, close,
-// transition) share the same canonical shape.
+// appendStateLogAndOutbox writes the operator_state_log row + two outbox
+// events in tx — both committed atomically with the state-log INSERT.
+//
+// Plan 13.2 § Q7 dual-publish:
+//  1. tenant.<t>.dialer.op.<op_id>.state — per-tenant subject consumed by
+//     operator UI / supervisor dashboards.
+//  2. analytics.event.operator_state — cross-tenant subject consumed by
+//     the ClickHouse ingest pipeline. The payload carries duration_in_state_sec
+//     (= delta from the PRIOR state-log row's ts) so analytics can compute
+//     per-state time-spent without joining back to operator_state_log.
+//
+// duration_in_state_sec is 0 for the first transition of a session (no
+// prior log row to subtract from).
 func (m *Machine) appendStateLogAndOutbox(
 	ctx context.Context,
 	tx postgres.Tx,
 	entry auditEntry,
 ) error {
+	// Look up the prior state-log row BEFORE inserting the current one so
+	// the "previous" semantics is genuinely the prior state. We swallow
+	// ErrNoStateLog: a session's first transition has no prior row and
+	// reports duration_in_state_sec = 0.
+	prev, err := m.sessions.LastStateLog(ctx, tx, entry.SessionID)
+	hasPrev := err == nil
+	if err != nil && !errors.Is(err, ErrNoStateLog) {
+		return fmt.Errorf("lookup prior state-log: %w", err)
+	}
+
 	if err := m.sessions.AppendStateLog(ctx, tx, entry.SessionID, entry.OccurredAt, entry.NewState, entry.Reason); err != nil {
 		return err
 	}
@@ -213,6 +287,141 @@ func (m *Machine) appendStateLogAndOutbox(
 		Payload:     payload,
 	}); err != nil {
 		return fmt.Errorf("outbox append: %w", err)
+	}
+
+	// Plan 13.2 § Q7: emit the cross-tenant analytics row in the same Tx.
+	// The tenant_id is denormalised into the payload (the subject is
+	// global), so we leave outbox.Event.TenantID nil; that also keeps
+	// existing per-tenant outbox queries (filtered on tenant_id) from
+	// surfacing analytics rows when they don't expect them.
+	var prevDur uint32
+	if hasPrev {
+		secs := entry.OccurredAt.Sub(prev.OccurredAt).Seconds()
+		switch {
+		case secs <= 0:
+			prevDur = 0
+		case secs >= float64(math.MaxUint32):
+			prevDur = math.MaxUint32
+		default:
+			prevDur = uint32(secs)
+		}
+	}
+	analyticsPayload, err := json.Marshal(analyticsapi.AnalyticsOperatorStateEventPayload{
+		Date:               entry.OccurredAt.UTC().Format("2006-01-02"),
+		TS:                 entry.OccurredAt.UTC(),
+		TenantID:           entry.TenantID,
+		UserID:             entry.OperatorID,
+		State:              string(entry.NewState),
+		DurationInStateSec: prevDur,
+		ProjectID:          entry.ProjectID,
+		EventID:            uuid.New(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal analytics operator_state: %w", err)
+	}
+	if err := m.outbox.Append(ctx, tx, outbox.Event{
+		Subject: analyticsapi.SubjectOperatorStateAnalytics,
+		Payload: analyticsPayload,
+	}); err != nil {
+		return fmt.Errorf("outbox append analytics op state: %w", err)
+	}
+
+	// Optional extra-outbox hook — used by EventStatusSubmitted to append
+	// the call.finalized rows (per-tenant + analytics) in the same Tx so
+	// the call-finalisation rollup is atomic with the state transition.
+	if entry.extraOutbox != nil {
+		if err := entry.extraOutbox(ctx, tx); err != nil {
+			return fmt.Errorf("extra outbox: %w", err)
+		}
+	}
+	return nil
+}
+
+// callFinalizedEntry carries the data the EventStatusSubmitted handler
+// needs to append the call.finalized + analytics.event.calls outbox rows.
+// Built INSIDE SubmitStatus before the audit Tx opens; appendCallFinalizedOutbox
+// consumes it via the auditEntry.extraOutbox hook.
+type callFinalizedEntry struct {
+	TenantID     uuid.UUID
+	OperatorID   uuid.UUID
+	ProjectID    uuid.UUID
+	CallID       uuid.UUID
+	RespondentID uuid.UUID
+	Status       string
+	DurationSec  uint32
+	TrunkUsed    string
+	HangupCause  string // "" until telephony-bridge ↔ analytics wiring lands (Q8)
+	RegionCode   string // "" until respondent flow lands (Q9)
+	AttemptNo    uint8
+	FinalizedAt  time.Time
+	StorageBytes int64
+}
+
+// appendCallFinalizedOutbox writes TWO outbox rows inside tx:
+//  1. tenant.<t>.dialer.call.finalized — the per-tenant subject consumed
+//     by billing + downstream tenant-scoped subscribers. Payload =
+//     api.CallFinalizedEvent.
+//  2. analytics.event.calls — cross-tenant subject consumed by the
+//     analytics ingest pipeline. Payload = analyticsapi.AnalyticsCallEventPayload.
+//
+// Both rows are emitted with fresh uuid.New() event_id values so the
+// ingest dedup LRU treats them as distinct events.
+func (m *Machine) appendCallFinalizedOutbox(
+	ctx context.Context,
+	tx postgres.Tx,
+	entry callFinalizedEntry,
+) error {
+	// 1. Per-tenant tenant.<t>.dialer.call.finalized row.
+	finalizedPayload, err := json.Marshal(api.CallFinalizedEvent{
+		CallID:       entry.CallID,
+		TenantID:     entry.TenantID,
+		OperatorID:   entry.OperatorID,
+		ProjectID:    entry.ProjectID,
+		RespondentID: entry.RespondentID,
+		TrunkUsed:    entry.TrunkUsed,
+		DurationSec:  int32(entry.DurationSec), //nolint:gosec // DurationSec is bounded by uint32 in the entry
+		Status:       entry.Status,
+		StorageBytes: entry.StorageBytes,
+		FinalizedAt:  entry.FinalizedAt.Unix(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal call_finalized: %w", err)
+	}
+	tenantID := entry.TenantID
+	callID := entry.CallID
+	if err := m.outbox.Append(ctx, tx, outbox.Event{
+		TenantID:    &tenantID,
+		AggregateID: &callID,
+		Subject:     api.SubjectCallFinalizedFor(entry.TenantID),
+		Payload:     finalizedPayload,
+	}); err != nil {
+		return fmt.Errorf("outbox append call_finalized: %w", err)
+	}
+
+	// 2. Cross-tenant analytics.event.calls row.
+	analyticsPayload, err := json.Marshal(analyticsapi.AnalyticsCallEventPayload{
+		Date:        entry.FinalizedAt.UTC().Format("2006-01-02"),
+		TS:          entry.FinalizedAt.UTC(),
+		TenantID:    entry.TenantID,
+		ProjectID:   entry.ProjectID,
+		OperatorID:  entry.OperatorID,
+		CallID:      entry.CallID,
+		Status:      entry.Status,
+		DurationSec: entry.DurationSec,
+		HangupCause: entry.HangupCause,
+		RegionCode:  entry.RegionCode,
+		AttemptNo:   entry.AttemptNo,
+		TrunkUsed:   entry.TrunkUsed,
+		EventID:     uuid.New(),
+	})
+	if err != nil {
+		return fmt.Errorf("marshal analytics calls: %w", err)
+	}
+	if err := m.outbox.Append(ctx, tx, outbox.Event{
+		Subject: analyticsapi.SubjectCallsAnalytics,
+		Payload: analyticsPayload,
+	}); err != nil {
+		return fmt.Errorf("outbox append analytics calls: %w", err)
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
+	analyticsapi "github.com/sociopulse/platform/internal/analytics/api"
 	"github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/dialer/fsm"
 	"github.com/sociopulse/platform/pkg/outbox"
@@ -95,6 +96,27 @@ func (f *fakeSessionStore) AppendStateLog(_ context.Context, _ postgres.Tx, sess
 	return nil
 }
 
+// LastStateLog returns the most-recent fakeStateLogRow for sessionID, or
+// ErrNoStateLog when the in-memory slice has none. The fake never touches
+// postgres.Tx — its zero value is fine.
+func (f *fakeSessionStore) LastStateLog(_ context.Context, _ postgres.Tx, sessionID uuid.UUID) (fsm.LastStateLogRow, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.errOn != nil {
+		return fsm.LastStateLogRow{}, f.errOn
+	}
+	for i := len(f.stateLog) - 1; i >= 0; i-- {
+		if f.stateLog[i].sessionID == sessionID {
+			return fsm.LastStateLogRow{
+				OccurredAt: f.stateLog[i].ts,
+				State:      f.stateLog[i].state,
+				Reason:     f.stateLog[i].reason,
+			}, nil
+		}
+	}
+	return fsm.LastStateLogRow{}, fsm.ErrNoStateLog
+}
+
 func (f *fakeSessionStore) stateLogSnapshot() []fakeStateLogRow {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -136,9 +158,39 @@ func (f *fakeOutbox) Append(_ context.Context, _ postgres.Tx, ev outbox.Event) e
 func (f *fakeOutbox) snapshot() []outboxCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	out := make([]outboxCall, len(f.calls))
-	copy(out, f.calls)
+	out := make([]outboxCall, 0, len(f.calls))
+	// Default snapshot filters to the per-tenant operator-state outbox
+	// rows the audit path emits — one per FSM transition. Plan 13.2 § Q7
+	// added three "extra" subjects that legacy state-transition tests do
+	// not want to see:
+	//   - analytics.event.operator_state  (per-transition analytics row)
+	//   - analytics.event.calls           (call.finalized analytics row)
+	//   - tenant.<t>.dialer.call.finalized (per-tenant call.finalized row)
+	// All of these are legitimate outbox writes but they're event-level,
+	// not transition-level. Use snapshotAllSubjects to inspect them.
+	for _, c := range f.calls {
+		if c.subject == analyticsapi.SubjectOperatorStateAnalytics ||
+			c.subject == analyticsapi.SubjectCallsAnalytics {
+			continue
+		}
+		if isCallFinalizedSubject(c.subject) {
+			continue
+		}
+		out = append(out, c)
+	}
 	return out
+}
+
+// isCallFinalizedSubject reports whether subj is one of the per-tenant
+// tenant.<t>.dialer.call.finalized subjects. The exact tenant token is
+// not knowable at filter time, so we match on the stable suffix.
+func isCallFinalizedSubject(subj string) bool {
+	const suffix = ".dialer.call.finalized"
+	const prefix = "tenant."
+	if len(subj) <= len(prefix)+len(suffix) {
+		return false
+	}
+	return subj[:len(prefix)] == prefix && subj[len(subj)-len(suffix):] == suffix
 }
 
 // fakeTxRunner satisfies fsm.TxRunner without a database. It invokes fn

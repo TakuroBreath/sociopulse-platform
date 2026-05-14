@@ -211,6 +211,27 @@ func (m *Machine) applyEventWith(
 	mutate func(s *Snapshot),
 	replayShortCircuit func(cur Snapshot) bool,
 ) (api.Snapshot, error) {
+	return m.applyEventFull(ctx, tenantID, operatorID, evt, preCheck, mutate, replayShortCircuit, nil)
+}
+
+// applyEventFull is applyEventWith plus an audit-Tx extras callback. The
+// extras builder receives the pre- and post-mutation snapshots and may
+// return an extraOutbox function that runs INSIDE the audit Tx after the
+// canonical state-log + per-tenant outbox + analytics outbox rows. Used
+// by SubmitStatus to append the call.finalized rows atomically with the
+// state-log row.
+//
+// extras is nil-tolerant. When extras is nil, applyEventFull behaves
+// identically to applyEventWith.
+func (m *Machine) applyEventFull(
+	ctx context.Context,
+	tenantID, operatorID uuid.UUID,
+	evt api.Event,
+	preCheck func(cur Snapshot) error,
+	mutate func(s *Snapshot),
+	replayShortCircuit func(cur Snapshot) bool,
+	extras func(cur, updated Snapshot, occurredAt time.Time) func(ctx context.Context, tx postgres.Tx) error,
+) (api.Snapshot, error) {
 	cur, err := m.load(ctx, tenantID, operatorID)
 	if err != nil {
 		return api.Snapshot{}, err
@@ -266,6 +287,9 @@ func (m *Machine) applyEventWith(
 			ProjectID:   updated.ProjectID,
 			CallID:      updated.CurrentCallID,
 			PauseReason: updated.PauseReason,
+		}
+		if extras != nil {
+			entry.extraOutbox = extras(cur, updated, now)
 		}
 		if err := m.auditTransition(ctx, entry); err != nil {
 			m.log.Error("fsm: audit append failed after live state committed",
@@ -517,13 +541,77 @@ func (m *Machine) RecordCallEnded(ctx context.Context, req api.CallEndedRequest)
 }
 
 // SubmitStatus implements api.OperatorFSM. Clears the call_id /
-// respondent_id; the disposition itself is owned by the caller's higher-
-// level service (which writes the calls.status field).
+// respondent_id and, INSIDE the same audit Tx, appends two
+// call-finalisation outbox rows (Plan 13.2 § Q7 dual-publish):
+//
+//   - tenant.<t>.dialer.call.finalized — per-tenant subject consumed by
+//     billing + downstream tenant-scoped subscribers.
+//   - analytics.event.calls — cross-tenant subject consumed by the
+//     analytics ingest pipeline.
+//
+// The wrap-up disposition (the calls.status column) is owned by the
+// caller's higher-level service. v1 carries empty-string sentinels for
+// hangup_cause / region_code per Q8/Q9; the analytics ingester accepts
+// them as "unknown" until telephony-bridge → analytics + respondent
+// flow are wired in a future plan.
 func (m *Machine) SubmitStatus(ctx context.Context, req api.SubmitStatusRequest) (api.Snapshot, error) {
-	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventStatusSubmitted, func(s *Snapshot) {
-		s.CurrentCallID = nil
-		s.RespondentID = nil
-	})
+	return m.applyEventFull(ctx, req.TenantID, req.OperatorID, api.EventStatusSubmitted,
+		nil, // preCheck
+		func(s *Snapshot) {
+			s.CurrentCallID = nil
+			s.RespondentID = nil
+		},
+		nil, // replayShortCircuit
+		m.callFinalizedExtras(req),
+	)
+}
+
+// callFinalizedExtras returns the audit-Tx extras callback the
+// SubmitStatus path uses to wire the Plan 13.2 § Q7 dual-publish of
+// tenant.<t>.dialer.call.finalized + analytics.event.calls. Kept as a
+// standalone helper so the RED step can detach it via SubmitStatus
+// (passing nil for the extras parameter) without losing the body.
+func (m *Machine) callFinalizedExtras(req api.SubmitStatusRequest) func(cur, _ Snapshot, occurredAt time.Time) func(ctx context.Context, tx postgres.Tx) error {
+	return func(cur, _ Snapshot, occurredAt time.Time) func(ctx context.Context, tx postgres.Tx) error {
+		// SubmitStatus is only reachable from State=status, which is
+		// reachable from State=call or State=dialing. cur carries the
+		// active call_id, respondent_id, and project_id — these are
+		// the fields the call-finalised payload denormalises.
+		projectID := uuid.Nil
+		if cur.ProjectID != nil {
+			projectID = *cur.ProjectID
+		}
+		callID := req.CallID
+		if cur.CurrentCallID != nil {
+			callID = *cur.CurrentCallID
+		}
+		respondentID := req.RespondentID
+		if cur.RespondentID != nil {
+			respondentID = *cur.RespondentID
+		}
+		cfe := callFinalizedEntry{
+			TenantID:     req.TenantID,
+			OperatorID:   req.OperatorID,
+			ProjectID:    projectID,
+			CallID:       callID,
+			RespondentID: respondentID,
+			Status:       req.Status,
+			// DurationSec / TrunkUsed / StorageBytes are not on the
+			// Machine context yet — v1 emits zero values. The
+			// analytics ingester treats them as "unknown" until the
+			// telephony bridge plumbs them through (Q8/Q9 caveats).
+			DurationSec:  0,
+			TrunkUsed:    "",
+			HangupCause:  "",
+			RegionCode:   "",
+			AttemptNo:    1,
+			FinalizedAt:  occurredAt,
+			StorageBytes: 0,
+		}
+		return func(ctx context.Context, tx postgres.Tx) error {
+			return m.appendCallFinalizedOutbox(ctx, tx, cfe)
+		}
+	}
 }
 
 // GoVerify implements api.OperatorFSM. Operator chooses to enter the

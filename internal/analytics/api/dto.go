@@ -17,11 +17,21 @@ import (
 )
 
 // EventKind enumerates the NATS event kinds the ingester accepts.
+// Values mirror the subject constants in events.go so the kind tag is
+// human-readable in logs / traces. EventEnvelope.Kind is currently
+// informational only — the ingester routes on the bound subject, not
+// the payload field — but the explicit enum is kept so unmarshalled
+// payloads can be sanity-checked against the subject they arrived on.
 type EventKind string
 
 const (
-	EventKindCallFinalized     EventKind = "dialer.call.finalized"
-	EventKindOperatorState     EventKind = "operator.state.changed"
+	// EventKindCalls corresponds to SubjectCallsAnalytics.
+	EventKindCalls EventKind = "analytics.event.calls"
+	// EventKindOperatorState corresponds to SubjectOperatorStateAnalytics.
+	EventKindOperatorState EventKind = "analytics.event.operator_state"
+	// EventKindRecordingUploaded corresponds to the per-tenant
+	// tenant.<t>.recording.uploaded subject (see
+	// SubjectRecordingUploadedWildcard for the ingester binding).
 	EventKindRecordingUploaded EventKind = "recording.uploaded"
 )
 

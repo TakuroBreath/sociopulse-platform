@@ -135,6 +135,17 @@ func (s *svc) Commit(ctx context.Context, in rapi.CommitInput) (rapi.CommitOutpu
 		replay bool
 	)
 	err := s.pool.WithTenant(ctx, in.TenantID, func(tx postgres.Tx) error {
+		// Plan 13.2: read the call's denormalised context (project_id,
+		// freeswitch_node) BEFORE the recording INSERT. This is also
+		// our FK probe — a missing call row surfaces ErrCallNotFound
+		// here, before the insert ever runs (mirrors the same-named
+		// check at the top of InsertRecordingIdempotent — kept there as
+		// a defence-in-depth for callers that don't pre-fetch context).
+		callCtx, err := s.store.LookupCallContext(ctx, tx, in.TenantID, in.CallID)
+		if err != nil {
+			return err
+		}
+
 		inserted, didReplay, err := s.store.InsertRecordingIdempotent(ctx, tx, row)
 		if err != nil {
 			return err
@@ -155,7 +166,7 @@ func (s *svc) Commit(ctx context.Context, in rapi.CommitInput) (rapi.CommitOutpu
 			return fmt.Errorf("audit insert: %w", err)
 		}
 
-		ev, err := buildOutboxEvent(inserted)
+		ev, err := buildOutboxEvent(inserted, callCtx)
 		if err != nil {
 			return fmt.Errorf("build outbox event: %w", err)
 		}
@@ -499,16 +510,34 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, now())
 	})
 }
 
-func buildOutboxEvent(r store.RecordingRow) (outbox.Event, error) {
+// buildOutboxEvent renders the recording.uploaded outbox row. The extra
+// callCtx parameter carries fields the analytics ingester needs but the
+// RecordingRow doesn't store (project_id is FK-joinable; freeswitch_node
+// lives on calls). EventID is fresh per emission so the analytics dedup
+// LRU treats replays as distinct events. DurationSec is the integer-
+// seconds projection of DurationMS that the CH UInt32 column expects;
+// floor-division (not rounding) matches the analytics SLO of "report
+// completed seconds, never inflate".
+func buildOutboxEvent(r store.RecordingRow, callCtx store.CallContext) (outbox.Event, error) {
+	durationSec := r.DurationMS / 1000
+	if durationSec < 0 {
+		durationSec = 0
+	}
 	payload, err := json.Marshal(rapi.RecordingUploadedEvent{
-		RecordingID: r.ID,
-		CallID:      r.CallID,
-		TenantID:    r.TenantID,
-		BytesSize:   r.BytesSize,
-		DurationMS:  r.DurationMS,
-		SHA256Hex:   r.SHA256Hex,
-		Status:      r.Status,
-		CommittedAt: r.CommittedAt.Unix(),
+		RecordingID:        r.ID,
+		CallID:             r.CallID,
+		TenantID:           r.TenantID,
+		ProjectID:          callCtx.ProjectID,
+		FSNode:             callCtx.FSNode, // "" until telephony plumbing lands (Plan 13.2 § Q caveat).
+		S3Key:              r.AudioObjectKey,
+		EncryptionKeyAlias: r.KMSKeyID, // KMS key id doubles as the alias for events_recording_uploaded.encryption_key_alias.
+		EventID:            uuid.New(),
+		BytesSize:          r.BytesSize,
+		DurationMS:         r.DurationMS,
+		DurationSec:        int32(durationSec), //nolint:gosec // durationSec >= 0; int32 range is enough for any realistic call.
+		SHA256Hex:          r.SHA256Hex,
+		Status:             r.Status,
+		CommittedAt:        r.CommittedAt.Unix(),
 	})
 	if err != nil {
 		return outbox.Event{}, fmt.Errorf("marshal outbox payload: %w", err)

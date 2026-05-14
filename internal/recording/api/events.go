@@ -64,17 +64,37 @@ const (
 )
 
 // RecordingUploadedEvent is the payload for SubjectRecordingUploaded.
-// Mirrors RecordingMetadata but omits S3 paths so subscribers cannot
-// short-circuit the audited read path.
+//
+// Plan 13.2 § Q4 extended the payload additively (backwards-compatible):
+// the analytics ingester binds the per-tenant tenant.<t>.recording.uploaded
+// subject via a wildcard, decodes this payload, and inserts into
+// events_recording_uploaded. The CH table needs project_id, fs_node, s3_key,
+// encryption_key_alias, duration_sec, event_id — fields the original
+// Plan 12.1 payload did not carry. Older subscribers (audit / monitoring)
+// continue to read the same recording_id / call_id / tenant_id /
+// bytes_size / duration_ms / sha256 / status / committed_at fields they
+// always have.
+//
+// The S3 path WAS deliberately omitted from the original payload to keep
+// subscribers from short-circuiting the audited read path. We re-introduce
+// it for the analytics sink only — the ingester writes the object key into
+// CH for QC / forensics traceability, but downstream readers must STILL go
+// through the audited Get/OpenAudioStream HTTP path for actual playback.
 type RecordingUploadedEvent struct {
-	RecordingID uuid.UUID `json:"recording_id"`
-	CallID      uuid.UUID `json:"call_id"`
-	TenantID    uuid.UUID `json:"tenant_id"`
-	BytesSize   int64     `json:"bytes_size"`
-	DurationMS  int64     `json:"duration_ms"`
-	SHA256Hex   string    `json:"sha256"`
-	Status      string    `json:"status"`
-	CommittedAt int64     `json:"committed_at"` // unix seconds
+	RecordingID        uuid.UUID `json:"recording_id"`
+	CallID             uuid.UUID `json:"call_id"`
+	TenantID           uuid.UUID `json:"tenant_id"`
+	ProjectID          uuid.UUID `json:"project_id"`           // NEW — joined from calls(project_id).
+	FSNode             string    `json:"fs_node"`              // NEW — joined from calls(freeswitch_node); "" until telephony provenance flows (caveat).
+	S3Key              string    `json:"s3_key"`               // NEW — audio_object_key for CH events_recording_uploaded.s3_key.
+	EncryptionKeyAlias string    `json:"encryption_key_alias"` // NEW — KMS key alias (mirrors call_recordings.kms_key_id).
+	EventID            uuid.UUID `json:"event_id"`             // NEW — fresh uuid.New() per emission; dedup LRU key.
+	BytesSize          int64     `json:"bytes_size"`
+	DurationMS         int64     `json:"duration_ms"`
+	DurationSec        int32     `json:"duration_sec"` // NEW — CH events_recording_uploaded.duration_sec; = floor(duration_ms / 1000).
+	SHA256Hex          string    `json:"sha256"`
+	Status             string    `json:"status"`
+	CommittedAt        int64     `json:"committed_at"` // unix seconds
 }
 
 // RecordingCallDeletedEvent is the payload published on

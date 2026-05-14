@@ -62,6 +62,38 @@ SELECT
     NOT EXISTS (SELECT 1 FROM ins) AS replay
 `
 
+// CallContext is the subset of the calls row the recording service needs
+// to denormalise into its outbox payload. project_id is the FK; fs_node
+// mirrors calls.freeswitch_node and is nullable in v1 (no FreeSWITCH
+// telephony plumbing yet — analytics ingester treats "" as "unknown").
+type CallContext struct {
+	ProjectID uuid.UUID
+	FSNode    string
+}
+
+// LookupCallContext reads (project_id, freeswitch_node) for a single
+// (tenantID, callID) pair inside tx. Returns ErrCallNotFound when the
+// row is missing — symmetric with InsertRecordingIdempotent. v1 callers
+// MUST invoke this BEFORE InsertRecordingIdempotent so the call row's
+// existence check below is folded into one round-trip; the analytics
+// ingest path then uses the returned context to populate the outbox
+// payload.
+func (s *PostgresStore) LookupCallContext(ctx context.Context, tx postgres.Tx, tenantID, callID uuid.UUID) (CallContext, error) {
+	const q = `
+		SELECT project_id, COALESCE(freeswitch_node, '')
+		FROM calls
+		WHERE id = $1 AND tenant_id = $2`
+	var c CallContext
+	err := tx.QueryRow(ctx, q, callID, tenantID).Scan(&c.ProjectID, &c.FSNode)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return CallContext{}, ErrCallNotFound
+	}
+	if err != nil {
+		return CallContext{}, fmt.Errorf("recording.store: lookup call context: %w", err)
+	}
+	return c, nil
+}
+
 // InsertRecordingIdempotent persists r inside the caller's transaction.
 // Idempotent on call_id: a duplicate Commit returns the existing row's full
 // data with replay=true; r.S3Bucket / r.AudioObjectKey / etc. are NOT
