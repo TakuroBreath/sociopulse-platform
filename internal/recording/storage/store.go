@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net/url"
+	"strconv"
 	"sync"
 	"time"
 )
@@ -144,7 +145,7 @@ func (s *LocalObjectStore) PresignedURL(ctx context.Context, bucket, key string,
 		Path:   "/" + key,
 	}
 	q := u.Query()
-	q.Set("expires", fmt.Sprintf("%d", time.Now().UTC().Add(ttl).Unix()))
+	q.Set("expires", strconv.FormatInt(time.Now().UTC().Add(ttl).Unix(), 10))
 	u.RawQuery = q.Encode()
 	return u.String(), nil
 }

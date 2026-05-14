@@ -170,7 +170,7 @@ func TestLocalObjectStore_Put_RoundTrip(t *testing.T) {
 
 	rc, err := s.Get(ctx, "test-bucket", "test/key")
 	require.NoError(t, err)
-	defer rc.Close()
+	t.Cleanup(func() { _ = rc.Close() })
 	got, err := io.ReadAll(rc)
 	require.NoError(t, err)
 	require.Equal(t, payload, got)
@@ -184,8 +184,9 @@ func TestLocalObjectStore_Put_OverwritesExisting(t *testing.T) {
 	require.NoError(t, s.Put(ctx, "b", "k", []byte("v2"), "text/plain"))
 	rc, err := s.Get(ctx, "b", "k")
 	require.NoError(t, err)
-	defer rc.Close()
-	got, _ := io.ReadAll(rc)
+	t.Cleanup(func() { _ = rc.Close() })
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
 	require.Equal(t, []byte("v2"), got)
 }
 
