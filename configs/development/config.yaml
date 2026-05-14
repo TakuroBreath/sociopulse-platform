@@ -157,10 +157,25 @@ recording:
   #   kek-platform-test: "0000000000000000000000000000000000000000000000000000000000000000"
 
 reports:
+  # Plan 13.3 Task 8 — reports module + cmd/worker Consumer config.
+  # async_threshold_* drive the sync-vs-async decision (FR-I3); a sync
+  # request whose window or estimated rows trips either threshold gets
+  # ErrAsyncRequired and is auto-routed to POST /api/reports/{kind}/export
+  # → 202 + JobTicket.
   async_threshold_period_days: 30
   async_threshold_records: 100000
-  job_ttl: 24h
+  # job_ttl is Plan 14's retention window — completed reports_jobs rows
+  # are purged after this. 720h = 30 days.
+  job_ttl: 720h
+  # presigned_url_ttl is the lifetime of the GET URL minted at
+  # MarkSucceededTx (FR-I3). 24h is the canonical contract.
   presigned_url_ttl: 24h
+  # asynq_concurrency: number of Consumer worker goroutines in
+  # cmd/worker. 2 is fine for dev; raise for staging/prod throughput.
+  asynq_concurrency: 2
+  # queue_name: the asynq queue the Consumer drains. Per-module
+  # convention (crm uses "crm", recording uses "recording").
+  queue_name: "reports"
 
 observability:
   otel:

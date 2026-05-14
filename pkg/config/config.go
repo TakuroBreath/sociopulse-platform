@@ -70,6 +70,7 @@ func (c *Config) Validate() error {
 		{"kms", c.KMS.Validate},
 		{"s3", c.S3.Validate},
 		{"analytics", c.Analytics.Validate},
+		{"reports", c.Reports.Validate},
 	}
 	for _, s := range subs {
 		if err := s.fn(); err != nil {

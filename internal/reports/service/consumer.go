@@ -60,10 +60,16 @@ type ConsumerDeps struct {
 	// success tx. Required.
 	ReadyPub *rptevents.ReportReadyPublisher
 
-	// BucketPrefix is "sociopulse-reports" — the final bucket name is
-	// "<BucketPrefix>-<tenant_uuid>" (CONTEXT.md S3 entry; mirrors the
-	// recording-bucket-per-tenant convention).
-	BucketPrefix string
+	// Bucket is the fully-resolved S3 bucket name the rendered artifact
+	// lands in. Project convention is a single shared bucket per
+	// environment (cfg.S3.Buckets.Reports — e.g. "sociopulse-dev-reports")
+	// with tenant isolation enforced via a tenant-prefixed object key,
+	// matching the recording module's S3Config.Recordings layout. Per-
+	// tenant buckets were considered (Plan 13.3 Task 6 draft) but the
+	// project does not provision them: 30 tenants × 2 buckets each =
+	// 60 buckets to track in IAM, vs one bucket + RLS-equivalent key
+	// prefix.
+	Bucket string
 	// PresignTTL is the lifetime of the GET URL we mint on succeed —
 	// production passes 24h per §FR-I3.
 	PresignTTL time.Duration
@@ -188,9 +194,12 @@ func (c *Consumer) handleJobRun(ctx context.Context, task *asynq.Task) error {
 		return c.markFailed(ctx, tenantID, in, jobID, renderErr)
 	}
 
-	// Phase 3: upload + presign.
-	bucket := fmt.Sprintf("%s-%s", c.d.BucketPrefix, tenantID)
-	key := syntheticConsumerKey(in.Kind, in.ActorID, res.Filename, c.d.Now())
+	// Phase 3: upload + presign. Single shared bucket per environment
+	// (cfg.S3.Buckets.Reports); tenant isolation rides on the key's
+	// leading <tenant_uuid>/ component (mirrors recording's bucket +
+	// key strategy — see internal/recording/service/upload.go).
+	bucket := c.d.Bucket
+	key := syntheticConsumerKey(tenantID, in.Kind, in.ActorID, res.Filename, c.d.Now())
 	if err := c.d.ObjectStore.Put(ctx, bucket, key, res.Bytes, res.MIME); err != nil {
 		return c.markFailed(ctx, tenantID, in, jobID, fmt.Errorf("upload: %w", err))
 	}
@@ -297,15 +306,17 @@ func isPermanentRenderError(err error) bool {
 }
 
 // syntheticConsumerKey builds the S3 object key for a rendered artifact.
-// The "<kind>/<yyyy>/<mm>/<dd>/<actor>-<filename>" shape lets ops grep
-// for a tenant's exports on a given day without listing the whole
-// bucket. Within a tenant's bucket the keys do not need to be globally
-// unique — but uniqueness across same-actor / same-second runs is
-// achieved via the asynq-generated jobID embedded in the filename
-// (Task 4 renderers produce filenames like
-// "operator_efficiency_2026-05-14T12-00-00Z.xlsx" with a
-// stable-per-call timestamp).
-func syntheticConsumerKey(kind reportsapi.ReportKind, actor uuid.UUID, filename string, ts time.Time) string {
-	return fmt.Sprintf("%s/%s/%s-%s",
-		kind, ts.UTC().Format("2006/01/02"), actor, filename)
+//
+// Layout: "<tenant_uuid>/<kind>/<yyyy>/<mm>/<dd>/<actor>-<filename>".
+//
+// The leading <tenant_uuid>/ component is the tenant-isolation primitive
+// for the shared reports bucket (Plan 13.3 Task 8 — see ConsumerDeps.Bucket
+// doc for the rationale). Day-grain folder structure lets ops grep for a
+// tenant's exports on a given day without listing the whole bucket. Within
+// the day/actor folder the renderer-generated timestamp in <filename>
+// disambiguates same-second runs (Task 4 renderers produce filenames like
+// "operator_efficiency_2026-05-14T12-00-00Z.xlsx").
+func syntheticConsumerKey(tenantID uuid.UUID, kind reportsapi.ReportKind, actor uuid.UUID, filename string, ts time.Time) string {
+	return fmt.Sprintf("%s/%s/%s/%s-%s",
+		tenantID, kind, ts.UTC().Format("2006/01/02"), actor, filename)
 }

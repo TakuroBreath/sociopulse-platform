@@ -1,0 +1,350 @@
+openapi: 3.1.0
+info:
+  title: СоциоПульс — Reports API
+  version: 0.1.0
+  description: |
+    Reports module HTTP API (Plan 13.3). Consumed by sociopulse-web Plan 19
+    (AdminReports page) to drive the admin reports dashboard.
+
+    Five endpoints, all under /api/reports, all gated by admin RBAC
+    (`requireAdmin` middleware combining JWT role check + RBACChecker
+    matrix). Per-jobID routes additionally apply a tenant guard that
+    resolves the job's owning tenant via BypassRLS and returns 404
+    reports.job_not_found on cross-tenant access (existence-probe
+    defence — NOT 403).
+
+    Sync path: POST /api/reports/{kind}/export tries Runner.Run first;
+    if the request trips the async threshold (period > 30d OR estimated
+    rows > 100k OR kind=custom), the handler enqueues a job and returns
+    202 + JobTicket. Custom reports skip sync entirely.
+
+    Async path: GET /api/reports/jobs/{jobID} polls state; once state =
+    "succeeded", GET /api/reports/jobs/{jobID}/download returns 302 →
+    24h presigned URL (FR-I3).
+
+    Error envelope is the canonical {code, message} shape (matches
+    pkg/httputil and the recording module precedent).
+servers:
+  - url: https://api.sociopulse.local
+    description: Production
+  - url: http://localhost:8080
+    description: Local dev (make dev-up)
+tags:
+  - name: reports
+    description: Predefined and custom reports.
+paths:
+  /api/reports:
+    get:
+      tags: [reports]
+      summary: List available report kinds.
+      description: |
+        Returns the 7 report kinds (6 predefined + custom). Stable order
+        for deterministic UI rendering.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  kinds:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ReportKind"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/reports/{kind}/export:
+    post:
+      tags: [reports]
+      summary: Run a predefined report.
+      description: |
+        Tries the synchronous path via Runner.Run. If the request trips
+        the async threshold (Runner returns ErrAsyncRequired), the handler
+        auto-routes by enqueuing the job and returning 202 + JobTicket.
+        All other errors map to the canonical {code, message} envelope.
+
+        On the sync success path the response body is the raw rendered
+        bytes with Content-Type set to the renderer's MIME (xlsx / csv /
+        pdf). The HTTP layer does not re-encode — Render owns the wire
+        shape.
+      parameters:
+        - name: kind
+          in: path
+          required: true
+          schema:
+            $ref: "#/components/schemas/PredefinedReportKind"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenderRequest"
+      responses:
+        "200":
+          description: Sync — file bytes inline. Content-Type per format.
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "202":
+          description: Async — job enqueued. Poll /api/reports/jobs/{jobID}.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobTicket"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "422": { $ref: "#/components/responses/TooLarge" }
+  /api/reports/custom:
+    post:
+      tags: [reports]
+      summary: Run a custom report. Always asynchronous.
+      description: |
+        Custom reports skip the sync path entirely — the user explicitly
+        asks for "async receipt" by hitting this endpoint. Returns 202
+        + JobTicket on success.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RenderRequest"
+      responses:
+        "202":
+          description: Async — job enqueued.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/JobTicket"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+  /api/reports/jobs/{jobID}:
+    get:
+      tags: [reports]
+      summary: Get job status.
+      description: |
+        Returns the Job DTO. While state ∈ {queued, running}, bytes_size
+        is 0 and filename/download_url/error are empty strings. They are
+        populated on succeed/fail.
+
+        Per-tenant access is enforced by a guard middleware that resolves
+        the job's owning tenant via BypassRLS and returns 404
+        reports.job_not_found on cross-tenant access (existence-probe
+        defence).
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          description: asynq task id (text PK on reports_jobs).
+          schema:
+            type: string
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Job"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+  /api/reports/jobs/{jobID}/download:
+    get:
+      tags: [reports]
+      summary: Download the rendered artifact.
+      description: |
+        Returns 302 → presigned URL on a succeeded job (24h TTL, minted
+        at MarkSucceededTx and persisted on the row — Q3 decision). The
+        URL is single-use from the client's perspective; expired URLs
+        return 403 from S3, and the API contract documents the 24h
+        window.
+
+        Any non-succeeded state (queued, running, failed, canceled) →
+        409 reports.job_not_ready. Missing row OR cross-tenant access →
+        404 reports.job_not_found.
+      parameters:
+        - name: jobID
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "302":
+          description: Redirect to the 24h presigned URL.
+          headers:
+            Location:
+              schema: { type: string }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "404": { $ref: "#/components/responses/NotFound" }
+        "409": { $ref: "#/components/responses/Conflict" }
+components:
+  schemas:
+    ReportKind:
+      type: string
+      enum:
+        - operator_efficiency
+        - project_summary
+        - calls_by_status
+        - finance
+        - quality_control
+        - hourly_activity
+        - custom
+      description: |
+        One of the six predefined report kinds plus the catch-all "custom".
+    PredefinedReportKind:
+      type: string
+      enum:
+        - operator_efficiency
+        - project_summary
+        - calls_by_status
+        - finance
+        - quality_control
+        - hourly_activity
+      description: |
+        Predefined kinds accepted by POST /api/reports/{kind}/export.
+        "custom" is rejected here and must use POST /api/reports/custom.
+    ExportFormat:
+      type: string
+      enum: [xlsx, csv, pdf]
+    JobState:
+      type: string
+      enum: [queued, running, succeeded, failed, canceled]
+    RenderRequest:
+      type: object
+      required: [format, window_from, window_to]
+      properties:
+        format:
+          $ref: "#/components/schemas/ExportFormat"
+        params:
+          type: object
+          additionalProperties: true
+          description: |
+            Renderer-specific bag (e.g. project_id, region_filter,
+            include_operator_breakdown). Schema is kind-dependent —
+            see internal/reports/templates/{kind}/render.go for the
+            recognised keys per kind.
+        window_from:
+          type: string
+          format: date-time
+          description: Half-open window start (RFC 3339).
+        window_to:
+          type: string
+          format: date-time
+          description: Half-open window end (RFC 3339).
+    JobTicket:
+      type: object
+      required: [job_id, queued_at]
+      properties:
+        job_id:
+          type: string
+          description: asynq task id; durable across retries.
+        queued_at:
+          type: string
+          format: date-time
+    Job:
+      type: object
+      required: [id, tenant_id, kind, format, state, created_by, created_at]
+      properties:
+        id: { type: string }
+        tenant_id: { type: string, format: uuid }
+        kind: { $ref: "#/components/schemas/ReportKind" }
+        format: { $ref: "#/components/schemas/ExportFormat" }
+        params:
+          type: object
+          additionalProperties: true
+        window:
+          type: object
+          properties:
+            from: { type: string, format: date-time }
+            to: { type: string, format: date-time }
+        state: { $ref: "#/components/schemas/JobState" }
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        finished_at:
+          type: string
+          format: date-time
+          nullable: true
+        bytes_size:
+          type: integer
+          format: int64
+          description: |
+            0 while state ∈ {queued, running}; populated on succeed.
+        filename:
+          type: string
+          description: Empty until state=succeeded.
+        download_url:
+          type: string
+          description: |
+            Empty until state=succeeded. 24h presigned URL minted at
+            MarkSucceededTx (FR-I3).
+        error:
+          type: string
+          description: Empty until state=failed.
+        created_by:
+          type: string
+          format: uuid
+        created_at:
+          type: string
+          format: date-time
+    ErrorEnvelope:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable low-cardinality string suitable for logs & metrics:
+            reports.unknown_kind, reports.unsupported_format,
+            reports.invalid_params, reports.window_invalid,
+            reports.async_required, reports.too_large,
+            reports.job_not_found, reports.job_not_ready,
+            reports.canceled, reports.forbidden, reports.unauthenticated,
+            reports.internal.
+        message:
+          type: string
+          description: Human-readable detail. NEVER assert against this — assert against `code`.
+  responses:
+    BadRequest:
+      description: 400 — invalid payload, unknown kind, unsupported format, invalid window, or async required.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: 401 — missing or invalid JWT.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: 403 — caller lacks admin / supervisor RBAC.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NotFound:
+      description: 404 — job missing OR cross-tenant access (existence-probe defence).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Conflict:
+      description: 409 — job not in a downloadable state (queued / running / failed / canceled).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    TooLarge:
+      description: 422 — render exceeds the per-format size cap (PDF row cap, etc.).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+security:
+  - BearerAuth: []

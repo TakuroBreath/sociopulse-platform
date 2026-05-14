@@ -131,16 +131,16 @@ func buildIntegrationConsumer(
 	pw := outbox.NewPostgresWriter()
 
 	c := reportsvc.NewConsumer(reportsvc.ConsumerDeps{
-		Server:       nil,
-		Analytics:    analytics,
-		Pool:         pool,
-		ObjectStore:  objStore,
-		Audit:        reportsvc.NewAuditEmitter(pw),
-		ReadyPub:     rptevents.NewReportReadyPublisher(pw),
-		BucketPrefix: "sociopulse-reports",
-		PresignTTL:   24 * time.Hour,
-		Logger:       zaptest.NewLogger(t),
-		Now:          func() time.Time { return time.Now().UTC() },
+		Server:      nil,
+		Analytics:   analytics,
+		Pool:        pool,
+		ObjectStore: objStore,
+		Audit:       reportsvc.NewAuditEmitter(pw),
+		ReadyPub:    rptevents.NewReportReadyPublisher(pw),
+		Bucket:      "sociopulse-test-reports",
+		PresignTTL:  24 * time.Hour,
+		Logger:      zaptest.NewLogger(t),
+		Now:         func() time.Time { return time.Now().UTC() },
 	})
 
 	// Force the flip closures to use the test-known jobID — production's

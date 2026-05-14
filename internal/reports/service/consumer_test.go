@@ -196,16 +196,16 @@ func buildConsumer(t *testing.T, analytics analyticsapi.ServiceRO) *consumerHarn
 	flip := &recordingFlip{}
 
 	c := reportsvc.NewConsumer(reportsvc.ConsumerDeps{
-		Server:       nil, // not used by handleJobRun (only by Run)
-		Analytics:    analytics,
-		Pool:         pool,
-		ObjectStore:  objStore,
-		Audit:        reportsvc.NewAuditEmitter(audit),
-		ReadyPub:     rptevents.NewReportReadyPublisher(ready),
-		BucketPrefix: "sociopulse-reports",
-		PresignTTL:   24 * time.Hour,
-		Logger:       zaptest.NewLogger(t),
-		Now:          consumerNowFn,
+		Server:      nil, // not used by handleJobRun (only by Run)
+		Analytics:   analytics,
+		Pool:        pool,
+		ObjectStore: objStore,
+		Audit:       reportsvc.NewAuditEmitter(audit),
+		ReadyPub:    rptevents.NewReportReadyPublisher(ready),
+		Bucket:      "sociopulse-test-reports",
+		PresignTTL:  24 * time.Hour,
+		Logger:      zaptest.NewLogger(t),
+		Now:         consumerNowFn,
 	})
 	reportsvc.SetConsumerFlipsForTest(c, flip.markRunning, flip.markSucceeded, flip.markFailed)
 
@@ -242,10 +242,14 @@ func TestConsumer_HandleJobRun_HappyPath(t *testing.T) {
 	require.Equal(t, queueTenant, h.pool.tenants[0])
 	require.Equal(t, queueTenant, h.pool.tenants[1])
 
-	// Put + Presign happened: bucket is "sociopulse-reports-<tenant>",
-	// key follows the kind/yyyy/mm/dd/<actor>-<filename> layout.
+	// Put + Presign happened: single shared bucket per environment
+	// (cfg.S3.Buckets.Reports == "sociopulse-test-reports" in tests),
+	// tenant isolation rides on the leading <tenant>/ component of the
+	// key. Layout: "<tenant>/<kind>/<yyyy>/<mm>/<dd>/<actor>-<filename>".
 	require.Len(t, h.store.putCalls, 1)
-	require.Equal(t, "sociopulse-reports-"+queueTenant.String(), h.store.putCalls[0].bucket)
+	require.Equal(t, "sociopulse-test-reports", h.store.putCalls[0].bucket)
+	require.True(t, strings.HasPrefix(h.store.putCalls[0].key, queueTenant.String()+"/"),
+		"key starts with the tenant UUID followed by '/'")
 	require.Contains(t, h.store.putCalls[0].key, string(reportsapi.KindOperatorEfficiency))
 	require.Contains(t, h.store.putCalls[0].key, "2026/05/14",
 		"the synthetic key embeds the UTC date of c.d.Now()")
@@ -375,15 +379,15 @@ func TestConsumer_HandleJobRun_ObjectStorePutErrorIsTransient(t *testing.T) {
 	// Substitute the object store for one whose Put returns an error.
 	failingStore := &failingObjectStore{err: errors.New("s3-down")}
 	c := reportsvc.NewConsumer(reportsvc.ConsumerDeps{
-		Analytics:    fa,
-		Pool:         h.pool,
-		ObjectStore:  failingStore,
-		Audit:        reportsvc.NewAuditEmitter(h.audit),
-		ReadyPub:     rptevents.NewReportReadyPublisher(h.ready),
-		BucketPrefix: "sociopulse-reports",
-		PresignTTL:   24 * time.Hour,
-		Logger:       zaptest.NewLogger(t),
-		Now:          consumerNowFn,
+		Analytics:   fa,
+		Pool:        h.pool,
+		ObjectStore: failingStore,
+		Audit:       reportsvc.NewAuditEmitter(h.audit),
+		ReadyPub:    rptevents.NewReportReadyPublisher(h.ready),
+		Bucket:      "sociopulse-test-reports",
+		PresignTTL:  24 * time.Hour,
+		Logger:      zaptest.NewLogger(t),
+		Now:         consumerNowFn,
 	})
 	reportsvc.SetConsumerFlipsForTest(c, h.flip.markRunning, h.flip.markSucceeded, h.flip.markFailed)
 
@@ -459,16 +463,16 @@ func TestConsumer_Run_ShutdownOnCtxCancel(t *testing.T) {
 
 	srv := newFakeAsynqServer()
 	c := reportsvc.NewConsumer(reportsvc.ConsumerDeps{
-		Server:       srv,
-		Analytics:    &fakeAnalytics{},
-		Pool:         &fakeConsumerPool{},
-		ObjectStore:  storage.NewLocalObjectStore(),
-		Audit:        reportsvc.NewAuditEmitter(&fakeOutboxRecorder{}),
-		ReadyPub:     rptevents.NewReportReadyPublisher(&fakeOutboxRecorder{}),
-		BucketPrefix: "sociopulse-reports",
-		PresignTTL:   24 * time.Hour,
-		Logger:       zaptest.NewLogger(t),
-		Now:          consumerNowFn,
+		Server:      srv,
+		Analytics:   &fakeAnalytics{},
+		Pool:        &fakeConsumerPool{},
+		ObjectStore: storage.NewLocalObjectStore(),
+		Audit:       reportsvc.NewAuditEmitter(&fakeOutboxRecorder{}),
+		ReadyPub:    rptevents.NewReportReadyPublisher(&fakeOutboxRecorder{}),
+		Bucket:      "sociopulse-test-reports",
+		PresignTTL:  24 * time.Hour,
+		Logger:      zaptest.NewLogger(t),
+		Now:         consumerNowFn,
 	})
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -504,16 +508,16 @@ func TestConsumer_Run_PropagatesServerError(t *testing.T) {
 	srv.runReturn = sentinel
 
 	c := reportsvc.NewConsumer(reportsvc.ConsumerDeps{
-		Server:       srv,
-		Analytics:    &fakeAnalytics{},
-		Pool:         &fakeConsumerPool{},
-		ObjectStore:  storage.NewLocalObjectStore(),
-		Audit:        reportsvc.NewAuditEmitter(&fakeOutboxRecorder{}),
-		ReadyPub:     rptevents.NewReportReadyPublisher(&fakeOutboxRecorder{}),
-		BucketPrefix: "sociopulse-reports",
-		PresignTTL:   24 * time.Hour,
-		Logger:       zaptest.NewLogger(t),
-		Now:          consumerNowFn,
+		Server:      srv,
+		Analytics:   &fakeAnalytics{},
+		Pool:        &fakeConsumerPool{},
+		ObjectStore: storage.NewLocalObjectStore(),
+		Audit:       reportsvc.NewAuditEmitter(&fakeOutboxRecorder{}),
+		ReadyPub:    rptevents.NewReportReadyPublisher(&fakeOutboxRecorder{}),
+		Bucket:      "sociopulse-test-reports",
+		PresignTTL:  24 * time.Hour,
+		Logger:      zaptest.NewLogger(t),
+		Now:         consumerNowFn,
 	})
 
 	ctx := context.Background()

@@ -42,6 +42,7 @@ import (
 	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/storage"
 	recwire "github.com/sociopulse/platform/internal/recording/wire"
+	"github.com/sociopulse/platform/internal/reports"
 	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/eventbus"
@@ -319,11 +320,17 @@ func run(ctx context.Context, configDir string) error {
 	// behaviour, exercised by TestModule_LocatorCrmFallbacks).
 	// analytics.Module{} MUST come AFTER any future crm.Module so the
 	// locator carries crm.ProjectService when Register runs.
+	// Plan 13.3 Task 8 — reports.Module. MUST come AFTER analytics so the
+	// locator carries analytics.MetricsQuery when Register runs. The
+	// ObjectStore wired here is the same instance recording uses; nil
+	// (e.g. dev env without local_keks) falls through to a WARN inside
+	// reports.Register and the async Queue stays disabled.
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
 		recordingModule,
 		analytics.New(analytics.Config{Registerer: metrics.Registry}),
+		reports.New(reports.Config{ObjectStore: recordingObjects}),
 	}}
 	if err := registerModules(providers, deps, logger, redisErr); err != nil {
 		return err

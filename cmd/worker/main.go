@@ -21,6 +21,12 @@
 //     Shares the "dialer-call-events" JetStream queue group with
 //     cmd/api's Module.Register subscription so events load-balance
 //     across replicas.
+//   - reports.Consumer (Plan 13.3 Task 8) — drains the "reports" asynq
+//     queue, dispatching to the renderer-per-kind compute path then
+//     uploading the artifact + signing the 24h presigned URL +
+//     flipping the reports_jobs state + emitting audit/report-ready
+//     outbox events, all atomically per-tenant. Degraded boot when
+//     Redis or ClickHouse unreachable.
 //
 // Composition root:
 //
@@ -296,6 +302,20 @@ func run(ctx context.Context, configDir string) error {
 	}
 	defer dialerEventsBoot.Close(logger)
 
+	// 4f. Reports asynq Consumer — Plan 13.3 Task 8. Drains the
+	//     "reports" queue (cfg.Reports.QueueName), running the renderer
+	//     dispatcher + uploading the artifact + signing the 24h
+	//     presigned URL + flipping the row state + appending audit +
+	//     report-ready outbox events, all atomically inside a per-tenant
+	//     transaction. Degraded boot is the rule: missing Redis / CH /
+	//     ObjectStore / bucket name → nil + WARN; the other worker
+	//     daemons keep running.
+	reportsRunner, err := buildReportsBoot(ctx, cfg, pool, rdb, logger)
+	if err != nil {
+		return fmt.Errorf("build reports consumer: %w", err)
+	}
+	defer reportsRunner.Close(logger)
+
 	// 5. /healthz listener. k8s readiness probes hit this; we keep
 	//    the surface tiny (just liveness) because the orchestrator's
 	//    own metrics dashboard is the readiness source of truth for
@@ -327,6 +347,11 @@ func run(ctx context.Context, configDir string) error {
 	if analyticsRunner != nil {
 		g.Go(func() error {
 			return analyticsRunner.run(gctx, logger.Named("analytics"))
+		})
+	}
+	if reportsRunner != nil {
+		g.Go(func() error {
+			return reportsRunner.run(gctx, logger.Named("reports"))
 		})
 	}
 	g.Go(func() error {
