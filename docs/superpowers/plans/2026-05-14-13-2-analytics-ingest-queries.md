@@ -2400,11 +2400,35 @@ Q4-Q12 resolved at plan-write time in `docs/references/plan-13-analytics.md`. Ne
 
 ---
 
-## Amendments
+## Amendments (post-execution 2026-05-14)
 
-_(filled at close-out; one entry per spec deviation discovered during execution)_
+- **Task 1 — `dialer/api.SubjectAnalytics*` constants deleted (not added).** Plan §1.5-1.7 instructed verifying the existing constants in `internal/dialer/api/events.go:25-27` and asserting them with a test. On execution, the constants were verified to be unused in production publish paths (only the new test referenced them); the code-quality review flagged this as a silent-drift trap (canonical source of truth lives in `internal/analytics/api/events.go`, not in the producer's api/). Task 1 fix-up commit `8188d6f` deleted them + the regression test. The analyticsapi import in `internal/dialer/fsm/audit.go` now sources `SubjectCallsAnalytics`/`SubjectOperatorStateAnalytics` from the consumer-side package. No behavioural change at the bus layer.
 
-(none yet)
+- **Task 2 — `clickhouse-go-isolation` depguard rule CREATED, not extended.** Plan §2.8 said the rule already existed for Plan 13.1 (`cmd/migrator` allow-listed) and Task 2 would add `internal/analytics/**`. On execution the rule did NOT exist; the implementer created it from scratch using `pgxpool-isolation` / `yandex-sdk-isolation` as the shape template. Allow-list: `cmd/migrator/**` + `internal/analytics/**`. No spec drift; the rule shape and effect match the plan intent exactly.
+
+- **Task 3 — `EventEnvelope` dead-code deletion.** Plan §3 referenced the `internal/analytics/api/dto.go::EventEnvelope` type as a "legacy abstraction the ingester bypasses". On execution the type + 3 `EventKind*` constants were verified to have zero consumers anywhere in the codebase (no producer emitted, no consumer read). Task 3 fix-up commit `8a5a664` deleted them. Plan reviewer caught this as IMPORTANT (#4) — "trap for future readers". No spec violation; the plan's `dto.go` reference was descriptive, not prescriptive.
+
+- **Task 3 — `context.WithoutCancel` for drain + count-threshold flushes.** Plan §3.5 sketched drain via `context.WithTimeout(context.Background(), DrainTimeout)` with `//nolint:contextcheck` suppression. Task 3 fix-up commit `8a5a664` switched to `context.WithTimeout(context.WithoutCancel(ctx), DrainTimeout)` — propagates trace/log values, drops cancellation, no lint suppression needed. Count-threshold flushes (inside push-handlers which have no ctx) capture `runCtx` on the struct in Run() and use `context.WithoutCancel(p.runCtx)`. Forward-looking improvement; behaviour identical for v1 (no values to propagate yet).
+
+- **Task 4 — MV column names locked from migrations, not plan sketch.** Plan §4.2 sketched the Calls query with column names `total / success_count / fail_count / refusal_count / total_dur_sec`. On execution the implementer read `migrations/clickhouse/000004_mv_calls_hourly.up.sql` and found the actual MV state columns are `cnt / duration_sec / distinct_calls`. SQL adapted accordingly. Same pattern for the other two MVs — read the migration before writing the SELECT. No spec drift; plan §Step 4.2 explicitly said "implementer Reads `migrations/clickhouse/000004_mv_calls_hourly.up.sql` to verify the MV's actual column tuple before pasting the SELECT".
+
+- **Task 4 — `crm.ProjectService.GetProgress` via locator (Q12 confirmed).** Plan §4 referenced `crm.ProjectService.AggregateProgress` in one earlier sketch; that was a leftover from the per-plan references file's pre-resolution wording. Final implementation uses `GetProgress(ctx, id) (*ProjectProgress, error)` (the canonical service method — `AggregateProgress` is the sibling STORE port that runs inside a Tx). References Q12 was updated at plan-write time to match. No spec violation.
+
+- **Task 4 — `RegionProgress` per-region Plan field uses `ProjectProgress.TargetCount` uniformly.** The crm port returns a single `TargetCount` representing the project's total quota. v1 maps this uniformly across regions (every region gets the same Plan); a future plan that adds per-region quotas to the crm port can replace the uniform fallback. Documented in the QueryService code comment + here as v1 design choice.
+
+- **Task 5 — `MountAnalyticsRoutes` takes `gin.IRouter` not `*gin.Engine`.** Plan §5.3 sketch said `*gin.Engine`. Implementer chose `gin.IRouter` (the broader interface) so tests can pass `gin.New()` (an Engine that satisfies IRouter) AND so future module wiring can pass a `gin.RouterGroup` if needed. Strictly broader; no caller breakage. cmd/api still passes the concrete Engine via `Deps.HTTPRouter`.
+
+- **Task 5 — `analytics.New(Config{Registerer: …})` not `analytics.Module{}` literal.** Plan §5.7 sketched `analytics.Module{}` in the cmd/api providers walk. On execution the Module has a pointer receiver, so the literal doesn't satisfy the `modules.Module` interface. Implementer switched to `analytics.New(analytics.Config{Registerer: metrics.Registry})` — also threads the Prometheus registry so query metrics land on the shared `/metrics` endpoint. Pattern matches `recording.New` and `realtime.New`.
+
+- **Task 5 — `crm.Module` is NOT in cmd/api today.** Plan §5.7 said analytics.Module must come AFTER crm.Module in the providers walk. `grep -rn "crm.Module" cmd/api/` returns empty; the crm module exists (`internal/crm/`) but isn't wired into cmd/api. The Q12 fallback (nil-locator → Plan=0) is therefore exercised by every production boot. When crm.Module is added in a future plan, analytics.Module's `RegionProgress.Plan` will start returning real values automatically — no analytics-side changes needed.
+
+- **Task 6 — `internal/analytics/wire/ingest.go` skipped.** Plan §6.5 sketched a `wire.BuildIngestPipeline(BuildDeps) (*IngestPipeline, error)` factory in `internal/analytics/wire/`. Task 6 inlined the equivalent as `buildAnalyticsIngest` in `cmd/worker/analytics.go` since cmd/worker is the only caller. The wire/ package would have been single-consumer indirection. Plan-acceptable; the contract (errgroup-runnable IngestPipeline with degraded-boot matrix) is met at the cmd/worker layer.
+
+- **Task 6 — `cmd/worker/eventbus.go` is net-new infrastructure.** Plan §6 framed the NATS open helper as "mirroring cmd/api's existing helper". On execution cmd/worker had NO NATS infrastructure today — `openNATS` + `redactNATSURLs` are the first NATS pieces in the worker binary. They mirror cmd/api byte-for-byte (1s timeout, publisher-Close-on-subscriber-failure cleanup, `url.User`→`***` redaction). The publisher is returned for symmetry; currently unused but available for future worker-side publishers.
+
+- **Task 6 — local variable `analyticsBoot` → `analyticsRunner`.** Code-quality reviewer caught this — the original local-var name shadowed the same-package type `analyticsBoot`. Task 6 fix-up commit `290e7d5` renamed to `analyticsRunner` (matches cmd/api's `recordingModule`/`dialerModule`/`realtimeModule` convention). No behavioural change; defence against a future `var x *analyticsBoot` insertion failing to compile.
+
+Net effect: 12 deviations across 6 tasks, all documented + behavior-preserving + tested. No spec violations (verified by 12 review subagent dispatches — 6 spec, 6 code-quality — across the full plan execution).
 
 ---
 

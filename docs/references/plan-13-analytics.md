@@ -501,7 +501,33 @@ CH work) doesn't re-discover them the hard way.
     execution); not a Plan 13.1 issue, just an environmental note.
     If CI is going to run integration, allocate ≥8GB to the runner.
 
-### 13.2 (TBD)
+### 13.2 (post-execution 2026-05-14)
+
+The producer-consumer pipeline turned out to be the most subject-discipline-heavy work in Plan 13 — most lessons are about NATS subjects, payload field discipline, and the cross-tenant vs per-tenant distinction. Document them here so the next sub-plan (13.3 reports) and Plan 14 (billing) don't re-discover them the hard way.
+
+1. **The `dialer/api.SubjectAnalytics*` constants existed since Plan 13.1 but were never used in production publish code.** The plan template referenced them as if they were the canonical source of truth; verifying via `grep -rn "api\.SubjectAnalytics" --include='*.go'` showed only the new test file referencing them. Task 1's fix-up deleted them; the canonical source of truth is `internal/analytics/api/events.go` (the consumer-side declaration). **Rule:** for cross-tenant analytics subjects, the analytics module owns the constant; producers import it via `analyticsapi "github.com/sociopulse/platform/internal/analytics/api"`. Duplicating the literal in the producer's api/ is a silent-drift trap.
+
+2. **Dialer FSM doesn't have all the fields the CH `events_calls` table needs.** Q8/Q9 caveats — `HangupCause` lives in telephony-bridge's FreeSWITCH event lifecycle; `RegionCode` requires the respondent row which the FSM doesn't carry; `TrunkUsed`/`AttemptNo` similar. v1 emits empty-string sentinels (`""`) which the analytics ingester accepts. A future plan that wires telephony-bridge → analytics will fill them in; until then, the dashboard's calls breakdown is partial-fidelity. Documented in `docs/architecture/analytics-mv.md` § Operational caveats (TODO Plan 13.2 close-out).
+
+3. **`Window.Validate()` returns the bare `ErrInvalidWindow` sentinel — no wrapping.** This is intentional so callers can `errors.Is(err, api.ErrInvalidWindow)` at every layer (service → HTTP handler → JSON envelope). Wrapping it via `fmt.Errorf("ctx: %w", err)` would still survive `errors.Is`, but the bare-sentinel return matches the project's convention for shallow validation errors. Don't wrap unless you have layered diagnostic context to add.
+
+4. **`gin`'s form binding can't decode `uuid.UUID`** — it treats `[16]byte` as a multi-value form array. Symptoms: `["uuid-string"] is not valid value for uuid.UUID` when binding query params with `form:"x" uuid.UUID`. Fix: explicit `parseRequiredUUID(c, "x")` / `parseOptionalUUID(c, "x")` helpers calling `uuid.Parse(c.Query("x"))`. The recording module already established this pattern in `search_handler.go::parseSearchQuery` — re-use, don't reinvent.
+
+5. **Project canonical error envelope is `{ "code": "<stable>", "message": "<human>" }`** per `internal/recording/transport/http.ErrorEnvelope` (matches `pkg/httputil/error_handler.go`). NOT `{ "error": "..." }` (which is `pkg/middleware/auth`'s shape, intentionally different — auth's envelope predates the canonical one and isn't part of the public REST contract). Analytics HTTP handlers mirror the recording shape. Stable `code` values matter — dashboards/log aggregators pivot on them.
+
+6. **`store.Config.{BatchSize, FlushInterval}` are mandatory non-zero** at Validate-time (Task 2 enforced this) but are only used by the ingest path. The query path doesn't batch; cmd/api's `Module.Register` passes `BatchSize=1, FlushInterval=1s` placeholders. If the read-side becomes more common than ingest, consider splitting `store.Config` into `ReadConfig` + `WriteConfig`.
+
+7. **`gzip.Reader.Close` validates the CRC + length trailer.** `io.ReadAll(gz)` alone does NOT consume the trailer — a truncated payload could pass through silently if you `defer gz.Close()` and ignore its error. Always propagate `gz.Close()` from `gunzip`. Same pattern applies to any `compress/zlib`/`compress/flate` reader.
+
+8. **Cache invalidation: TTL-only is the v1 choice (Q6).** Project rename / delete is rare; cached `OperatorComparisonRow.DisplayName` is stale for at most 5min, which is acceptable for an admin dashboard. If real-time freshness becomes a requirement, subscribe to `tenant.<t>.crm.project.deleted` → `DEL analytics:{tenant_id}:*` (Redis SCAN+DEL pattern). The locator-port pattern already in place makes adding an explicit invalidator straightforward.
+
+9. **clickhouse-go/v2's `clickhouse.Open(opts)` Pings during connect ONLY when explicit Ping is called** — the dial is lazy. The wrapper's constructor MUST call `Ping(ctx)` to surface connection failures at boot. Failure path: `_ = drv.Close()` to release the goroutines + return wrapped err. NEVER return a non-nil `*Conn` whose underlying driver hasn't been Ping'd.
+
+10. **`StoreReader` + `StoreReaderAdapter` (Task 4) mirrors `StoreWriter` + `StoreAdapter` (Task 3).** Both ports exist because `store.{Insert,Query}*` are package-level functions, NOT methods on `*store.Conn`. The adapter is a thin wrapper that turns free functions into interface methods. Tests use `fakeStoreReader`/`fakeStoreWriter` satisfying the same port — no real CH needed for the QueryService/IngestPipeline unit tests.
+
+11. **`context.WithoutCancel` is the right primitive for "propagate values but not cancellation"**. Task 3's drain ctx uses `context.WithTimeout(context.WithoutCancel(ctx), DrainTimeout=5s)` — no `//nolint:contextcheck` suppression needed. Same pattern for count-threshold flushes that run inside the bus's push-handler (which carries no ctx). Capture `runCtx` on the struct in Run() before subscribers fire; handlers read it via `context.WithoutCancel(p.runCtx)`.
+
+12. **goleak's `IgnoreTopFunction("internal/poll.runtime_pollWait")` is overly broad.** That's the top-of-stack for ANY netpoll-blocked goroutine — including a leaked clickhouse-go pool connection. Use SPECIFIC top-function names instead: `net/http.(*persistConn).readLoop`, `net/http.(*persistConn).writeLoop` for docker; the testcontainers reaper; quic-go's baseServer.run. Adjust the list when a new pattern surfaces in a future testcontainers bump — never reach for `runtime_pollWait`.
 
 ### 13.3 (TBD)
 
