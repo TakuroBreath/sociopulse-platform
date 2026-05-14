@@ -151,4 +151,50 @@ func BuildAAD(tenantID uuid.UUID, scope, rowID string) []byte {
 
 ## Production lessons
 
-_Filled at close-out._
+_Filled at close-out 2026-05-14, after the 6-task wave landed cleanly across 7 commits + 2 fix-up commits._
+
+### Audit → plan → fix loop
+
+1. **Adversarial-audit-then-fix worked.** Six parallel review agents found 5 CRITICAL findings that real users would have hit. Plans wrote, agents implemented, reviewers caught one more (the recording-flow AAD HIGH that the implementer wrongly deferred). The total cost (~6 audit agents + 6 implementers + 6 reviewers + 2 fix-up agents) was a fraction of what a missed cross-tenant breach in prod would cost.
+2. **Two-stage review caught real bugs.** Task 5 review caught a Prometheus naming convention bug (`_total` suffix on a gauge) before any dashboard/alert locked the name in. Task 6 review caught that the recording-flow refactor was incorrectly deferred — implementer's justification ("non-empty AAD") missed that AAD must bind row identifier, not just tenant. Both fixes landed as fix-up commits before the plan close-out.
+3. **Implementer scope expansion is OK when the spec demands it.** Tasks 1 and 6 both expanded scope (Task 1 into realtime + analytics for `CrmReader` signature propagation; Task 6 into dialer retry adapter + cmd/worker decryptor for `respondentID` AAD reproducibility). The "don't touch X" hint in implementer prompts is fine for net-new code but cascades on signature changes are unavoidable. Future plans should mark "expected ripple targets: ..." sections explicitly.
+
+### Cross-tenant guard design lessons
+
+4. **404, not 403, on mismatch.** The middleware returns 404 with no body on cross-tenant attempts. Returning 403 ("forbidden") would let an attacker enumerate which IDs exist in another tenant. The plan got this right and the reviewer confirmed.
+5. **Explicit `callerTenantID` parameter is defence-in-depth.** Even with the middleware in place, services that receive `callerTenantID` and run under `WithTenant(callerTenantID, ...)` will hit RLS rejection if a future endpoint forgets the middleware. The surveys module chose to thread `tenantIDFromContext` instead — equivalent semantically, but a future refactor that removes the ctx key would silently regress.
+6. **Out-of-scope finding**: `POST /api/calls/:id/hangup` in `internal/dialer/transport/http` was NOT in the original audit list (dialer was not in the C1 module scope) but the reviewer flagged it: an authenticated operator from Tenant A who learns a Tenant B `call_id` could hangup that call. **Tracked for Plan 14.**
+
+### AEAD / envelope encryption lessons
+
+7. **AAD must bind the row identifier, not just the tenant.** This was the single most important lesson from Task 6. The implementer's deferral justification ("recording flow already passes non-empty AAD") was technically true but missed the security model: a same-tenant cross-row swap is still possible if AAD only carries tenant_id. `BuildAAD(tenantID, scope, rowID)` is the canonical pattern.
+8. **Length-prefixed AAD encoding is required.** Naive concatenation `tenant.String() + scope + rowID` is vulnerable to ambiguity-attack splits (e.g., `("t", "auth.user.phone", "id")` vs `("t", "auth.user", "phone.id")`). The `binary.AppendUvarint`-per-field encoding eliminates the class.
+9. **Versioned-DEK byte dispatch for backward compat.** Three byte 0 dispatch paths (`0x00` unprefixed legacy, `0x01` versioned legacy, `0x02` new with BuildAAD) was the only safe way to introduce AAD changes to a system with existing encrypted data. **Caveat**: for the recording flow, no DEKs existed in production (cmd/recording-uploader still a stub) so the fix-up did a clean refactor without legacy paths.
+10. **Service-layer swap-rejection tests are essential.** Resolver-layer tests catch the primitive correctness; service-layer tests verify that the application code actually USES the new resolver signature with the right scope+rowID. We almost missed a real production-relevant test that swaps respondent A's phone ciphertext bytes into respondent B's row.
+
+### ClickHouse engine lessons
+
+11. **`MergeTree` to `ReplacingMergeTree` migration is RENAME → CREATE → INSERT-SELECT → DROP.** CH does not support `ALTER TABLE … MODIFY ENGINE`. The migration must drop dependent MVs first, rename source tables, create new tables, backfill, drop legacy, recreate MVs. State tables (`mv_*_state`) are preserved — only the materialized-view (the `WITH … TO …` definitions) are dropped/recreated.
+12. **CH migrations are not transactional.** `golang-migrate` runs each statement separately; a crash between `RENAME → CREATE → INSERT → DROP` leaves the DB in a half-state. Runbook entry needed: "if crashed mid-migration: drop the partially-created table, restore the `_legacy` rename, retry." Accepted trade-off for v1.
+13. **ORDER BY trade-off for dedup.** Changing `ORDER BY (tenant_id, project_id, ts)` → `(tenant_id, event_id)` favors dedup correctness over query speed on raw source-table scans. Verified no production query path reads source tables directly with `project_id`-leading predicates outside the ingest path.
+14. **Dedup-miss metric is best-effort.** The new `sociopulse_analytics_ingest_dedup_miss_total{subject}` counter increments on `WasEmpty || Evicted` LRU paths. Help text honest about approximation. ReplacingMergeTree reconciles asynchronously at merge; `SELECT FINAL` reads the deduped view for analytics queries.
+
+### Pre-Prometheus-naming and post-deployment lessons
+
+15. **Gauges should NOT have `_total` suffix.** Prometheus convention reserves `_total` for counters. Caught at Task 5 review. Fix landed before any dashboard/alert locked in the name.
+16. **JetStream durable consumers persist server-side.** `callEventBoot.Close` is intentionally a no-op for push subscriptions managed by the bus — the durable consumer is NOT auto-deleted on disconnect (that's the resume property). Cluster-level cleanup is out of scope for v1.
+
+### Dialer FSM design lesson
+
+17. **Outcome enum on the FSM snapshot, persisted to Redis.** Task 3 considered two design options for "verify only from success-class outcomes": (a) carry outcome as a separate per-FSM-instance variable, or (b) field on the `OperatorState` snapshot. Option (b) won: outcome survives operator pause/restart between `RecordCallEnded` and `GoVerify`. Hash field `outcome` is HDEL'd via empty-string semantics whenever a transition exits `status` (centralized in `buildNextSnapshot` helper).
+18. **`resolveTransition(from, event, outcome)` as the single decision point.** Every state mutation goes through one function. A future agent adding a transition cannot bypass the outcome guard — defence against future drift.
+
+### Producer-consumer plan contracts
+
+19. **Wire BOTH sides in one plan, OR test the contract.** The Plan 09 telephony publisher existed long before Plan 13.2.5 wired the consumer; the spec said "subjects look like `tenant.<t>.telephony.event.<call_id>.<type>`" and the consumer correctly bound to that pattern. **But there was no integration test asserting publisher ↔ consumer payload+subject contract.** Plan 13.2 amendments showed the same pattern (12 deviations from cross-plan-contract drift). **Future recommendation**: a `docs/contracts/` folder with cross-plan invariants validated by integration tests.
+
+### Process lessons
+
+20. **Wave-based dispatch with file partitioning works.** Three waves (Wave A: 3 parallel independent tasks; Wave B: 2 parallel after Wave A commits; Wave C: 1 task after Tasks 1+5 land). Zero merge conflicts despite 6 implementers + 6 reviewers running in parallel.
+21. **Don't trust gopls during in-flight subagent dispatches.** Diagnostics about "wrong type for method" surfaced multiple times during signature-change cascades. By each implementer's commit time, the actual compile was clean. Always re-verify with `go build && go vet && go test -race`.
+22. **Race-test the full repo before tagging.** Final `go test -race -count=1 ./...` covers ~80 packages and took ~30s. Single CRITICAL bug it could have caught: any cross-goroutine state in the new FSM outcome handling.
