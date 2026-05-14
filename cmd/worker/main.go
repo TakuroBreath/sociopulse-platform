@@ -1,5 +1,5 @@
 // Package main is the entrypoint for cmd/worker — the СоциоПульс
-// background worker process. Today it owns three errgroup-driven
+// background worker process. Today it owns four errgroup-driven
 // daemons:
 //
 //   - dialer.retry.Orchestrator (Plan 10 Task 10) — leader-elected
@@ -10,6 +10,11 @@
 //   - recording.IntegrityPass (Plan 12.4 Task 3 + Task 5) — leader-
 //     elected sweep that 1%-samples committed recordings and recomputes
 //     sha256 against ciphertext to catch silent corruption.
+//   - analytics.IngestPipeline (Plan 13.2 Task 6) — drains the three
+//     analytics-bound NATS subjects (calls / operator_state /
+//     recording.uploaded) into ClickHouse via per-subject batched
+//     inserts with dedup-LRU. Best-effort: NATS or CH unreachable at
+//     boot → WARN + skip; the other daemons keep running.
 //
 // Composition root:
 //
@@ -60,6 +65,7 @@ import (
 	"github.com/sociopulse/platform/internal/recording/wire"
 	"github.com/sociopulse/platform/internal/recording/worker"
 	"github.com/sociopulse/platform/pkg/config"
+	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/observability"
 	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/postgres"
@@ -203,6 +209,57 @@ func run(ctx context.Context, configDir string) error {
 		return fmt.Errorf("build recording workers: %w", err)
 	}
 
+	// 4c. NATS subscriber — Plan 13.2 Task 6. Required by the
+	//     analytics ingest pipeline. Best-effort (mirrors cmd/api): a
+	//     connection failure logs a WARN and analytics ingest is
+	//     skipped. The other daemons keep running. The publisher is
+	//     returned for symmetry but is currently unused.
+	natsPub, natsSub, natsErr := openNATS(ctx, cfg, logger)
+	if natsErr != nil {
+		logger.Warn("nats unreachable; analytics ingest will be skipped",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+			zap.Error(natsErr),
+		)
+	} else {
+		logger.Info("nats publisher + subscriber up",
+			zap.Strings("urls", redactNATSURLs(cfg.NATS.URLs)),
+		)
+	}
+	if natsPub != nil {
+		defer func() {
+			if err := natsPub.Close(); err != nil {
+				logger.Warn("nats publisher close", zap.Error(err))
+			}
+		}()
+	}
+	if natsSub != nil {
+		defer func() {
+			if err := natsSub.Close(); err != nil {
+				logger.Warn("nats subscriber close", zap.Error(err))
+			}
+		}()
+	}
+
+	// 4d. Analytics ingest pipeline — Plan 13.2 Task 6. Gated on
+	//     cfg.Analytics.Enabled && natsSub != nil && CH reachable.
+	//     Degraded boot is the rule: a return of (nil, nil) is the
+	//     happy "ingest disabled" path; the dialer retry + recording
+	//     sweeps continue. A non-nil error surfaces only on
+	//     configuration mistakes (bad validation) and trips fail-fast.
+	//
+	//     Subscriber is interface-typed (eventbus.Subscriber), so we
+	//     pass natsSub directly. nil-passing through the helper is
+	//     fine — it short-circuits with a WARN.
+	var natsSubIface eventbus.Subscriber
+	if natsSub != nil {
+		natsSubIface = natsSub
+	}
+	analyticsBoot, err := buildAnalyticsIngest(ctx, cfg, natsSubIface, logger.Named("analytics"))
+	if err != nil {
+		return fmt.Errorf("build analytics ingest: %w", err)
+	}
+	defer analyticsBoot.Close(logger)
+
 	// 5. /healthz listener. k8s readiness probes hit this; we keep
 	//    the surface tiny (just liveness) because the orchestrator's
 	//    own metrics dashboard is the readiness source of truth for
@@ -229,6 +286,11 @@ func run(ctx context.Context, configDir string) error {
 				return fmt.Errorf("%s: %w", runner.name, err)
 			}
 			return nil
+		})
+	}
+	if analyticsBoot != nil {
+		g.Go(func() error {
+			return analyticsBoot.run(gctx, logger.Named("analytics"))
 		})
 	}
 	g.Go(func() error {

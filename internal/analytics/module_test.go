@@ -47,7 +47,9 @@ func TestModule_Register_NoOpWhenHTTPRouterNil(t *testing.T) {
 	m := analytics.New(analytics.Config{})
 	d := makeDeps(t, logger, func(d *modules.Deps) {
 		d.HTTPRouter = nil
-		// DSN intentionally non-empty: the HTTPRouter check fires first.
+		// DSN + Enabled intentionally non-empty: the HTTPRouter check
+		// fires before either is consulted.
+		d.Config.Analytics.Enabled = true
 		d.Config.Database.ClickHouse.DSN = "clickhouse://localhost:9000/default"
 	})
 
@@ -56,24 +58,51 @@ func TestModule_Register_NoOpWhenHTTPRouterNil(t *testing.T) {
 		"expected the HTTP-router-missing INFO log; got: %v", recorded.All())
 }
 
-// TestModule_Register_NoOpWhenDSNEmpty asserts the module short-circuits
-// when ClickHouse is not configured. The Q11 dual-target model lets
-// cmd/api boot without analytics in dev environments that don't run CH.
-func TestModule_Register_NoOpWhenDSNEmpty(t *testing.T) {
+// TestModule_Register_NoOpWhenAnalyticsDisabled asserts the module
+// short-circuits when Config.Analytics.Enabled=false. The Q11 dual-
+// target model lets cmd/api boot without analytics in dev environments
+// that don't run CH (operator sets Enabled=false in YAML).
+func TestModule_Register_NoOpWhenAnalyticsDisabled(t *testing.T) {
 	t.Parallel()
 	core, recorded := observer.New(zap.InfoLevel)
 	logger := zap.New(core)
 
 	m := analytics.New(analytics.Config{})
-	d := makeDeps(t, logger) // DSN defaults to ""
+	d := makeDeps(t, logger, func(d *modules.Deps) {
+		d.Config.Analytics.Enabled = false
+		// DSN intentionally non-empty: the Enabled check fires first.
+		d.Config.Database.ClickHouse.DSN = "clickhouse://localhost:9000/default"
+	})
 
 	require.NoError(t, m.Register(d))
-	require.True(t, hasLogMessage(recorded, "clickhouse DSN empty"),
-		"expected the DSN-empty INFO log; got: %v", recorded.All())
+	require.True(t, hasLogMessage(recorded, "Config.Analytics.Enabled=false"),
+		"expected the Enabled=false INFO log; got: %v", recorded.All())
 
-	// The MetricsQuery key must NOT be registered when the module short-
-	// circuits — downstream lookups should observe ok=false, not a stale
-	// half-wired service.
+	// The MetricsQuery key must NOT be registered when the module
+	// short-circuits — downstream lookups should observe ok=false,
+	// not a stale half-wired service.
+	_, ok := d.Locator.Lookup(analytics.LocatorMetricsQuery)
+	require.False(t, ok, "no-op Register must not register MetricsQuery")
+}
+
+// TestModule_Register_NoOpWhenDSNEmpty asserts the nested fallback:
+// even with Enabled=true, an empty DSN still skips wiring with a WARN.
+// Dev environments without a CH container keep booting.
+func TestModule_Register_NoOpWhenDSNEmpty(t *testing.T) {
+	t.Parallel()
+	core, recorded := observer.New(zap.WarnLevel)
+	logger := zap.New(core)
+
+	m := analytics.New(analytics.Config{})
+	d := makeDeps(t, logger, func(d *modules.Deps) {
+		d.Config.Analytics.Enabled = true
+		// DSN defaults to "" so the nested fallback fires.
+	})
+
+	require.NoError(t, m.Register(d))
+	require.True(t, hasLogMessage(recorded, "enabled but clickhouse DSN empty"),
+		"expected the DSN-empty WARN log; got: %v", recorded.All())
+
 	_, ok := d.Locator.Lookup(analytics.LocatorMetricsQuery)
 	require.False(t, ok, "no-op Register must not register MetricsQuery")
 }
@@ -89,6 +118,9 @@ func TestModule_Register_DegradesOnUnreachableClickHouse(t *testing.T) {
 
 	m := analytics.New(analytics.Config{})
 	d := makeDeps(t, logger, func(d *modules.Deps) {
+		// Plan 13.2 Task 6 — Enabled must be true so the gate falls
+		// through to the actual CH open path.
+		d.Config.Analytics.Enabled = true
 		// Point at a host that won't resolve / won't accept. The exact
 		// failure mode (dial vs ping) is irrelevant to the test — both
 		// surface as a wrapped error in Register and trigger the WARN.

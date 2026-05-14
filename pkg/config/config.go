@@ -38,6 +38,7 @@ type Config struct {
 	Observability ObservabilityConfig `mapstructure:"observability"`
 	Shutdown      ShutdownConfig      `mapstructure:"shutdown"`
 	Outbox        OutboxConfig        `mapstructure:"outbox"`
+	Analytics     AnalyticsConfig     `mapstructure:"analytics"`
 }
 
 // ServiceConfig holds the cross-cutting service attributes.
@@ -68,6 +69,7 @@ func (c *Config) Validate() error {
 		{"outbox", c.Outbox.validate},
 		{"kms", c.KMS.Validate},
 		{"s3", c.S3.Validate},
+		{"analytics", c.Analytics.Validate},
 	}
 	for _, s := range subs {
 		if err := s.fn(); err != nil {
@@ -221,6 +223,21 @@ func DefaultDev() Config {
 			// staging and prod (Yandex Object Storage is S3-compatible).
 			Provider:     S3ProviderLocal,
 			BucketPrefix: "sociopulse-recordings-",
+		},
+		// Analytics — Plan 13.2 Task 6. Enabled by default in dev so
+		// `make dev-up` boots the ingest pipeline + read path against
+		// the local ClickHouse container. Production overrides via
+		// SOCIOPULSE_ANALYTICS_ENABLED / config.yaml.
+		Analytics: AnalyticsConfig{
+			Enabled:             true,
+			BatchSize:           10_000,
+			FlushInterval:       5 * time.Second,
+			DedupLRUSize:        10_000,
+			CacheShortTTL:       30 * time.Second,
+			CacheLongTTL:        5 * time.Minute,
+			LongWindowThreshold: 24 * time.Hour,
+			QueueGroup:          "analytics-ingest",
+			DrainTimeout:        5 * time.Second,
 		},
 	}
 }

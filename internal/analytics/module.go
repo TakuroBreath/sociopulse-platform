@@ -25,10 +25,16 @@
 //   - crm.ProjectService not in locator → CrmReader=nil; RegionProgress
 //     falls back to Plan=0 (Q12 documented behaviour).
 //
-// TODO (Plan 13.2 Task 6): replace the DSN-presence gate with an
-// explicit Config.Analytics.Enabled flag once pkg/config/analytics.go
-// lands. Until then the DSN check is the canonical "should this
-// module wire?" signal.
+// Gating (Plan 13.2 Task 6 finalised):
+//
+//   - Config.Analytics.Enabled is the canonical "should this module
+//     wire?" gate. Disabled → log INFO + skip the entire module.
+//   - DSN-empty is a NESTED fallback even when Enabled=true. Dev
+//     environments without a CH container still boot cmd/api cleanly
+//     (log WARN, skip the rest of Register).
+//   - QueryConfig values (CacheShortTTL, CacheLongTTL,
+//     LongWindowThreshold) are now pulled from d.Config.Analytics
+//     instead of hardcoded constants.
 package analytics
 
 import (
@@ -120,9 +126,24 @@ func (m *Module) Register(d modules.Deps) error {
 		return nil
 	}
 
-	if d.Config == nil || d.Config.Database.ClickHouse.DSN == "" {
-		// Plan 13.2 Task 6 will replace this gate with cfg.Analytics.Enabled.
-		logger.Info("analytics: clickhouse DSN empty, module disabled")
+	if d.Config == nil {
+		logger.Info("analytics: config nil, module disabled")
+		return nil
+	}
+
+	// Plan 13.2 Task 6: Config.Analytics.Enabled is the canonical
+	// gate. When false the module skips wiring entirely; cmd/api still
+	// serves /healthz / /metrics / other modules' routes.
+	if !d.Config.Analytics.Enabled {
+		logger.Info("analytics: Config.Analytics.Enabled=false, module disabled")
+		return nil
+	}
+
+	if d.Config.Database.ClickHouse.DSN == "" {
+		// Nested fallback: even when Enabled=true, an empty DSN means
+		// no ClickHouse to talk to. WARN (operator misconfiguration)
+		// but don't fail boot — cmd/api keeps serving the rest.
+		logger.Warn("analytics: enabled but clickhouse DSN empty, module disabled")
 		return nil
 	}
 
@@ -155,9 +176,9 @@ func (m *Module) Register(d modules.Deps) error {
 		logger.Named("query"),
 		queryMetrics,
 		service.QueryConfig{
-			CacheShortTTL:       30 * time.Second,
-			CacheLongTTL:        5 * time.Minute,
-			LongWindowThreshold: 24 * time.Hour,
+			CacheShortTTL:       d.Config.Analytics.CacheShortTTL,
+			CacheLongTTL:        d.Config.Analytics.CacheLongTTL,
+			LongWindowThreshold: d.Config.Analytics.LongWindowThreshold,
 		},
 	)
 	if err != nil {

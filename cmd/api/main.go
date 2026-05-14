@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/sociopulse/platform/internal/analytics"
 	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
@@ -310,10 +311,19 @@ func run(ctx context.Context, configDir string) error {
 		DEKUnwrapper: recordingDEK,
 		ObjectStore:  recordingObjects,
 	})
+	// Plan 13.2 Task 6 — analytics.Module{} joins the providers walk.
+	// The module's Register is gated by cfg.Analytics.Enabled (Task 6);
+	// when disabled it logs INFO and skips wiring. crm.Module is not in
+	// the cmd/api boot list today, so the analytics module's
+	// lookupCrmProjectService falls back to Plan=0 (Q12 documented
+	// behaviour, exercised by TestModule_LocatorCrmFallbacks).
+	// analytics.Module{} MUST come AFTER any future crm.Module so the
+	// locator carries crm.ProjectService when Register runs.
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
 		recordingModule,
+		analytics.New(analytics.Config{Registerer: metrics.Registry}),
 	}}
 	if err := registerModules(providers, deps, logger, redisErr); err != nil {
 		return err

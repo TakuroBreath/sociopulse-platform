@@ -90,4 +90,17 @@ func seedDefaults(v viperDefaulter, c Config) {
 	v.SetDefault("recording.workers.integrity_interval", 1*time.Hour)
 	v.SetDefault("recording.workers.integrity_batch", 10)
 	v.SetDefault("recording.workers.integrity_sample_percent", 1.0)
+	// analytics — Plan 13.2 Task 6. Defaults match DefaultDev so an
+	// operator with an empty analytics block in YAML still gets the
+	// intended batch / flush / cache TTLs. Enabled=true mirrors the
+	// dev expectation that the local CH container is reachable.
+	v.SetDefault("analytics.enabled", c.Analytics.Enabled)
+	v.SetDefault("analytics.batch_size", c.Analytics.BatchSize)
+	v.SetDefault("analytics.flush_interval", c.Analytics.FlushInterval)
+	v.SetDefault("analytics.dedup_lru_size", c.Analytics.DedupLRUSize)
+	v.SetDefault("analytics.cache_short_ttl", c.Analytics.CacheShortTTL)
+	v.SetDefault("analytics.cache_long_ttl", c.Analytics.CacheLongTTL)
+	v.SetDefault("analytics.long_window_threshold", c.Analytics.LongWindowThreshold)
+	v.SetDefault("analytics.queue_group", c.Analytics.QueueGroup)
+	v.SetDefault("analytics.drain_timeout", c.Analytics.DrainTimeout)
 }

@@ -164,6 +164,76 @@ func TestPassthroughDecryptorRoundTrip(t *testing.T) {
 	require.NotEqual(t, in, out)
 }
 
+// TestBuildAnalyticsIngest_DisabledReturnsNil verifies that the Plan
+// 13.2 Task 6 wiring is no-op when analytics.enabled=false. No NATS /
+// CH required: the helper short-circuits before opening anything.
+func TestBuildAnalyticsIngest_DisabledReturnsNil(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Analytics.Enabled = false
+
+	boot, err := buildAnalyticsIngest(t.Context(), cfg, nil, zaptestLogger(t))
+	require.NoError(t, err)
+	require.Nil(t, boot, "disabled analytics → nil boot")
+	// Close is nil-safe.
+	boot.Close(zaptestLogger(t))
+}
+
+// TestBuildAnalyticsIngest_EmptyDSNReturnsNil verifies the nested
+// fallback: enabled but no DSN → degraded boot, not an error.
+func TestBuildAnalyticsIngest_EmptyDSNReturnsNil(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Analytics.Enabled = true
+	cfg.Database.ClickHouse.DSN = ""
+
+	boot, err := buildAnalyticsIngest(t.Context(), cfg, nil, zaptestLogger(t))
+	require.NoError(t, err)
+	require.Nil(t, boot, "empty DSN → nil boot")
+}
+
+// TestBuildAnalyticsIngest_NilSubscriberReturnsNil verifies the
+// NATS-degraded path: even with Enabled+DSN, a nil subscriber means
+// no ingest can run, so the helper returns nil + WARN.
+func TestBuildAnalyticsIngest_NilSubscriberReturnsNil(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Analytics.Enabled = true
+	cfg.Database.ClickHouse.DSN = "clickhouse://localhost:9000/default"
+
+	boot, err := buildAnalyticsIngest(t.Context(), cfg, nil, zaptestLogger(t))
+	require.NoError(t, err)
+	require.Nil(t, boot, "nil subscriber → nil boot")
+}
+
+// TestBuildAnalyticsIngest_BadConfigFailsBoot surfaces a configuration
+// mistake at boot (invalid BatchSize) rather than silently skipping.
+// This contract distinguishes "degraded environment" (return nil + log)
+// from "wrong config" (return error) so the operator fixes the YAML.
+func TestBuildAnalyticsIngest_BadConfigFailsBoot(t *testing.T) {
+	t.Parallel()
+	cfg := config.DefaultDev()
+	cfg.Analytics.Enabled = true
+	cfg.Analytics.BatchSize = 0 // invalid
+	cfg.Database.ClickHouse.DSN = "clickhouse://localhost:9000/default"
+
+	// fakeSubscriber satisfies eventbus.Subscriber so the helper
+	// reaches the Validate step.
+	sub := fakeSubscriberForAnalyticsTest{}
+	_, err := buildAnalyticsIngest(t.Context(), cfg, sub, zaptestLogger(t))
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "analytics config")
+}
+
+// TestAnalyticsBoot_RunIsNilSafe asserts that the run-method gracefully
+// handles a nil receiver (the errgroup goroutine call site assumes
+// this for the disabled-path fast return).
+func TestAnalyticsBoot_RunIsNilSafe(t *testing.T) {
+	t.Parallel()
+	var boot *analyticsBoot
+	require.NoError(t, boot.run(t.Context(), zaptestLogger(t)))
+}
+
 // TestBuildRecordingWorkers_DisabledReturnsEmpty verifies that the Plan
 // 12.4 Task 5 wiring is no-op when recording.enabled=false. No Postgres
 // required: the helper short-circuits before opening anything.
@@ -298,4 +368,18 @@ func TestOpenRedisPingsAddr(t *testing.T) {
 	require.Error(t, err)
 	require.NotNil(t, rdb)
 	_ = rdb.Close()
+}
+
+// fakeSubscriberForAnalyticsTest is a no-op eventbus.Subscriber stub
+// used only by TestBuildAnalyticsIngest_BadConfigFailsBoot to reach
+// the config-validate gate without standing up real NATS.
+type fakeSubscriberForAnalyticsTest struct{}
+
+func (fakeSubscriberForAnalyticsTest) Subscribe(
+	_ context.Context,
+	_ string,
+	_ string,
+	_ func(subject string, payload []byte) error,
+) error {
+	return nil
 }

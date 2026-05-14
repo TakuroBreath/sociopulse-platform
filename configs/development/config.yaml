@@ -186,3 +186,19 @@ outbox:
   batch_size: 100
   tick: 1s
   max_retry: 10
+
+# analytics — Plan 13.2 Task 6.
+# enabled=true wires the cmd/api HTTP query path AND the cmd/worker
+# ingest pipeline against the local ClickHouse container. Setting
+# enabled=false disables both, useful when running cmd/api without a
+# ClickHouse process. The same block is consumed by both binaries.
+analytics:
+  enabled: true
+  batch_size: 10000
+  flush_interval: 5s
+  dedup_lru_size: 10000
+  cache_short_ttl: 30s
+  cache_long_ttl: 5m
+  long_window_threshold: 24h
+  queue_group: analytics-ingest
+  drain_timeout: 5s
