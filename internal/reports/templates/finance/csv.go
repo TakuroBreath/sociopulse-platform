@@ -6,12 +6,12 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderCSV emits 5 single-(metric, value) rows under a header.
-func RenderCSV(data service.FinanceData) (reportsapi.RenderResult, error) {
+func RenderCSV(data tpldata.FinanceData) (reportsapi.RenderResult, error) {
 	buf := &bytes.Buffer{}
 	w, err := common.NewCSVWriter(buf)
 	if err != nil {

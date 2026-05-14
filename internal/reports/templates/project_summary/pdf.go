@@ -8,14 +8,14 @@ import (
 	"github.com/signintech/gopdf"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderPDF produces a 3-section PDF. PDF row cap counts total rows across
 // sections (Summary≈7 + OperatorState≈5 + Regions). The cap targets the
 // Regions section because it's the only variable-length one.
-func RenderPDF(data service.ProjectSummaryData) (reportsapi.RenderResult, error) {
+func RenderPDF(data tpldata.ProjectSummaryData) (reportsapi.RenderResult, error) {
 	if len(data.Regions) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("project_summary.pdf: %d regions > %d cap: %w",
 			len(data.Regions), common.PDFRowLimit, reportsapi.ErrTooLarge)
@@ -50,7 +50,7 @@ func RenderPDF(data service.ProjectSummaryData) (reportsapi.RenderResult, error)
 
 // writeSummary writes the fixed-row Calls summary section under a
 // "Metric | Value" header. Returns the y after the last row.
-func writeSummary(pdf *gopdf.GoPdf, y float64, data service.ProjectSummaryData) (float64, error) {
+func writeSummary(pdf *gopdf.GoPdf, y float64, data tpldata.ProjectSummaryData) (float64, error) {
 	widths := []float64{160, 160}
 	y, err := common.PDFRow(pdf, y, []string{"Metric", "Value"}, widths)
 	if err != nil {
@@ -74,7 +74,7 @@ func writeSummary(pdf *gopdf.GoPdf, y float64, data service.ProjectSummaryData) 
 
 // writeState writes the fixed-row OperatorState section under a
 // "State | Seconds" header.
-func writeState(pdf *gopdf.GoPdf, y float64, data service.ProjectSummaryData) (float64, error) {
+func writeState(pdf *gopdf.GoPdf, y float64, data tpldata.ProjectSummaryData) (float64, error) {
 	y += 12
 	pdf.SetXY(40, y)
 	if err := pdf.Cell(nil, "Operator State (seconds)"); err != nil {
@@ -102,7 +102,7 @@ func writeState(pdf *gopdf.GoPdf, y float64, data service.ProjectSummaryData) (f
 
 // writeRegions writes the variable-length Regions section. This is the
 // only section that can page, so it carries the per-page header repeater.
-func writeRegions(pdf *gopdf.GoPdf, y float64, data service.ProjectSummaryData) error {
+func writeRegions(pdf *gopdf.GoPdf, y float64, data tpldata.ProjectSummaryData) error {
 	y += 12
 	pdf.SetXY(40, y)
 	if err := pdf.Cell(nil, "Regions"); err != nil {

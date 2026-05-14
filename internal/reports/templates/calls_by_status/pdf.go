@@ -6,13 +6,13 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderPDF emits 4 summary lines + (Status, Count) table. >5000 buckets
 // return reportsapi.ErrTooLarge.
-func RenderPDF(data service.CallsByStatusData) (reportsapi.RenderResult, error) {
+func RenderPDF(data tpldata.CallsByStatusData) (reportsapi.RenderResult, error) {
 	if len(data.Result.ByStatus) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("calls_by_status.pdf: %d rows > %d cap: %w",
 			len(data.Result.ByStatus), common.PDFRowLimit, reportsapi.ErrTooLarge)

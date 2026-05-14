@@ -9,8 +9,8 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	"github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 const (
@@ -21,7 +21,7 @@ const (
 // RenderXLSX produces an .xlsx artifact for the operator-efficiency
 // projection. One header row + N body rows under the "operator_efficiency"
 // sheet (Excel constrains sheet names to ASCII ≤31 chars).
-func RenderXLSX(data service.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
+func RenderXLSX(d data.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
 	f := excelize.NewFile()
 	defer func() { _ = f.Close() }()
 	idx, err := f.NewSheet(sheetName)
@@ -47,7 +47,7 @@ func RenderXLSX(data service.OperatorEfficiencyData) (reportsapi.RenderResult, e
 			return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.xlsx: SetCellStyle: %w", err)
 		}
 	}
-	for r, row := range data.Rows {
+	for r, row := range d.Rows {
 		rowIdx := r + 2
 		cells := []any{
 			row.DisplayName, row.CallsTotal, row.SuccessRate,
@@ -65,5 +65,5 @@ func RenderXLSX(data service.OperatorEfficiencyData) (reportsapi.RenderResult, e
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.xlsx: Write: %w", err)
 	}
-	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, d.Window.From), nil
 }

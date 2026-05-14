@@ -6,14 +6,14 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderPDF emits a (Hour, Count, AvgDurSec) table. Hour is formatted as
 // "2006-01-02 15:04" (human-readable). >5000 buckets return
 // reportsapi.ErrTooLarge.
-func RenderPDF(data service.HourlyActivityData) (reportsapi.RenderResult, error) {
+func RenderPDF(data tpldata.HourlyActivityData) (reportsapi.RenderResult, error) {
 	if len(data.Buckets) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("hourly_activity.pdf: %d rows > %d cap: %w",
 			len(data.Buckets), common.PDFRowLimit, reportsapi.ErrTooLarge)

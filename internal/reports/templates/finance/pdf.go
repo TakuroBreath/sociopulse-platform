@@ -6,13 +6,13 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderPDF emits a "Metric | Value" header row followed by 5 (metric, value)
 // rows. PDF row cap not applicable — finance has a fixed 5-row layout.
-func RenderPDF(data service.FinanceData) (reportsapi.RenderResult, error) {
+func RenderPDF(data tpldata.FinanceData) (reportsapi.RenderResult, error) {
 	pdf, err := common.PDFInit()
 	if err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("finance.pdf: %w", err)

@@ -17,4 +17,9 @@ var (
 	ErrTooLarge = errors.New("reports: result exceeds size cap")
 	// ErrCanceled is returned by Cancel and surfaces in Job.Error after a successful cancel.
 	ErrCanceled = errors.New("reports: job canceled")
+	// ErrAsyncRequired is returned by ReportRunner.Run when the request
+	// trips the async threshold (window > 30 d OR estimated rows >= 100k
+	// OR kind == KindCustom). The HTTP handler routes such requests to
+	// JobQueue.Enqueue instead of returning the bytes inline.
+	ErrAsyncRequired = errors.New("reports: async required")
 )

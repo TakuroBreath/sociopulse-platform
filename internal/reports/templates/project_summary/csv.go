@@ -6,14 +6,14 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderCSV produces a UTF-8 BOM-prefixed CSV containing 3 sections
 // separated by blank lines: Summary scalars, OperatorState breakdown,
 // Region progress rows.
-func RenderCSV(data service.ProjectSummaryData) (reportsapi.RenderResult, error) {
+func RenderCSV(data tpldata.ProjectSummaryData) (reportsapi.RenderResult, error) {
 	buf := &bytes.Buffer{}
 	w, err := common.NewCSVWriter(buf)
 	if err != nil {

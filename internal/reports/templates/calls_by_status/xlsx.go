@@ -9,8 +9,8 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 const (
@@ -20,7 +20,7 @@ const (
 
 // RenderXLSX produces a single-sheet workbook with 4 summary rows + a
 // header + N status-bucket rows.
-func RenderXLSX(data service.CallsByStatusData) (reportsapi.RenderResult, error) {
+func RenderXLSX(data tpldata.CallsByStatusData) (reportsapi.RenderResult, error) {
 	f := excelize.NewFile()
 	defer func() { _ = f.Close() }()
 	idx, err := f.NewSheet(sheetName)

@@ -9,6 +9,24 @@ import (
 
 	analyticsapi "github.com/sociopulse/platform/internal/analytics/api"
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
+	"github.com/sociopulse/platform/internal/reports/templates/data"
+)
+
+// Re-exported aliases for the per-kind data structs. The canonical
+// declarations live in internal/reports/templates/data — that package
+// was extracted so both the template packages and this service
+// dispatcher can import the types without creating an import cycle
+// (templates ↔ service). External callers may use either name; the
+// alias-form keeps existing imports working unchanged.
+type (
+	OperatorEfficiencyData = data.OperatorEfficiencyData
+	OperatorEfficiencyRow  = data.OperatorEfficiencyRow
+	ProjectSummaryData     = data.ProjectSummaryData
+	CallsByStatusData      = data.CallsByStatusData
+	FinanceData            = data.FinanceData
+	QualityControlData     = data.QualityControlData
+	HourlyActivityData     = data.HourlyActivityData
+	CustomData             = data.CustomData
 )
 
 // Per-kind data fetchers bridge analyticsapi.ServiceRO to typed per-kind
@@ -27,25 +45,11 @@ import (
 // -----------------------------------------------------------------------
 // OperatorEfficiency
 // -----------------------------------------------------------------------
-
-// OperatorEfficiencyData is the per-operator efficiency report payload
-// the Task 4 XLSX/CSV/PDF renderers consume.
-type OperatorEfficiencyData struct {
-	Window analyticsapi.Window
-	Rows   []OperatorEfficiencyRow
-}
-
-// OperatorEfficiencyRow is a single operator's metrics within the
-// reporting window.
-type OperatorEfficiencyRow struct {
-	OperatorID   uuid.UUID
-	DisplayName  string
-	CallsTotal   uint64
-	SuccessRate  float64
-	AvgTalkSec   float64
-	PauseShare   float64
-	AboveTeamAvg bool
-}
+//
+// The OperatorEfficiencyData / OperatorEfficiencyRow types live in
+// internal/reports/templates/data; this package re-exports the names
+// via type aliases at the top of the file. Fetchers continue to live
+// here (they have no template dependency).
 
 // FetchOperatorEfficiency requires Params["project_id"]: string (uuid).
 func FetchOperatorEfficiency(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (OperatorEfficiencyData, error) {
@@ -80,15 +84,6 @@ func FetchOperatorEfficiency(ctx context.Context, ana analyticsapi.ServiceRO, in
 // ProjectSummary
 // -----------------------------------------------------------------------
 
-// ProjectSummaryData aggregates the project-level Overview projection.
-type ProjectSummaryData struct {
-	Window  analyticsapi.Window
-	Project uuid.UUID
-	Calls   analyticsapi.CallsResult
-	State   analyticsapi.OperatorStateBreakdown
-	Regions []analyticsapi.RegionProgressRow
-}
-
 // FetchProjectSummary requires Params["project_id"]: string (uuid).
 func FetchProjectSummary(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (ProjectSummaryData, error) {
 	projectID, err := paramUUID(in.Params, "project_id")
@@ -116,12 +111,6 @@ func FetchProjectSummary(ctx context.Context, ana analyticsapi.ServiceRO, in rep
 // CallsByStatus
 // -----------------------------------------------------------------------
 
-// CallsByStatusData is the calls-by-status report payload.
-type CallsByStatusData struct {
-	Window analyticsapi.Window
-	Result analyticsapi.CallsResult
-}
-
 // FetchCallsByStatus optionally takes Params["project_id"]: string (uuid).
 func FetchCallsByStatus(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (CallsByStatusData, error) {
 	projectID, err := paramUUIDOpt(in.Params, "project_id")
@@ -147,15 +136,6 @@ func FetchCallsByStatus(ctx context.Context, ana analyticsapi.ServiceRO, in repo
 // lives in Plan 14 (billing); for Plan 13.3 reports we surface
 // CallsResult + a fixed per-minute rate supplied via
 // Params["rate_rub_per_min"].
-
-// FinanceData is the per-tenant finance report payload.
-type FinanceData struct {
-	Window        analyticsapi.Window
-	Calls         analyticsapi.CallsResult
-	PerMinuteRate float64 // ₽/min
-	TotalMinutes  float64 // CallsResult.TotalDurSec / 60
-	TotalCostRub  float64 // TotalMinutes * PerMinuteRate
-}
 
 // FetchFinance requires Params["rate_rub_per_min"]: float64 (or int).
 // Optionally takes Params["project_id"]: string (uuid).
@@ -197,12 +177,6 @@ func FetchFinance(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi
 // v1 just surfaces CallsResult (refusals + fails are the signal); v2
 // will add per-call review scores once those exist.
 
-// QualityControlData is the quality-control report payload.
-type QualityControlData struct {
-	Window analyticsapi.Window
-	Calls  analyticsapi.CallsResult
-}
-
 // FetchQualityControl optionally takes Params["project_id"]: string (uuid).
 func FetchQualityControl(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (QualityControlData, error) {
 	projectID, err := paramUUIDOpt(in.Params, "project_id")
@@ -223,12 +197,6 @@ func FetchQualityControl(ctx context.Context, ana analyticsapi.ServiceRO, in rep
 // -----------------------------------------------------------------------
 // HourlyActivity
 // -----------------------------------------------------------------------
-
-// HourlyActivityData is the per-hour activity report payload.
-type HourlyActivityData struct {
-	Window  analyticsapi.Window
-	Buckets []analyticsapi.HourlyBucket
-}
 
 // FetchHourlyActivity optionally takes Params["project_id"]: string (uuid).
 func FetchHourlyActivity(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (HourlyActivityData, error) {
@@ -254,12 +222,6 @@ func FetchHourlyActivity(ctx context.Context, ana analyticsapi.ServiceRO, in rep
 // Custom is the free-form report. v1 just projects ServiceRO.Overview;
 // future versions may parse a tiny DSL out of Params to compose
 // multiple MetricsQuery calls.
-
-// CustomData is the custom report payload.
-type CustomData struct {
-	Window analyticsapi.Window
-	OV     analyticsapi.OverviewResult
-}
 
 // FetchCustom optionally takes Params["project_id"]: string (uuid).
 func FetchCustom(ctx context.Context, ana analyticsapi.ServiceRO, in reportsapi.RenderInput) (CustomData, error) {

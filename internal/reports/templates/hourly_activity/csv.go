@@ -7,13 +7,13 @@ import (
 	"time"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderCSV emits a header row + N bucket rows. Hour is RFC3339-formatted
 // so non-Excel readers display the timestamp correctly.
-func RenderCSV(data service.HourlyActivityData) (reportsapi.RenderResult, error) {
+func RenderCSV(data tpldata.HourlyActivityData) (reportsapi.RenderResult, error) {
 	buf := &bytes.Buffer{}
 	w, err := common.NewCSVWriter(buf)
 	if err != nil {

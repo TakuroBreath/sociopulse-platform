@@ -6,12 +6,12 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	"github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderCSV produces a UTF-8 BOM-prefixed CSV with one header + N rows.
-func RenderCSV(data service.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
+func RenderCSV(d data.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
 	buf := &bytes.Buffer{}
 	w, err := common.NewCSVWriter(buf)
 	if err != nil {
@@ -20,7 +20,7 @@ func RenderCSV(data service.OperatorEfficiencyData) (reportsapi.RenderResult, er
 	if err := w.Write([]string{"Operator", "CallsTotal", "SuccessRate", "AvgTalkSec", "PauseShare", "AboveTeamAvg"}); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.csv: header: %w", err)
 	}
-	for _, row := range data.Rows {
+	for _, row := range d.Rows {
 		if err := w.Write([]string{
 			row.DisplayName,
 			strconv.FormatUint(row.CallsTotal, 10),
@@ -36,5 +36,5 @@ func RenderCSV(data service.OperatorEfficiencyData) (reportsapi.RenderResult, er
 	if err := w.Error(); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.csv: flush: %w", err)
 	}
-	return common.NewRenderResult(buf.Bytes(), kind, common.MIMECSV, data.Window.From), nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMECSV, d.Window.From), nil
 }

@@ -12,8 +12,8 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 const (
@@ -23,7 +23,7 @@ const (
 
 // RenderXLSX produces a single-sheet workbook with 5 labeled rows. No PDF
 // row cap because the row count is fixed.
-func RenderXLSX(data service.FinanceData) (reportsapi.RenderResult, error) {
+func RenderXLSX(data tpldata.FinanceData) (reportsapi.RenderResult, error) {
 	f := excelize.NewFile()
 	defer func() { _ = f.Close() }()
 	idx, err := f.NewSheet(sheetName)

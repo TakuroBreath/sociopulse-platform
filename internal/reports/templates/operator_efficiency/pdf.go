@@ -6,17 +6,17 @@ import (
 	"strconv"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	"github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 // RenderPDF produces a PDF table of operator KPIs. Renderers with >5000
 // detail rows return reportsapi.ErrTooLarge so the runner can route the
 // caller to an XLSX fallback or async path.
-func RenderPDF(data service.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
-	if len(data.Rows) > common.PDFRowLimit {
+func RenderPDF(d data.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
+	if len(d.Rows) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.pdf: %d rows > %d cap: %w",
-			len(data.Rows), common.PDFRowLimit, reportsapi.ErrTooLarge)
+			len(d.Rows), common.PDFRowLimit, reportsapi.ErrTooLarge)
 	}
 	pdf, err := common.PDFInit()
 	if err != nil {
@@ -38,7 +38,7 @@ func RenderPDF(data service.OperatorEfficiencyData) (reportsapi.RenderResult, er
 		return reportsapi.RenderResult{}, err
 	}
 
-	for _, row := range data.Rows {
+	for _, row := range d.Rows {
 		y, err = common.PDFRow(pdf, y, []string{
 			row.DisplayName,
 			strconv.FormatUint(row.CallsTotal, 10),
@@ -63,5 +63,5 @@ func RenderPDF(data service.OperatorEfficiencyData) (reportsapi.RenderResult, er
 	if _, err := pdf.WriteTo(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.pdf: WriteTo: %w", err)
 	}
-	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, data.Window.From), nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, d.Window.From), nil
 }

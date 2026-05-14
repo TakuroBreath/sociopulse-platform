@@ -12,8 +12,8 @@ import (
 	"github.com/xuri/excelize/v2"
 
 	reportsapi "github.com/sociopulse/platform/internal/reports/api"
-	"github.com/sociopulse/platform/internal/reports/service"
 	"github.com/sociopulse/platform/internal/reports/templates/common"
+	tpldata "github.com/sociopulse/platform/internal/reports/templates/data"
 )
 
 const (
@@ -25,7 +25,7 @@ const (
 // The Hour column uses a date-format style for portability across Excel,
 // Numbers, and LibreOffice (default excelize cells render as Excel-serial
 // floats otherwise).
-func RenderXLSX(data service.HourlyActivityData) (reportsapi.RenderResult, error) {
+func RenderXLSX(data tpldata.HourlyActivityData) (reportsapi.RenderResult, error) {
 	f := excelize.NewFile()
 	defer func() { _ = f.Close() }()
 	idx, err := f.NewSheet(sheetName)
