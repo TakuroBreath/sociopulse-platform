@@ -170,8 +170,7 @@ func NewQueryService(
 	}
 	if cache == nil {
 		// Use a no-op cache so callers don't need to special-case nil
-		// everywhere. The noopCache is local to this package and is
-		// also a Cache implementation — see noop_cache.go.
+		// everywhere. noopCache lives in cache.go (this package).
 		cache = noopCache{}
 	}
 	return &QueryService{
@@ -239,6 +238,7 @@ func (s *QueryService) OperatorState(ctx context.Context, q apianalytics.Operato
 			s.metrics.IncCacheHit(method)
 			return cached, nil
 		}
+		s.logger.Debug("analytics: stale cache entry — falling through to CH", zap.String("key", key))
 	}
 	s.metrics.IncCacheMiss(method)
 
@@ -273,6 +273,7 @@ func (s *QueryService) RegionProgress(ctx context.Context, q apianalytics.Region
 			s.metrics.IncCacheHit(method)
 			return cached, nil
 		}
+		s.logger.Debug("analytics: stale cache entry — falling through to CH", zap.String("key", key))
 	}
 	s.metrics.IncCacheMiss(method)
 
@@ -288,7 +289,9 @@ func (s *QueryService) RegionProgress(ctx context.Context, q apianalytics.Region
 		progress, crmErr := s.crm.GetProgress(ctx, q.ProjectID)
 		if crmErr != nil {
 			s.logger.Debug("analytics: crm.GetProgress failed — Plan=0",
-				zap.String("project_id", q.ProjectID.String()), zap.Error(crmErr))
+				zap.String("tenant_id", q.TenantID.String()),
+				zap.String("project_id", q.ProjectID.String()),
+				zap.Error(crmErr))
 		} else if progress != nil && progress.TargetCount >= 0 {
 			plan = uint64(progress.TargetCount)
 		}
@@ -331,6 +334,7 @@ func (s *QueryService) Hourly(ctx context.Context, q apianalytics.HourlyQuery) (
 			s.metrics.IncCacheHit(method)
 			return cached, nil
 		}
+		s.logger.Debug("analytics: stale cache entry — falling through to CH", zap.String("key", key))
 	}
 	s.metrics.IncCacheMiss(method)
 
@@ -367,6 +371,7 @@ func (s *QueryService) OperatorComparisons(ctx context.Context, q apianalytics.O
 			s.metrics.IncCacheHit(method)
 			return cached, nil
 		}
+		s.logger.Debug("analytics: stale cache entry — falling through to CH", zap.String("key", key))
 	}
 	s.metrics.IncCacheMiss(method)
 

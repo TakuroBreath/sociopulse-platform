@@ -23,16 +23,20 @@ var ErrNilQueryConn = errors.New("analytics/store: nil conn (query)")
 // real data — exactly the semantics the optional filter wants.
 var zeroUUID uuid.UUID
 
-// projectFilter returns (value, predicate) for the project-optional
-// idiom: when q.ProjectID is nil, value is the zero UUID and the
-// predicate matches every row (project_id is non-Nullable in
-// events_calls so the OR side fires); when q.ProjectID is set, value
-// is the supplied UUID and the predicate restricts to it.
+// optionalUUIDFilter returns the value to bind for an optional-UUID
+// SELECT predicate (project_id, operator_id, etc.). When the pointer
+// is nil, returns zeroUUID — the no-filter sentinel — and the SQL's
+// OR(? = zeroUUID) gate evaluates true for every row. When the pointer
+// is set, returns the supplied UUID and the column = ? branch restricts.
 //
-// Pass the returned (zero, value) pair into the SQL twice — once for
-// the OR(? = zeroUUID) gate, once for the project_id = ? branch.
-// Pre-extracting here keeps the call sites readable.
-func projectFilter(p *uuid.UUID) uuid.UUID {
+// Pass the returned value into the SQL TWICE — once for the gate, once
+// for the equality branch. Pre-extracting here keeps the call sites
+// readable.
+//
+// Used for project_id (CallsByMV / RegionProgress / Hourly) AND
+// operator_id (OperatorState / OperatorComparisons); the generic name
+// reflects the dual use.
+func optionalUUIDFilter(p *uuid.UUID) uuid.UUID {
 	if p == nil {
 		return zeroUUID
 	}
@@ -71,7 +75,7 @@ func CallsByMV(ctx context.Context, conn *Conn, q apianalytics.CallsQuery) (apia
 		  AND bucket_hour >= ? AND bucket_hour < ?
 		  AND (? = toUUID('00000000-0000-0000-0000-000000000000') OR project_id = ?)`
 
-	pf := projectFilter(q.ProjectID)
+	pf := optionalUUIDFilter(q.ProjectID)
 	var totals struct {
 		Total uint64
 		Dur   uint64
@@ -160,8 +164,8 @@ func OperatorStateByMV(ctx context.Context, conn *Conn, q apianalytics.OperatorS
 		  AND (? = toUUID('00000000-0000-0000-0000-000000000000') OR user_id    = ?)
 		  AND (? = toUUID('00000000-0000-0000-0000-000000000000') OR project_id = ?)`
 
-	opFilter := projectFilter(q.OperatorID)
-	pf := projectFilter(q.ProjectID)
+	opFilter := optionalUUIDFilter(q.OperatorID)
+	pf := optionalUUIDFilter(q.ProjectID)
 
 	var b apianalytics.OperatorStateBreakdown
 	if err := conn.Driver().QueryRow(ctx, stmt,
@@ -246,7 +250,7 @@ func HourlyByMV(ctx context.Context, conn *Conn, q apianalytics.HourlyQuery) ([]
 		GROUP BY bucket_hour
 		ORDER BY bucket_hour`
 
-	pf := projectFilter(q.ProjectID)
+	pf := optionalUUIDFilter(q.ProjectID)
 	rows, err := conn.Driver().Query(ctx, stmt,
 		q.TenantID, q.Window.From, q.Window.To, pf, pf,
 	)

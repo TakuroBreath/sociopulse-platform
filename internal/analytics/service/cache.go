@@ -122,13 +122,25 @@ func gzipBytes(b []byte) ([]byte, error) {
 // Used at Get time. A corrupt / truncated input returns a non-nil
 // error; the caller treats it as a cache miss + fall-through to the
 // origin (see QueryService.Calls).
+//
+// gzip.Reader.Close validates the CRC + length trailer — io.ReadAll
+// alone does NOT consume the trailer, so a truncated payload could
+// pass through silently if we deferred Close and ignored its error.
+// Propagating the Close error makes truncated bytes a clean miss.
 func gunzip(b []byte) ([]byte, error) {
 	gz, err := gzip.NewReader(bytes.NewReader(b))
 	if err != nil {
 		return nil, err
 	}
-	defer gz.Close()
-	return io.ReadAll(gz)
+	plain, readErr := io.ReadAll(gz)
+	closeErr := gz.Close()
+	if readErr != nil {
+		return nil, readErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return plain, nil
 }
 
 // noopCache is the local Cache implementation used by QueryService
