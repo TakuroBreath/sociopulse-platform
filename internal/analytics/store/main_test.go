@@ -14,17 +14,26 @@ import (
 // keeps long-lived *Conn instances per process) from accumulating
 // silent goroutine garbage.
 //
-// Optional ignores: testcontainers-go spawns persistent goroutines for
-// reaper / log streaming that we do not own. They are ignored by name
-// so we stay focused on OUR code's leaks. Adjust the list if a new
-// testcontainers internal goroutine surfaces in a future bump.
+// Optional ignores: testcontainers-go + transitive deps spawn
+// persistent goroutines for reaper / log streaming / docker control
+// that we do not own. They are ignored by SPECIFIC top-of-stack
+// function so a leaked clickhouse-go pool connection (which would
+// also park in netpoll → `internal/poll.runtime_pollWait`) is NOT
+// masked. The broad `runtime_pollWait` ignore is deliberately
+// avoided — that's the same top-of-stack the offender would have.
+//
+// Adjust the list if a new testcontainers/docker internal goroutine
+// surfaces in a future bump. Run with goleak strict locally to
+// observe new patterns before adding to this list.
 func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(
 		m,
 		// testcontainers reaper goroutine — owned by the lib, not us.
 		goleak.IgnoreTopFunction("github.com/testcontainers/testcontainers-go.(*Reaper).connect.func1"),
-		// HTTP/2 transport background reader used by the docker client.
-		goleak.IgnoreTopFunction("internal/poll.runtime_pollWait"),
+		// docker HTTP/2 background reader (specific package path, NOT
+		// the generic `runtime_pollWait` — that would mask CH pool leaks).
+		goleak.IgnoreTopFunction("net/http.(*persistConn).readLoop"),
+		goleak.IgnoreTopFunction("net/http.(*persistConn).writeLoop"),
 		// nats / quic-go internal goroutines spawned by transitive deps
 		// pulled in by testcontainers; they are not part of our code path.
 		goleak.IgnoreAnyFunction("github.com/quic-go/quic-go.(*baseServer).run"),

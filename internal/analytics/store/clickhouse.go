@@ -95,13 +95,13 @@ func (c Config) Validate() error {
 // Conn wraps a clickhouse-go/v2 driver.Conn. It is safe for concurrent
 // use; the underlying driver pool serialises queries across goroutines.
 //
-// Construct via Open. The zero value is NOT usable — Driver() returns
-// nil on a zero Conn and every method except Close panics if the
-// underlying driver is nil.
+// Construct via Open. The zero value is NOT usable: Driver(), Config(),
+// and Close are nil-safe and return their zero/no-op result; Ping and
+// Healthy will return an error wrapping ErrInvalidConfig on a zero or
+// nil-driver Conn rather than panicking.
 type Conn struct {
 	cfg    Config
 	driver driver.Conn
-	logger *zap.Logger
 
 	closeOnce sync.Once
 	closeErr  error
@@ -156,22 +156,20 @@ func Open(ctx context.Context, cfg Config) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("analytics/store: open clickhouse: %w", err)
 	}
-
-	logger := cfg.Logger
-	if logger == nil {
-		logger = zap.NewNop()
-	}
+	// cfg.Logger stays on Config (accessible via Conn.Config()) for
+	// future callers; the wrapper itself does no logging today. When
+	// the ingest pipeline (Plan 13.2 Task 3) needs to log a flush
+	// failure, it pulls Logger from its own deps, not from the Conn.
 
 	c := &Conn{
 		cfg:    cfg,
 		driver: drv,
-		logger: logger,
 	}
 
 	if err := c.Ping(ctx); err != nil {
-		// Close on the bare driver — c.Close routes through closeOnce
-		// and we do not want to mark the wrapper "closed" when the
-		// failure path is "never opened correctly".
+		// Close on the bare driver because the wrapper `c` is about to
+		// be dropped — closeOnce never runs, so a direct Close is the
+		// simplest cleanup.
 		_ = drv.Close()
 		return nil, fmt.Errorf("analytics/store: ping after open: %w", err)
 	}
@@ -238,6 +236,10 @@ func (c *Conn) Driver() driver.Conn {
 // Config returns a copy of the configuration used to open this Conn.
 // Useful for diagnostics / readiness reports. The returned value is a
 // snapshot; mutating it does not affect the live Conn.
+//
+// CAUTION: the returned Config.DSN includes any credentials embedded
+// at construction time. Do NOT log this value verbatim — redact the
+// password (or log only the host/port and database) before printing.
 func (c *Conn) Config() Config {
 	if c == nil {
 		return Config{}

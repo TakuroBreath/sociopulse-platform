@@ -183,11 +183,22 @@ func TestInsertRecordingsUploaded_HappyPath(t *testing.T) {
 // The system.columns filter drops auto-default columns (_inserted_at
 // is DEFAULT now()) so the payload tag set, which omits it, matches.
 //
-// The recording row uses an explicit tag list (recordingPayloadCHTags)
-// because the full RecordingUploadedEvent payload carries extra
-// fields (recording_id / duration_ms / sha256 / status) that exist on
-// the bus but NOT in CH — the table records the analytic projection
-// only. The explicit list pins exactly which JSON tags should map.
+// Two sub-test shapes:
+//
+//   - events_calls + events_operator_state — true parity test. The
+//     payload struct's JSON tags are reflected and asserted to match
+//     CH's column set byte-for-byte. Drift either way fails.
+//
+//   - events_recording_uploaded — schema-pin only. The full
+//     RecordingUploadedEvent payload carries 4 extra fields
+//     (recording_id / duration_ms / sha256 / status) that exist on the
+//     bus but NOT in CH — the table is the analytic projection only.
+//     For this case the test ONLY pins CH's column set against a
+//     hand-maintained list of expected column names. It is NOT a
+//     symmetric parity check — drift in the Go payload's JSON tags is
+//     intentionally NOT caught here. The InsertRecordingsUploaded
+//     batch.Append column-tuple is the load-bearing alignment for the
+//     payload side and is exercised by TestInsertRecordingsUploaded_HappyPath.
 func TestSchemaShape_PayloadFieldsMatchCHColumns(t *testing.T) {
 	t.Parallel()
 	conn := openTestConn(t)
@@ -208,9 +219,10 @@ func TestSchemaShape_PayloadFieldsMatchCHColumns(t *testing.T) {
 			wantTags: jsonTagsOf(apianalytics.AnalyticsOperatorStateEventPayload{}),
 		},
 		{
-			name:     "events_recording_uploaded",
+			// Schema-pin only — see test docstring above.
+			name:     "events_recording_uploaded (schema-pin)",
 			table:    "events_recording_uploaded",
-			wantTags: recordingPayloadCHTags(),
+			wantTags: recordingTableExpectedColumns(),
 		},
 	}
 
@@ -219,7 +231,7 @@ func TestSchemaShape_PayloadFieldsMatchCHColumns(t *testing.T) {
 			t.Parallel()
 			got := chColumns(t, conn, tc.table)
 			require.ElementsMatch(t, tc.wantTags, got,
-				"payload JSON tags MUST match CH columns (table=%s)", tc.table)
+				"CH columns drift detected (table=%s)", tc.table)
 		})
 	}
 }
@@ -275,10 +287,17 @@ func jsonTagsOf(v any) []string {
 	return out
 }
 
-// recordingPayloadCHTags is the explicit list of CH-relevant JSON
-// tags on RecordingUploadedEvent. Extending the CH schema requires
-// extending this list AND the InsertRecordingsUploaded helper.
-func recordingPayloadCHTags() []string {
+// recordingTableExpectedColumns pins the CH `events_recording_uploaded`
+// column set as a hand-maintained list. NOT a payload-side projection:
+// the Go RecordingUploadedEvent intentionally carries extras
+// (recording_id / duration_ms / sha256 / status) that the analytic
+// projection does not store.
+//
+// Extending the CH schema requires updating BOTH this list AND the
+// InsertRecordingsUploaded helper's column tuple. The schema-pin test
+// then catches a migration-without-helper-update; the helper's
+// integration test catches a helper-without-migration-update.
+func recordingTableExpectedColumns() []string {
 	return []string{
 		"date", "ts", "tenant_id", "project_id", "call_id",
 		"fs_node", "s3_key", "size_bytes", "duration_sec",
