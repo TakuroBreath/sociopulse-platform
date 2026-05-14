@@ -70,11 +70,18 @@ type AuditWindow struct {
 // Target="report:<JobID>", Payload carrying
 // kind/format/window/bytes_size/params.
 func (e *AuditEmitter) EmitTx(ctx context.Context, tx postgres.Tx, in AuditExport) error {
-	actorID := in.ActorID
+	// ActorID is *uuid.UUID with omitempty; only set the pointer when the
+	// caller provided a real actor. System-initiated exports
+	// (ActorKind=ActorSystem) leave ActorID nil and the field is omitted.
+	var actorIDPtr *uuid.UUID
+	if in.ActorID != uuid.Nil {
+		actorID := in.ActorID
+		actorIDPtr = &actorID
+	}
 	ev := auditapi.Event{
 		ID:        uuid.New(),
 		TenantID:  in.TenantID,
-		ActorID:   &actorID,
+		ActorID:   actorIDPtr,
 		ActorKind: in.ActorKind,
 		Action:    "reports.export",
 		Target:    fmt.Sprintf("report:%s", in.JobID),

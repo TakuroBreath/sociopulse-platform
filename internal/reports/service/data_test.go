@@ -426,14 +426,13 @@ func TestFetchers_OptionalUUIDEmptyStringIgnored(t *testing.T) {
 func TestFetchers_OptionalUUIDMalformedRejected(t *testing.T) {
 	t.Parallel()
 
-	// project_id is optional — but if PRESENT and malformed, error.
+	// project_id is optional — but if PRESENT and malformed, error must
+	// classify as ErrInvalidParams so the HTTP transport can return 400
+	// rather than 500.
 	fa := &fakeAnalytics{}
 	_, err := reportsvc.FetchCallsByStatus(context.Background(), fa,
 		newInput(t, map[string]any{"project_id": "not-a-uuid"}))
-	require.Error(t, err)
-	// Note: paramUUIDOpt returns the raw uuid.Parse error, not wrapped
-	// with ErrInvalidParams. The fetcher's wrapping carries the message.
-	require.Contains(t, err.Error(), "uuid", "error should mention uuid parsing")
+	require.ErrorIs(t, err, reportsapi.ErrInvalidParams)
 }
 
 func TestFetchers_RateAcceptsFloat64AndInt64(t *testing.T) {

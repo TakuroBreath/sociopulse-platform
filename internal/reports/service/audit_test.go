@@ -90,6 +90,41 @@ func TestAuditEmit_PublishesAuditEventToTenantSubject(t *testing.T) {
 	require.Equal(t, "xlsx", unmarshaled.Payload["format"])
 }
 
+// TestAuditEmit_SystemActorOmitsActorID asserts that when ActorID is the
+// zero uuid (system-initiated export), the marshalled event omits the
+// actor_id field via *uuid.UUID + omitempty — auditapi.Event consumers
+// reading the payload must see actor_id ABSENT, not "00000000-...-0".
+func TestAuditEmit_SystemActorOmitsActorID(t *testing.T) {
+	t.Parallel()
+
+	tenantID := uuid.MustParse("11111111-1111-1111-1111-111111111111")
+	ts := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+
+	fw := &fakeOutboxWriter{}
+	emitter := reportsvc.NewAuditEmitter(fw)
+
+	err := emitter.EmitTx(context.Background(), postgres.Tx{}, reportsvc.AuditExport{
+		TenantID:  tenantID,
+		ActorID:   uuid.Nil, // system-initiated
+		ActorKind: auditapi.ActorSystem,
+		JobID:     "job-sys",
+		Kind:      "calls_by_status",
+		Format:    "csv",
+		Window: reportsvc.AuditWindow{
+			From: ts.Add(-time.Hour),
+			To:   ts,
+		},
+		Timestamp: ts,
+	})
+	require.NoError(t, err)
+
+	require.Len(t, fw.appended, 1)
+	var unmarshaled auditapi.Event
+	require.NoError(t, json.Unmarshal(fw.appended[0].Payload, &unmarshaled))
+	require.Nil(t, unmarshaled.ActorID, "ActorID must be absent (omitempty) when in.ActorID == uuid.Nil")
+	require.Equal(t, auditapi.ActorSystem, unmarshaled.ActorKind)
+}
+
 func TestAuditEmit_PropagatesAppendError(t *testing.T) {
 	t.Parallel()
 

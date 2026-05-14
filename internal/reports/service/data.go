@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/google/uuid"
@@ -309,7 +310,7 @@ func paramUUIDOpt(p map[string]any, key string) (uuid.UUID, error) {
 	}
 	id, err := uuid.Parse(raw)
 	if err != nil {
-		return uuid.UUID{}, fmt.Errorf("%s: parse uuid: %w", key, err)
+		return uuid.UUID{}, errors.Join(reportsapi.ErrInvalidParams, fmt.Errorf("%s: parse uuid: %w", key, err))
 	}
 	return id, nil
 }
