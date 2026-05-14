@@ -58,11 +58,13 @@ func TestKMSResolverImpl_BuiltAgainstLocalKMSClient(t *testing.T) {
 	t.Cleanup(resolver.Close)
 
 	plaintext := []byte("the quick brown fox jumps over the lazy dog")
-	ct, err := resolver.Encrypt(context.Background(), tenantID, plaintext)
+	const scope = "auth.user.phone"
+	rowID := uuid.NewString()
+	ct, err := resolver.Encrypt(context.Background(), tenantID, scope, rowID, plaintext)
 	require.NoError(t, err)
 	require.NotEqual(t, plaintext, ct)
 
-	pt, err := resolver.Decrypt(context.Background(), tenantID, ct)
+	pt, err := resolver.Decrypt(context.Background(), tenantID, scope, rowID, ct)
 	require.NoError(t, err)
 	require.Equal(t, plaintext, pt)
 }

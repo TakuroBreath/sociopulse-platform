@@ -45,8 +45,16 @@ func seedProject(t *testing.T, ctx context.Context, pool *postgres.Pool, tenantI
 
 // insertRespondent runs s.Insert inside a per-tenant tx and returns
 // the saved row. Mirrors insertProject in the project tests.
+//
+// Plan 13.2.5 Task 6: Insert now requires a non-Nil ID (the caller
+// mints it client-side so the BuildAAD bind matches). When the test
+// hasn't pre-populated `in.ID`, the helper mints one for ergonomics —
+// the explicit-ID round-trip is exercised by Test_Insert_RoundTrip.
 func insertRespondent(t *testing.T, ctx context.Context, pool *postgres.Pool, s *store.RespondentStore, in crmapi.Respondent) crmapi.Respondent {
 	t.Helper()
+	if in.ID == uuid.Nil {
+		in.ID = uuid.New()
+	}
 	var out crmapi.Respondent
 	require.NoError(t, pool.WithTenant(ctx, in.TenantID, func(tx postgres.Tx) error {
 		var err error
@@ -85,7 +93,9 @@ func TestRespondentStore_Insert_RoundTrip(t *testing.T) {
 	projectID := seedProject(t, ctx, pool, tenantID, "RESP-PROJ-1")
 	s := store.NewRespondentStore(pool)
 
+	respondentID := uuid.New()
 	in := crmapi.Respondent{
+		ID:             respondentID,
 		TenantID:       tenantID,
 		ProjectID:      projectID,
 		PhoneEncrypted: []byte{0x01, 0x02, 0x03, 0x04},
@@ -98,7 +108,8 @@ func TestRespondentStore_Insert_RoundTrip(t *testing.T) {
 
 	saved := insertRespondent(t, ctx, pool, s, in)
 
-	require.NotEqual(t, uuid.Nil, saved.ID)
+	require.Equal(t, respondentID, saved.ID,
+		"Plan 13.2.5 Task 6: Insert must honour caller-supplied id (used as BuildAAD rowID)")
 	require.Equal(t, tenantID, saved.TenantID)
 	require.Equal(t, projectID, saved.ProjectID)
 	require.Equal(t, []byte{0x01, 0x02, 0x03, 0x04}, saved.PhoneEncrypted)
@@ -144,6 +155,7 @@ func TestRespondentStore_Insert_DuplicatePhoneHashReturnsErrDuplicate(t *testing
 
 	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
 		_, err := s.Insert(ctx, tx, crmapi.Respondent{
+			ID:             uuid.New(),
 			TenantID:       tenantID,
 			ProjectID:      projectID,
 			PhoneEncrypted: []byte{0x22},
@@ -345,6 +357,7 @@ func TestRespondentStore_InsertBatch_RoundTrip(t *testing.T) {
 		hash[0] = byte(i & 0xff)
 		hash[1] = byte((i >> 8) & 0xff)
 		rows[i] = crmapi.Respondent{
+			ID:             uuid.New(), // Plan 13.2.5 Task 6: caller mints rowID for BuildAAD.
 			TenantID:       tenantID,
 			ProjectID:      projectID,
 			PhoneEncrypted: []byte{0xee, 0xee},
@@ -389,8 +402,8 @@ func TestRespondentStore_InsertBatch_DuplicateInBatchFails(t *testing.T) {
 
 	hash := []byte{0xfe, 0xfe, 0xfe, 0xfe}
 	rows := []crmapi.Respondent{
-		{TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x01}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
-		{TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x02}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
+		{ID: uuid.New(), TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x01}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
+		{ID: uuid.New(), TenantID: tenantID, ProjectID: projectID, PhoneEncrypted: []byte{0x02}, PhoneHash: hash, RegionCode: "RU", Source: crmapi.SourceImported},
 	}
 
 	err := pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {

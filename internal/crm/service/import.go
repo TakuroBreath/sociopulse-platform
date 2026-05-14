@@ -502,14 +502,20 @@ func (s *RespondentService) filterAgainstDB(ctx context.Context, tx postgres.Tx,
 
 // persistBatch encrypts the surviving rows and runs the COPY insert.
 // Returns the count of inserted rows.
+//
+// Plan 13.2.5 Task 6: the per-row UUID is minted client-side BEFORE the
+// KMS Encrypt call so the AAD bound into the ciphertext reproduces at
+// decrypt time. The COPY then writes the same ID into respondents.id.
 func (s *RespondentService) persistBatch(ctx context.Context, tx postgres.Tx, p importTaskPayload, insertable []stagedRow) (int, error) {
 	respondents := make([]api.Respondent, 0, len(insertable))
 	for _, sr := range insertable {
-		ciphertext, eerr := s.kms.Encrypt(ctx, p.TenantID, []byte(sr.e164))
+		respondentID := uuid.New()
+		ciphertext, eerr := s.kms.Encrypt(ctx, p.TenantID, respondentPhoneAADScope, respondentID.String(), []byte(sr.e164))
 		if eerr != nil {
 			return 0, fmt.Errorf("encrypt phone: %w", eerr)
 		}
 		respondents = append(respondents, api.Respondent{
+			ID:             respondentID,
 			TenantID:       p.TenantID,
 			ProjectID:      p.ProjectID,
 			PhoneEncrypted: ciphertext,

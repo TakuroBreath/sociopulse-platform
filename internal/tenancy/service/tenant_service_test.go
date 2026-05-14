@@ -908,11 +908,11 @@ func (f *fakeKMSResolverForCache) GenerateDataKey(_ context.Context, _ uuid.UUID
 	return api.DataKey{}, errors.New("fakeKMSResolverForCache.GenerateDataKey not configured")
 }
 
-func (f *fakeKMSResolverForCache) Encrypt(_ context.Context, _ uuid.UUID, _ []byte) ([]byte, error) {
+func (f *fakeKMSResolverForCache) Encrypt(_ context.Context, _ uuid.UUID, _, _ string, _ []byte) ([]byte, error) {
 	return nil, errors.New("fakeKMSResolverForCache.Encrypt not configured")
 }
 
-func (f *fakeKMSResolverForCache) Decrypt(_ context.Context, _ uuid.UUID, _ []byte) ([]byte, error) {
+func (f *fakeKMSResolverForCache) Decrypt(_ context.Context, _ uuid.UUID, _, _ string, _ []byte) ([]byte, error) {
 	return nil, errors.New("fakeKMSResolverForCache.Decrypt not configured")
 }
 

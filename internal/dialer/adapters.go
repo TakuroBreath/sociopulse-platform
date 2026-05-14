@@ -85,17 +85,24 @@ type kmsDecryptorAdapter struct {
 	kms tenancyapi.KMSResolver
 }
 
+// dialerRespondentPhoneAADScope mirrors the crm.respondent.phone scope
+// used by RespondentService at encrypt time. Both sides must agree on
+// this string or the AEAD AAD bind fails (Plan 13.2.5 Task 6). Kept
+// duplicated here rather than imported from crm/service to keep the
+// dialer module's depguard surface clean.
+const dialerRespondentPhoneAADScope = "crm.respondent.phone"
+
 // Compile-time interface check.
 var _ retry.Decryptor = (*kmsDecryptorAdapter)(nil)
 
 // Decrypt satisfies retry.Decryptor. The orchestrator passes the
-// per-row tenant ID + ciphertext; we forward verbatim to the KMS
-// resolver.
-func (a *kmsDecryptorAdapter) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphertext []byte) ([]byte, error) {
+// per-row tenant ID + respondent ID + ciphertext; we forward to the
+// KMS resolver after stamping the canonical respondent-phone scope.
+func (a *kmsDecryptorAdapter) Decrypt(ctx context.Context, tenantID, respondentID uuid.UUID, ciphertext []byte) ([]byte, error) {
 	if a == nil || a.kms == nil {
 		return nil, errors.New("dialer: KMSResolver not wired (decryptor unavailable)")
 	}
-	return a.kms.Decrypt(ctx, tenantID, ciphertext)
+	return a.kms.Decrypt(ctx, tenantID, dialerRespondentPhoneAADScope, respondentID.String(), ciphertext)
 }
 
 // passthroughDecryptor is the fallback retry.Decryptor used when
@@ -110,7 +117,7 @@ type passthroughDecryptor struct{}
 var _ retry.Decryptor = passthroughDecryptor{}
 
 // Decrypt satisfies retry.Decryptor.
-func (passthroughDecryptor) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (passthroughDecryptor) Decrypt(_ context.Context, _, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) == 0 {
 		return nil, errors.New("dialer/retry: empty ciphertext")
 	}

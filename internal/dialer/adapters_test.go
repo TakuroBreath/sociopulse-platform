@@ -134,10 +134,10 @@ func (*fakeKMSResolver) EnsureKEK(context.Context, uuid.UUID) (string, error) {
 func (*fakeKMSResolver) GenerateDataKey(context.Context, uuid.UUID) (tenancyapi.DataKey, error) {
 	panic("unexpected")
 }
-func (*fakeKMSResolver) Encrypt(context.Context, uuid.UUID, []byte) ([]byte, error) {
+func (*fakeKMSResolver) Encrypt(context.Context, uuid.UUID, string, string, []byte) ([]byte, error) {
 	panic("unexpected")
 }
-func (f *fakeKMSResolver) Decrypt(_ context.Context, _ uuid.UUID, _ []byte) ([]byte, error) {
+func (f *fakeKMSResolver) Decrypt(_ context.Context, _ uuid.UUID, _, _ string, _ []byte) ([]byte, error) {
 	if f.err != nil {
 		return nil, f.err
 	}
@@ -153,7 +153,7 @@ func TestKMSDecryptorAdapterForwardsToKMS(t *testing.T) {
 
 	want := []byte("+79991234567")
 	a := &kmsDecryptorAdapter{kms: &fakeKMSResolver{out: want}}
-	got, err := a.Decrypt(t.Context(), uuid.New(), []byte("ciphertext"))
+	got, err := a.Decrypt(t.Context(), uuid.New(), uuid.New(), []byte("ciphertext"))
 	require.NoError(t, err)
 	assert.Equal(t, want, got)
 }
@@ -164,7 +164,7 @@ func TestKMSDecryptorAdapterPropagatesError(t *testing.T) {
 
 	wantErr := errors.New("kms boom")
 	a := &kmsDecryptorAdapter{kms: &fakeKMSResolver{err: wantErr}}
-	_, err := a.Decrypt(t.Context(), uuid.New(), []byte("ciphertext"))
+	_, err := a.Decrypt(t.Context(), uuid.New(), uuid.New(), []byte("ciphertext"))
 	assert.ErrorIs(t, err, wantErr)
 }
 
@@ -174,7 +174,7 @@ func TestKMSDecryptorAdapterNilKMSReturnsError(t *testing.T) {
 	t.Parallel()
 
 	var a *kmsDecryptorAdapter
-	_, err := a.Decrypt(t.Context(), uuid.New(), []byte("ciphertext"))
+	_, err := a.Decrypt(t.Context(), uuid.New(), uuid.New(), []byte("ciphertext"))
 	assert.Error(t, err)
 }
 
@@ -183,7 +183,7 @@ func TestPassthroughDecryptor(t *testing.T) {
 	t.Parallel()
 
 	in := []byte("+79991234567")
-	out, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), in)
+	out, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), uuid.New(), in)
 	require.NoError(t, err)
 	assert.Equal(t, in, out)
 	// Modifying the returned slice does not corrupt the caller's
@@ -195,7 +195,7 @@ func TestPassthroughDecryptor(t *testing.T) {
 // TestPassthroughDecryptorEmptyCiphertext.
 func TestPassthroughDecryptorEmptyCiphertext(t *testing.T) {
 	t.Parallel()
-	_, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), nil)
+	_, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), uuid.New(), nil)
 	assert.Error(t, err)
 }
 

@@ -158,7 +158,21 @@ func (r *KMSResolverImpl) GenerateDataKey(ctx context.Context, tenantID uuid.UUI
 
 // Envelope ciphertext layout:
 //
-//	[4-byte big-endian wrapped-DEK length][wrapped-DEK][AES-GCM blob]
+// Plan 13.2.5 Task 6 introduced AAD-bound ciphertext writes. Every new
+// write is v2 (0x02 prefix); legacy production data without a version
+// byte continues to decrypt under the v1 (no AAD) path. Layouts:
+//
+//	v2  : [0x02][4-byte BE wrapped-DEK length][wrapped-DEK][AES-GCM blob, AAD = BuildAAD(tenant, scope, rowID)]
+//	v1' : [0x01][4-byte BE wrapped-DEK length][wrapped-DEK][AES-GCM blob, AAD = nil]   (explicit-legacy; produced by a future migration)
+//	v1  :       [4-byte BE wrapped-DEK length][wrapped-DEK][AES-GCM blob, AAD = nil]   (pre-13.2.5 production data; no version byte)
+//
+// Dispatch on the FIRST byte:
+//   - 0x02 → v2 path; strip version, AAD = BuildAAD
+//   - 0x01 → versioned legacy; strip version, AAD = nil
+//   - 0x00 → unprefixed legacy (existing prod data — the high byte of the
+//     length-prefix is always 0x00 because wrapped-DEK ≤ 1 MiB); decode
+//     bytes verbatim, AAD = nil
+//   - other → ErrInvalidArgument (unknown version)
 //
 // Bundling the wrapped DEK with the payload makes ciphertext self-contained:
 // any process with KMS access can decrypt it without consulting an
@@ -167,16 +181,39 @@ func (r *KMSResolverImpl) GenerateDataKey(ctx context.Context, tenantID uuid.UUI
 // flows through this path.
 const wrappedDEKLenBytes = 4
 
+// Ciphertext version bytes — first byte of the resolver-emitted blob.
+const (
+	// ciphertextVersionLegacyUnprefixed marks the historical envelope —
+	// no leading byte, AAD = nil. Existing production data has this
+	// implicit "version": the wrapped-DEK length-prefix high byte is
+	// always 0x00 because we cap wrapped-DEK at 1 MiB (= 0x100000).
+	ciphertextVersionLegacyUnprefixed byte = 0x00
+
+	// ciphertextVersionLegacy is an explicit "no AAD" marker — supports
+	// a future migration that stamps a version byte onto in-place data
+	// without re-encrypting. NOT produced by Encrypt today.
+	ciphertextVersionLegacy byte = 0x01
+
+	// ciphertextVersionAAD marks a v2 envelope: AAD = BuildAAD(tenant,
+	// scope, rowID). Encrypt ALWAYS writes this version.
+	ciphertextVersionAAD byte = 0x02
+)
+
 // maxWrappedDEKLen guards the int→uint32 conversion in the envelope
 // header. Yandex KMS-wrapped DEKs are well under 1 KiB; we cap at 1 MiB
 // as a sanity bound so a misuse never produces a non-decodable header.
 const maxWrappedDEKLen = 1 << 20
 
-// Encrypt performs envelope AES-256-GCM with a cached DEK. Cache miss
-// triggers a fresh GenerateDataKey, after which subsequent Encrypts on
-// the same (tenant, KEK-version) reuse the same DEK until InvalidateCache
-// is called or the cache evicts.
-func (r *KMSResolverImpl) Encrypt(ctx context.Context, tenantID uuid.UUID, plaintext []byte) ([]byte, error) {
+// Encrypt performs envelope AES-256-GCM with a cached DEK, binding
+// (tenant, scope, rowID) into the AEAD authentication tag via
+// pkg/encryption.BuildAAD. Every emitted ciphertext starts with the
+// ciphertextVersionAAD (0x02) byte; legacy unprefixed/0x01 envelopes
+// are decrypt-only (backward compatibility) and never produced here.
+//
+// Cache miss triggers a fresh GenerateDataKey, after which subsequent
+// Encrypts on the same (tenant, KEK-version) reuse the same DEK until
+// InvalidateCache is called or the cache evicts.
+func (r *KMSResolverImpl) Encrypt(ctx context.Context, tenantID uuid.UUID, scope, rowID string, plaintext []byte) ([]byte, error) {
 	dek, err := r.resolveDEKForEncrypt(ctx, tenantID)
 	if err != nil {
 		return nil, err
@@ -185,36 +222,41 @@ func (r *KMSResolverImpl) Encrypt(ctx context.Context, tenantID uuid.UUID, plain
 		return nil, fmt.Errorf("kms-resolver: wrapped dek length %d exceeds %d byte cap",
 			len(dek.Ciphertext), maxWrappedDEKLen)
 	}
-	body, err := encryption.Encrypt(dek.Plaintext, plaintext, nil)
+	aad := encryption.BuildAAD(tenantID, scope, rowID)
+	body, err := encryption.Encrypt(dek.Plaintext, plaintext, aad)
 	if err != nil {
 		return nil, fmt.Errorf("kms-resolver: aes-gcm encrypt: %w", err)
 	}
-	out := make([]byte, 0, wrappedDEKLenBytes+len(dek.Ciphertext)+len(body))
+	out := make([]byte, 0, 1+wrappedDEKLenBytes+len(dek.Ciphertext)+len(body))
+	out = append(out, ciphertextVersionAAD)
 	out = binary.BigEndian.AppendUint32(out, uint32(len(dek.Ciphertext))) //nolint:gosec // bounded above
 	out = append(out, dek.Ciphertext...)
 	out = append(out, body...)
 	return out, nil
 }
 
-// Decrypt unpacks the envelope produced by Encrypt. Cache hit fast-paths
-// when the embedded wrapped-DEK matches the cached one; otherwise the
-// resolver calls KMS.Decrypt to unwrap the DEK and updates the cache.
-func (r *KMSResolverImpl) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphertext []byte) ([]byte, error) {
+// Decrypt unpacks the envelope produced by Encrypt. Reads the leading
+// version byte to choose between AAD-bound (v2) and legacy (v1 /
+// v1-unprefixed) paths.
+//
+// Cache hit fast-paths when the embedded wrapped-DEK matches the cached
+// one; otherwise the resolver calls KMS.Decrypt to unwrap the DEK and
+// updates the cache.
+func (r *KMSResolverImpl) Decrypt(ctx context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < wrappedDEKLenBytes {
 		return nil, fmt.Errorf("%w: ciphertext shorter than length prefix", api.ErrInvalidArgument)
 	}
-	ctLen := binary.BigEndian.Uint32(ciphertext[:wrappedDEKLenBytes])
-	if uint64(wrappedDEKLenBytes)+uint64(ctLen) > uint64(len(ciphertext)) {
-		return nil, fmt.Errorf("%w: wrapped-DEK length %d overshoots ciphertext", api.ErrInvalidArgument, ctLen)
+
+	body, wrappedDEK, aad, err := r.decodeCiphertext(tenantID, scope, rowID, ciphertext)
+	if err != nil {
+		return nil, err
 	}
-	wrappedDEK := ciphertext[wrappedDEKLenBytes : wrappedDEKLenBytes+ctLen]
-	body := ciphertext[wrappedDEKLenBytes+ctLen:]
 
 	dek, err := r.resolveDEKForDecrypt(ctx, tenantID, wrappedDEK)
 	if err != nil {
 		return nil, err
 	}
-	pt, err := encryption.Decrypt(dek.Plaintext, body, nil)
+	pt, err := encryption.Decrypt(dek.Plaintext, body, aad)
 	if err != nil {
 		// Surface as ErrInvalidArgument: the wrapped-DEK was authentic
 		// (KMS.Decrypt succeeded) but the body is corrupt. We don't map
@@ -223,6 +265,64 @@ func (r *KMSResolverImpl) Decrypt(ctx context.Context, tenantID uuid.UUID, ciphe
 		return nil, fmt.Errorf("%w: aes-gcm open: %w", api.ErrInvalidArgument, err)
 	}
 	return pt, nil
+}
+
+// decodeCiphertext dispatches on the leading version byte and returns
+// the AES-GCM body, the wrapped-DEK slice, and the AAD to use. Caller
+// owns slice lifetime — returned slices alias `ciphertext`.
+//
+// Layouts (see resolver header):
+//   - 0x02 → v2: strip byte, decode framing, AAD = BuildAAD
+//   - 0x01 → versioned legacy: strip byte, decode framing, AAD = nil
+//   - 0x00 → unprefixed legacy: decode framing on the whole input, AAD = nil
+//   - else → unknown version (ErrInvalidArgument)
+func (r *KMSResolverImpl) decodeCiphertext(tenantID uuid.UUID, scope, rowID string, ciphertext []byte) (body, wrappedDEK, aad []byte, err error) {
+	switch ciphertext[0] {
+	case ciphertextVersionAAD:
+		body, wrappedDEK, err = r.parseEnvelope(ciphertext[1:])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		aad = encryption.BuildAAD(tenantID, scope, rowID)
+		return body, wrappedDEK, aad, nil
+
+	case ciphertextVersionLegacy:
+		body, wrappedDEK, err = r.parseEnvelope(ciphertext[1:])
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		// AAD = nil for legacy envelopes; scope/rowID are intentionally
+		// not consulted.
+		return body, wrappedDEK, nil, nil
+
+	case ciphertextVersionLegacyUnprefixed:
+		// No version byte: pre-13.2.5 production data. The "0x00" is the
+		// high byte of the length-prefix.
+		body, wrappedDEK, err = r.parseEnvelope(ciphertext)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		return body, wrappedDEK, nil, nil
+
+	default:
+		return nil, nil, nil, fmt.Errorf("%w: unknown ciphertext version 0x%02x", api.ErrInvalidArgument, ciphertext[0])
+	}
+}
+
+// parseEnvelope splits a length-prefixed envelope into (body, wrappedDEK).
+// Used by both the v2 and legacy decode paths after the optional version
+// byte has been stripped.
+func (r *KMSResolverImpl) parseEnvelope(envelope []byte) (body, wrappedDEK []byte, err error) {
+	if len(envelope) < wrappedDEKLenBytes {
+		return nil, nil, fmt.Errorf("%w: ciphertext shorter than length prefix", api.ErrInvalidArgument)
+	}
+	ctLen := binary.BigEndian.Uint32(envelope[:wrappedDEKLenBytes])
+	if uint64(wrappedDEKLenBytes)+uint64(ctLen) > uint64(len(envelope)) {
+		return nil, nil, fmt.Errorf("%w: wrapped-DEK length %d overshoots ciphertext", api.ErrInvalidArgument, ctLen)
+	}
+	wrappedDEK = envelope[wrappedDEKLenBytes : wrappedDEKLenBytes+ctLen]
+	body = envelope[wrappedDEKLenBytes+ctLen:]
+	return body, wrappedDEK, nil
 }
 
 // InvalidateCache drops every cached DEK for the tenant — across all

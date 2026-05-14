@@ -157,7 +157,7 @@ func TestParseConfigDirEnvFallback(t *testing.T) {
 func TestPassthroughDecryptorRoundTrip(t *testing.T) {
 	t.Parallel()
 	in := []byte("+79991234567")
-	out, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), in)
+	out, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), uuid.New(), in)
 	require.NoError(t, err)
 	require.Equal(t, in, out)
 	out[0] = 'X'
@@ -278,7 +278,7 @@ func TestBuildRecordingWorkers_BadKEKsErrors(t *testing.T) {
 // TestPassthroughDecryptorEmpty surfaces a clean error.
 func TestPassthroughDecryptorEmpty(t *testing.T) {
 	t.Parallel()
-	_, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), nil)
+	_, err := passthroughDecryptor{}.Decrypt(t.Context(), uuid.New(), uuid.New(), nil)
 	require.Error(t, err)
 }
 

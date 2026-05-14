@@ -26,6 +26,14 @@ type DataKey struct {
 // auth, crm) consume this through the api.Tenancy aggregate.
 //
 // All methods are idempotent on the KMS side: retries are safe.
+//
+// Plan 13.2.5 Task 6: Encrypt/Decrypt take `scope` and `rowID` arguments
+// that are bound into the AEAD authentication tag via
+// pkg/encryption.BuildAAD. An attacker who tries to splice a ciphertext
+// from one (scope, row) to another fails AES-GCM Open. Backward
+// compatibility with existing production ciphertexts (no AAD bind) is
+// preserved via a version byte on the wrapped-DEK envelope — see
+// internal/tenancy/service/kms_resolver.go for the layout.
 type KMSResolver interface {
 	// EnsureKEK creates a per-tenant KEK in Yandex KMS if absent and returns its ID.
 	// Idempotent: safe to call repeatedly during onboarding.
@@ -36,12 +44,23 @@ type KMSResolver interface {
 	GenerateDataKey(ctx context.Context, tenantID uuid.UUID) (DataKey, error)
 
 	// Encrypt performs in-app AES-256-GCM with a cached DEK (for short PII like phones).
-	// Returns ciphertext that includes the nonce and a header identifying the wrapped DEK.
-	Encrypt(ctx context.Context, tenantID uuid.UUID, plaintext []byte) ([]byte, error)
+	// scope and rowID identify the column / row owning the ciphertext; both
+	// are bound into the AEAD AAD via pkg/encryption.BuildAAD so a row /
+	// column swap fails authentication. See package doc on BuildAAD for the
+	// canonical scope strings (e.g. "auth.user.phone", "crm.respondent.phone").
+	// Returns ciphertext that includes a version byte, the wrapped-DEK
+	// header, and the AES-GCM blob.
+	Encrypt(ctx context.Context, tenantID uuid.UUID, scope, rowID string, plaintext []byte) ([]byte, error)
 
 	// Decrypt reverses Encrypt. Resolves the DEK via the cache, transparently
-	// invokes KMS.Decrypt on cache miss.
-	Decrypt(ctx context.Context, tenantID uuid.UUID, ciphertext []byte) ([]byte, error)
+	// invokes KMS.Decrypt on cache miss. scope and rowID MUST match the
+	// values supplied to Encrypt; otherwise AEAD authentication fails and
+	// the resolver surfaces ErrInvalidArgument.
+	//
+	// Legacy (pre-Plan-13.2.5) ciphertexts decrypt unchanged — the resolver
+	// detects them by inspecting the leading version byte and skips the
+	// AAD bind. The scope/rowID arguments are ignored on the legacy path.
+	Decrypt(ctx context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error)
 
 	// InvalidateCache drops the in-memory DEK cache entry for the tenant.
 	// Called after KEK rotation or tenant suspension.

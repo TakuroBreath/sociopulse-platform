@@ -110,7 +110,7 @@ type fakeDecryptor struct {
 	err error
 }
 
-func (d fakeDecryptor) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (d fakeDecryptor) Decrypt(_ context.Context, _, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
 	if d.err != nil {
 		return nil, d.err
 	}
@@ -454,7 +454,7 @@ type errOnFirstDecryptor struct {
 	count int
 }
 
-func (d *errOnFirstDecryptor) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (d *errOnFirstDecryptor) Decrypt(_ context.Context, _, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.count++

@@ -112,16 +112,19 @@ func translateRespondentErr(err error) error {
 	return err
 }
 
-// Insert implements api.RespondentStorePort.Insert. The supplied
-// Respondent.ID is ignored — Postgres mints a fresh id via
-// gen_random_uuid() and the returned row carries the canonical
-// id+timestamp. Status defaults to api.RespPending when zero.
+// Insert implements api.RespondentStorePort.Insert. The caller MUST
+// supply r.ID (a fresh uuid.New() value), so the AAD bound into the
+// phone-ciphertext via KMSResolver.Encrypt reproduces at decrypt time
+// (Plan 13.2.5 Task 6 — the row ID is the BuildAAD rowID parameter).
+// Passing uuid.Nil is a programming error and rolls the transaction
+// back with a NOT NULL violation. Status defaults to api.RespPending
+// when zero.
 func (s *RespondentStore) Insert(ctx context.Context, tx postgres.Tx, r api.Respondent) (api.Respondent, error) {
 	const q = `
 		INSERT INTO respondents (
-			tenant_id, project_id, phone_encrypted, phone_hash,
+			id, tenant_id, project_id, phone_encrypted, phone_hash,
 			region_code, attributes, status, source
-		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 		RETURNING ` + respondentColumns
 
 	status := r.Status
@@ -142,6 +145,7 @@ func (s *RespondentStore) Insert(ctx context.Context, tx postgres.Tx, r api.Resp
 	}
 
 	saved, err := scanRespondentRow(tx.QueryRow(ctx, q,
+		r.ID,
 		r.TenantID,
 		r.ProjectID,
 		r.PhoneEncrypted,
@@ -224,7 +228,12 @@ func (s *RespondentStore) IsBlockedDNC(ctx context.Context, tx postgres.Tx, tena
 // COPY stream. The order MUST match the row produced by
 // CopyFromSlice's callback below; any drift between the two corrupts
 // the inserted rows silently.
+//
+// Plan 13.2.5 Task 6: the COPY now includes `id` because the phone
+// ciphertext's AAD is bound to (tenant, scope, rowID). Caller mints the
+// UUID client-side before Encrypt and reuses it here.
 var insertBatchColumns = []string{
+	"id",
 	"tenant_id",
 	"project_id",
 	"phone_encrypted",
@@ -249,6 +258,10 @@ var insertBatchColumns = []string{
 // Empty input is a no-op that returns (0, nil); CopyFrom on an empty
 // source still opens a server-side stream, so the early return is a
 // small but real optimisation.
+//
+// Plan 13.2.5 Task 6: every row MUST have a non-Nil ID. The caller
+// supplies it (uuid.New()) before calling KMSResolver.Encrypt so the
+// same value lands in the BuildAAD scope/rowID envelope.
 func (s *RespondentStore) InsertBatch(ctx context.Context, tx postgres.Tx, rows []api.Respondent) (int, error) {
 	if len(rows) == 0 {
 		return 0, nil
@@ -269,6 +282,7 @@ func (s *RespondentStore) InsertBatch(ctx context.Context, tx postgres.Tx, rows 
 			attrs = map[string]any{}
 		}
 		return []any{
+			r.ID,
 			r.TenantID,
 			r.ProjectID,
 			r.PhoneEncrypted,

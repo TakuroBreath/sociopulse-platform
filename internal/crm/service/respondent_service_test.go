@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -338,9 +339,11 @@ func (s *fakeRespondentStore) ExistingHashes(_ context.Context, _ postgres.Tx, t
 	return out, nil
 }
 
-// fakeKMS is a no-op KMS resolver: every Encrypt call returns
-// "enc:" + plaintext as a single byte slice. Tests assert on exact
-// bytes so a real-world ciphertext envelope isn't necessary.
+// fakeKMS is an AAD-aware KMS resolver double: every Encrypt call
+// records the (tenant, scope, rowID) tuple as a small header before
+// the plaintext, and Decrypt verifies the header matches before
+// returning the body. This lets respondent_service_test.go exercise
+// cross-row swap rejection at the service layer (Plan 13.2.5 Task 6).
 type fakeKMS struct {
 	mu sync.Mutex
 
@@ -356,7 +359,7 @@ func (k *fakeKMS) GenerateDataKey(_ context.Context, _ uuid.UUID) (tenancyapi.Da
 	return tenancyapi.DataKey{}, nil
 }
 
-func (k *fakeKMS) Encrypt(_ context.Context, _ uuid.UUID, plaintext []byte) ([]byte, error) {
+func (k *fakeKMS) Encrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, plaintext []byte) ([]byte, error) {
 	k.mu.Lock()
 	defer k.mu.Unlock()
 	k.encryptCalls++
@@ -365,20 +368,46 @@ func (k *fakeKMS) Encrypt(_ context.Context, _ uuid.UUID, plaintext []byte) ([]b
 		k.encryptErr = nil
 		return nil, err
 	}
-	out := make([]byte, 0, len(plaintext)+4)
+	tag := fakeKMSAADTag(tenantID, scope, rowID)
+	out := make([]byte, 0, 4+len(tag)+len(plaintext))
 	out = append(out, 'e', 'n', 'c', ':')
+	out = append(out, tag...)
 	out = append(out, plaintext...)
 	return out, nil
 }
 
-func (k *fakeKMS) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (k *fakeKMS) Decrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) < 4 || string(ciphertext[:4]) != "enc:" {
 		return nil, errors.New("fakeKMS: malformed ciphertext")
 	}
-	return ciphertext[4:], nil
+	wantTag := fakeKMSAADTag(tenantID, scope, rowID)
+	if len(ciphertext) < 4+len(wantTag) {
+		return nil, errors.New("fakeKMS: ciphertext too short")
+	}
+	gotTag := ciphertext[4 : 4+len(wantTag)]
+	for i, b := range gotTag {
+		if b != wantTag[i] {
+			return nil, errors.New("fakeKMS: AAD tag mismatch")
+		}
+	}
+	return ciphertext[4+len(wantTag):], nil
 }
 
 func (k *fakeKMS) InvalidateCache(_ uuid.UUID) {}
+
+// fakeKMSAADTag returns a 16-byte digest of the AAD inputs. Caller
+// reproduces the same bytes at Decrypt time; a mismatch surfaces as
+// the swap-rejection error.
+func fakeKMSAADTag(tenantID uuid.UUID, scope, rowID string) []byte {
+	h := sha256.New()
+	h.Write(tenantID[:])
+	h.Write([]byte{0x00})
+	h.Write([]byte(scope))
+	h.Write([]byte{0x00})
+	h.Write([]byte(rowID))
+	sum := h.Sum(nil)
+	return sum[:16]
+}
 
 // Compile-time assertion that *fakeKMS satisfies tenancyapi.KMSResolver
 // — keeps the fake in sync if the interface ever changes.
@@ -1165,4 +1194,58 @@ func TestRespondentService_StubbedImportMethodsReturnError(t *testing.T) {
 
 	_, err = svc.GetImportStatus(ctx, "job-1")
 	require.Error(t, err)
+}
+
+// TestRespondentService_PhoneCiphertextSwap_AcrossRows_Rejected is the
+// service-layer demonstration that Plan 13.2.5 Task 6 closes the
+// phone-ciphertext swap defect. Two respondents are created in the
+// same tenant + project; the attacker swaps row B's PhoneEncrypted
+// bytes into row A's record. The next GetWithPhone(A) calls
+// KMSResolver.Decrypt with (tenant, "crm.respondent.phone", A.ID) —
+// but the ciphertext bytes are bound to B.ID in their AEAD AAD, so
+// decryption fails at the AEAD layer.
+//
+// The AAD-aware fakeKMS in this test file reproduces the bind via
+// fakeKMSAADTag; a swap surfaces as the "fakeKMS: AAD tag mismatch"
+// error.
+func TestRespondentService_PhoneCiphertextSwap_AcrossRows_Rejected(t *testing.T) {
+	t.Parallel()
+
+	svc, _, store, _, _, _ := newRespSvc(t)
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	ctx := context.Background()
+
+	// Two respondents in the same tenant + project but with distinct
+	// phones (so phone_hash dedup doesn't fire).
+	a, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     "+79991111111",
+	})
+	require.NoError(t, err)
+	b, err := svc.Create(ctx, crmapi.CreateRespondentInput{
+		TenantID:  tenantID,
+		ProjectID: projectID,
+		Phone:     "+79992222222",
+	})
+	require.NoError(t, err)
+
+	// Attacker: copy B's PhoneEncrypted bytes into A's row.
+	store.mu.Lock()
+	rowA := store.rows[a.ID]
+	rowB := store.rows[b.ID]
+	require.NotEqual(t, rowA.PhoneEncrypted, rowB.PhoneEncrypted,
+		"prerequisite: each row must have distinct ciphertext bytes")
+	rowA.PhoneEncrypted = append([]byte(nil), rowB.PhoneEncrypted...)
+	store.rows[a.ID] = rowA
+	store.mu.Unlock()
+
+	// GetWithPhone(A) passes (tenant, "crm.respondent.phone", A.ID) to
+	// Decrypt; the ciphertext was Encrypt'd with B.ID in its AAD — MUST
+	// fail at the AEAD layer rather than silently surfacing B's phone.
+	_, err = svc.GetWithPhone(ctx, tenantID, a.ID)
+	require.Error(t, err, "swap attack must surface as an error, not B's phone")
+	require.Contains(t, err.Error(), "decrypt",
+		"the failure must come from the KMS decrypt step (AAD mismatch)")
 }

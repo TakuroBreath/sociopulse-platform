@@ -74,6 +74,12 @@ var _ api.RespondentService = (*RespondentService)(nil)
 // the service, and tests share one source of truth.
 const deletionGracePeriod = 30 * 24 * time.Hour
 
+// respondentPhoneAADScope is the AAD scope passed to KMSResolver
+// Encrypt/Decrypt for respondent phone ciphertexts (Plan 13.2.5 Task 6).
+// Bound into the AEAD authentication tag so a phone ciphertext cannot be
+// spliced across rows / columns even when the per-tenant DEK is shared.
+const respondentPhoneAADScope = "crm.respondent.phone"
+
 // defaultSearchPageSize / maxSearchPageSize are the pagination clamps
 // the Search service applies before calling the store. The values
 // match the Plan 05 conventions for List endpoints.
@@ -259,12 +265,19 @@ func (s *RespondentService) applyRespondentCreate(ctx context.Context, tx postgr
 		return api.Respondent{}, gerr
 	}
 
-	ciphertext, eerr := s.kms.Encrypt(ctx, p.in.TenantID, []byte(p.e164))
+	// Plan 13.2.5 Task 6: the phone ciphertext's AAD is bound to the row
+	// ID via encryption.BuildAAD. Mint the row UUID client-side BEFORE
+	// Encrypt so the value bound into the AEAD tag matches what the
+	// Insert SQL writes into respondents.id. Server-side gen_random_uuid()
+	// would render the ciphertext undecryptable.
+	respondentID := uuid.New()
+	ciphertext, eerr := s.kms.Encrypt(ctx, p.in.TenantID, respondentPhoneAADScope, respondentID.String(), []byte(p.e164))
 	if eerr != nil {
 		return api.Respondent{}, fmt.Errorf("crm/service: encrypt phone: %w", eerr)
 	}
 
 	saved, serr := s.store.Insert(ctx, tx, api.Respondent{
+		ID:             respondentID,
 		TenantID:       p.in.TenantID,
 		ProjectID:      p.in.ProjectID,
 		PhoneEncrypted: ciphertext,
@@ -394,7 +407,7 @@ func (s *RespondentService) GetWithPhone(ctx context.Context, callerTenantID, id
 	if row.DeleteAt != nil {
 		return nil, api.ErrRespondentDeleted
 	}
-	plaintext, derr := s.kms.Decrypt(ctx, row.TenantID, row.PhoneEncrypted)
+	plaintext, derr := s.kms.Decrypt(ctx, row.TenantID, respondentPhoneAADScope, row.ID.String(), row.PhoneEncrypted)
 	if derr != nil {
 		return nil, fmt.Errorf("crm/service: get with phone: decrypt: %w", derr)
 	}
@@ -581,11 +594,15 @@ func (s *RespondentService) lookupRespondent(ctx context.Context, id uuid.UUID) 
 // the display-safe mask. Returns an empty string + the wrapped KMS
 // error on decrypt failure — callers decide whether to render "***"
 // or surface the error.
+//
+// Plan 13.2.5 Task 6: the row's ID is bound into the AEAD AAD; an
+// attacker who swaps the ciphertext bytes from another row fails
+// decryption here.
 func (s *RespondentService) maskedPhoneFor(ctx context.Context, r api.Respondent) (string, error) {
 	if len(r.PhoneEncrypted) == 0 {
 		return "", nil
 	}
-	plaintext, err := s.kms.Decrypt(ctx, r.TenantID, r.PhoneEncrypted)
+	plaintext, err := s.kms.Decrypt(ctx, r.TenantID, respondentPhoneAADScope, r.ID.String(), r.PhoneEncrypted)
 	if err != nil {
 		return "", err
 	}

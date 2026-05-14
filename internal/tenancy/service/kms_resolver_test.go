@@ -265,12 +265,14 @@ func TestKMSResolver_EncryptDecrypt_Roundtrip(t *testing.T) {
 	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	plaintext := []byte("super-secret-payload-for-tenant")
-	ct, err := r.Encrypt(context.Background(), tenantID, plaintext)
+	const scope = "auth.user.phone"
+	rowID := uuid.NewString()
+	ct, err := r.Encrypt(context.Background(), tenantID, scope, rowID, plaintext)
 	require.NoError(t, err)
 	require.NotEmpty(t, ct)
 	require.NotEqual(t, plaintext, ct)
 
-	pt, err := r.Decrypt(context.Background(), tenantID, ct)
+	pt, err := r.Decrypt(context.Background(), tenantID, scope, rowID, ct)
 	require.NoError(t, err)
 	require.Equal(t, plaintext, pt)
 }
@@ -288,7 +290,7 @@ func TestKMSResolver_Encrypt_CachesDEK_AvoidsSecondGenerateDataKey(t *testing.T)
 	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
 	for i := 0; i < 5; i++ {
-		_, err := r.Encrypt(context.Background(), tenantID, []byte("payload"))
+		_, err := r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("payload"))
 		require.NoError(t, err)
 	}
 	require.Equal(t, int32(1), kms.gendkCalls.Load(),
@@ -308,12 +310,14 @@ func TestKMSResolver_Decrypt_LazyUnwrapOnCacheMiss(t *testing.T) {
 	// Encrypt with one resolver instance to produce ciphertext; then
 	// decrypt with a fresh resolver instance whose cache is cold.
 	r1 := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
-	ct, err := r1.Encrypt(context.Background(), tenantID, []byte("payload"))
+	const scope = "auth.user.phone"
+	rowID := uuid.NewString()
+	ct, err := r1.Encrypt(context.Background(), tenantID, scope, rowID, []byte("payload"))
 	require.NoError(t, err)
 
 	r2 := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
-	pt, err := r2.Decrypt(context.Background(), tenantID, ct)
+	pt, err := r2.Decrypt(context.Background(), tenantID, scope, rowID, ct)
 	require.NoError(t, err)
 	require.Equal(t, []byte("payload"), pt)
 
@@ -333,12 +337,14 @@ func TestKMSResolver_Decrypt_KMSDecryptErrorMapsToUnavailable(t *testing.T) {
 
 	// Encrypt happily, then break Decrypt before unwrapping.
 	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
-	ct, err := r.Encrypt(context.Background(), tenantID, []byte("payload"))
+	const scope = "auth.user.phone"
+	rowID := uuid.NewString()
+	ct, err := r.Encrypt(context.Background(), tenantID, scope, rowID, []byte("payload"))
 	require.NoError(t, err)
 	r.InvalidateCache(tenantID) // force the next Decrypt to call kms.Decrypt
 
 	kms.decryptErr = errors.New("yandex kms transient")
-	_, err = r.Decrypt(context.Background(), tenantID, ct)
+	_, err = r.Decrypt(context.Background(), tenantID, scope, rowID, ct)
 	require.ErrorIs(t, err, api.ErrKMSUnavailable)
 }
 
@@ -362,7 +368,7 @@ func TestKMSResolver_Decrypt_RejectsMalformedCiphertext(t *testing.T) {
 		{"length prefix overshoot", []byte{0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00}},
 	}
 	for _, tc := range cases {
-		_, err := r.Decrypt(context.Background(), tenantID, tc.in)
+		_, err := r.Decrypt(context.Background(), tenantID, "auth.user.phone", "row-1", tc.in)
 		require.ErrorIs(t, err, api.ErrInvalidArgument,
 			"case %q: expected ErrInvalidArgument", tc.name)
 	}
@@ -398,9 +404,12 @@ func TestKMSResolver_DifferentTenantsHaveSeparateCacheEntries(t *testing.T) {
 
 	r := newTestResolver(t, rs, kms, service.KMSResolverConfig{})
 
-	ctA, err := r.Encrypt(context.Background(), idA, []byte("A's payload"))
+	const scope = "auth.user.phone"
+	rowA := uuid.NewString()
+	rowB := uuid.NewString()
+	ctA, err := r.Encrypt(context.Background(), idA, scope, rowA, []byte("A's payload"))
 	require.NoError(t, err)
-	ctB, err := r.Encrypt(context.Background(), idB, []byte("B's payload"))
+	ctB, err := r.Encrypt(context.Background(), idB, scope, rowB, []byte("B's payload"))
 	require.NoError(t, err)
 
 	require.GreaterOrEqual(t, kms.gendkCalls.Load(), int32(2),
@@ -409,11 +418,11 @@ func TestKMSResolver_DifferentTenantsHaveSeparateCacheEntries(t *testing.T) {
 	// Decrypts must round-trip per tenant; cross-tenant decrypt with the
 	// wrong cache must NOT succeed (the wrapped DEK in ctA names kek-A,
 	// not kek-B).
-	ptA, err := r.Decrypt(context.Background(), idA, ctA)
+	ptA, err := r.Decrypt(context.Background(), idA, scope, rowA, ctA)
 	require.NoError(t, err)
 	require.Equal(t, []byte("A's payload"), ptA)
 
-	ptB, err := r.Decrypt(context.Background(), idB, ctB)
+	ptB, err := r.Decrypt(context.Background(), idB, scope, rowB, ctB)
 	require.NoError(t, err)
 	require.Equal(t, []byte("B's payload"), ptB)
 }
@@ -429,13 +438,13 @@ func TestKMSResolver_InvalidateCache_ForcesNextEncryptToCallKMS(t *testing.T) {
 
 	r := newTestResolver(t, newResolverStore(t, tenant), kms, service.KMSResolverConfig{})
 
-	_, err := r.Encrypt(context.Background(), tenantID, []byte("a"))
+	_, err := r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("a"))
 	require.NoError(t, err)
 	require.Equal(t, int32(1), kms.gendkCalls.Load())
 
 	r.InvalidateCache(tenantID)
 
-	_, err = r.Encrypt(context.Background(), tenantID, []byte("b"))
+	_, err = r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("b"))
 	require.NoError(t, err)
 	require.Equal(t, int32(2), kms.gendkCalls.Load(),
 		"after InvalidateCache, the next Encrypt must mint a fresh DEK from KMS")
@@ -470,13 +479,13 @@ func TestKMSResolver_DEKCacheExpires(t *testing.T) {
 		})
 	t.Cleanup(r.Close)
 
-	_, err := r.Encrypt(context.Background(), tenantID, []byte("hi"))
+	_, err := r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("hi"))
 	require.NoError(t, err)
 	require.Equal(t, int32(1), kms.gendkCalls.Load())
 
 	time.Sleep(50 * time.Millisecond)
 
-	_, err = r.Encrypt(context.Background(), tenantID, []byte("hi-again"))
+	_, err = r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("hi-again"))
 	require.NoError(t, err)
 	require.Equal(t, int32(2), kms.gendkCalls.Load(),
 		"expired DEK must be re-fetched from KMS")
@@ -505,7 +514,7 @@ func TestKMSResolver_DifferentKEKVersionsCacheSeparately(t *testing.T) {
 	t.Cleanup(r.Close)
 
 	// First Encrypt mints DEK#1 wrapped under v1.
-	_, err := r.Encrypt(context.Background(), tenantID, []byte("p1"))
+	_, err := r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("p1"))
 	require.NoError(t, err)
 	require.Equal(t, int32(1), kms.gendkCalls.Load())
 
@@ -519,7 +528,7 @@ func TestKMSResolver_DifferentKEKVersionsCacheSeparately(t *testing.T) {
 	// logic — internally the resolver detects the KEK version change by the
 	// version label returned from GenerateDataKey.
 	r.InvalidateCache(tenantID) // simulate the rotation NATS notice landing
-	_, err = r.Encrypt(context.Background(), tenantID, []byte("p2"))
+	_, err = r.Encrypt(context.Background(), tenantID, "auth.user.phone", uuid.NewString(), []byte("p2"))
 	require.NoError(t, err)
 	require.Equal(t, int32(2), kms.gendkCalls.Load(),
 		"post-rotation Encrypt must mint a v2 DEK")

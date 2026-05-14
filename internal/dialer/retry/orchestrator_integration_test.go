@@ -71,7 +71,7 @@ func startRedis(t *testing.T) *redis.Client {
 // PG update) without standing up the full encryption stack.
 type passthroughDecryptor struct{}
 
-func (passthroughDecryptor) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (passthroughDecryptor) Decrypt(_ context.Context, _, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
 	return ciphertext, nil
 }
 

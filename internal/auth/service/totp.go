@@ -49,6 +49,13 @@ const totpBackupCodesCount = 10
 // crypto/rand; never math/rand.
 const totpBackupCodeBytes = 5
 
+// totpAADScope is the AAD scope label passed to KMSResolver.Encrypt /
+// Decrypt for TOTP secret ciphertexts (Plan 13.2.5 Task 6). Binding the
+// scope into the AEAD tag means a ciphertext stolen from this column
+// cannot be replayed against, say, the respondent-phone column even if
+// the tenant DEK is reused.
+const totpAADScope = "auth.totp.secret"
+
 // TOTPStorePort is the consumer-side projection of *store.TOTPStore the
 // TOTPService needs. Keeping the interface small lets unit tests
 // substitute hand-rolled fakes without dragging the real store and its
@@ -263,8 +270,10 @@ func (s *TOTPService) Enroll(ctx context.Context, userID uuid.UUID) (authapi.TOT
 
 	// Step 4 — encrypt secret with the tenant DEK. The KMSResolver
 	// returns a single ciphertext blob (header + nonce + ciphertext)
-	// that goes verbatim into auth_totp.secret_enc.
-	enc, err := s.kms.Encrypt(ctx, user.TenantID, []byte(secret))
+	// that goes verbatim into auth_totp.secret_enc. Plan 13.2.5 Task 6:
+	// scope+rowID are bound into the AEAD AAD so the ciphertext cannot
+	// be spliced across users/columns.
+	enc, err := s.kms.Encrypt(ctx, user.TenantID, totpAADScope, userID.String(), []byte(secret))
 	if err != nil {
 		return authapi.TOTPEnrollment{}, fmt.Errorf("auth/service: totp kms encrypt: %w", err)
 	}
@@ -307,7 +316,7 @@ func (s *TOTPService) Confirm(ctx context.Context, userID uuid.UUID, code string
 		return nil
 	}
 
-	secret, err := s.kms.Decrypt(ctx, state.TenantID, state.SecretEncrypted)
+	secret, err := s.kms.Decrypt(ctx, state.TenantID, totpAADScope, userID.String(), state.SecretEncrypted)
 	if err != nil {
 		return fmt.Errorf("auth/service: totp kms decrypt: %w", err)
 	}
@@ -360,7 +369,7 @@ func (s *TOTPService) Verify(ctx context.Context, userID uuid.UUID, code string)
 		return false, err
 	}
 
-	secret, err := s.kms.Decrypt(ctx, state.TenantID, state.SecretEncrypted)
+	secret, err := s.kms.Decrypt(ctx, state.TenantID, totpAADScope, userID.String(), state.SecretEncrypted)
 	if err != nil {
 		return false, fmt.Errorf("auth/service: totp kms decrypt: %w", err)
 	}

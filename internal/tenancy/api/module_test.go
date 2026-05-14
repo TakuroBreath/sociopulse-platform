@@ -23,11 +23,11 @@ func (stubKMSResolver) GenerateDataKey(context.Context, uuid.UUID) (api.DataKey,
 	return api.DataKey{}, nil
 }
 
-func (stubKMSResolver) Encrypt(context.Context, uuid.UUID, []byte) ([]byte, error) {
+func (stubKMSResolver) Encrypt(context.Context, uuid.UUID, string, string, []byte) ([]byte, error) {
 	return nil, nil
 }
 
-func (stubKMSResolver) Decrypt(context.Context, uuid.UUID, []byte) ([]byte, error) {
+func (stubKMSResolver) Decrypt(context.Context, uuid.UUID, string, string, []byte) ([]byte, error) {
 	return nil, nil
 }
 

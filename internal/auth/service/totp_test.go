@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"strings"
@@ -262,24 +263,54 @@ func (k *xorKMS) GenerateDataKey(_ context.Context, _ uuid.UUID) (tenancyapi.Dat
 	return tenancyapi.DataKey{}, errors.New("xorKMS: GenerateDataKey not used")
 }
 
-func (k *xorKMS) Encrypt(_ context.Context, _ uuid.UUID, plaintext []byte) ([]byte, error) {
-	out := make([]byte, len(plaintext)+1)
-	out[0] = xorKMSHeader
-	for i, b := range plaintext {
-		out[i+1] = b ^ k.key
+// Encrypt simulates an AAD-aware KMS: the (tenant, scope, rowID) tuple
+// is hashed into the prefix so a Decrypt with mismatching args fails.
+// This lets totp_test.go exercise scope-swap and row-swap defences at
+// the service layer without dragging in real AES-GCM (Plan 13.2.5 Task 6).
+func (k *xorKMS) Encrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, plaintext []byte) ([]byte, error) {
+	tag := xorAADTag(tenantID, scope, rowID)
+	out := make([]byte, 0, 1+len(tag)+len(plaintext))
+	out = append(out, xorKMSHeader)
+	out = append(out, tag...)
+	for _, b := range plaintext {
+		out = append(out, b^k.key)
 	}
 	return out, nil
 }
 
-func (k *xorKMS) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (k *xorKMS) Decrypt(_ context.Context, tenantID uuid.UUID, scope, rowID string, ciphertext []byte) ([]byte, error) {
 	if len(ciphertext) == 0 || ciphertext[0] != xorKMSHeader {
 		return nil, errors.New("xorKMS: bad header")
 	}
-	out := make([]byte, len(ciphertext)-1)
-	for i, b := range ciphertext[1:] {
+	wantTag := xorAADTag(tenantID, scope, rowID)
+	if len(ciphertext) < 1+len(wantTag) {
+		return nil, errors.New("xorKMS: ciphertext too short")
+	}
+	gotTag := ciphertext[1 : 1+len(wantTag)]
+	for i, b := range gotTag {
+		if b != wantTag[i] {
+			return nil, errors.New("xorKMS: AAD tag mismatch")
+		}
+	}
+	body := ciphertext[1+len(wantTag):]
+	out := make([]byte, len(body))
+	for i, b := range body {
 		out[i] = b ^ k.key
 	}
 	return out, nil
+}
+
+// xorAADTag returns a deterministic 16-byte digest of the AAD inputs.
+// SHA-256 is overkill for tests but keeps the helper short.
+func xorAADTag(tenantID uuid.UUID, scope, rowID string) []byte {
+	h := sha256.New()
+	h.Write(tenantID[:])
+	h.Write([]byte{0x00})
+	h.Write([]byte(scope))
+	h.Write([]byte{0x00})
+	h.Write([]byte(rowID))
+	sum := h.Sum(nil)
+	return sum[:16]
 }
 
 func (k *xorKMS) InvalidateCache(_ uuid.UUID) {}
@@ -522,6 +553,57 @@ func TestTOTPService_Confirm_AcceptsValidCodeAndAudits(t *testing.T) {
 	require.Equal(t, authapi.AuditActionTOTPEnrolled, events[0].Action)
 	require.Equal(t, "user:"+fx.user.ID.String(), events[0].Target)
 	require.NotNil(t, events[0].ActorID)
+}
+
+// TestTOTPService_SecretCiphertextSwap_AcrossUsers_Rejected is the
+// service-layer demonstration that Plan 13.2.5 Task 6 closes the
+// swap-attack defect. Two users enrol; the attacker swaps user B's
+// SecretEncrypted bytes into user A's row. The next Confirm against
+// user A invokes KMSResolver.Decrypt with (tenant, scope, A.ID) — the
+// AAD does not match the ciphertext encrypted under (tenant, scope,
+// B.ID), so decryption fails at the AEAD layer.
+//
+// The fake xorKMS in this test file reproduces the AAD bind contract
+// (xorAADTag is part of the prefix); a swap thus surfaces as the
+// "xorKMS: AAD tag mismatch" error.
+func TestTOTPService_SecretCiphertextSwap_AcrossUsers_Rejected(t *testing.T) {
+	t.Parallel()
+
+	fx := newTOTPFixture(t)
+
+	// Seed user B under the same tenant so the tenant scope alone
+	// cannot account for any rejection.
+	userB := authapi.User{
+		ID:       uuid.New(),
+		TenantID: fx.user.TenantID,
+		Login:    "bob",
+	}
+	fx.users.seed(userB)
+
+	// Enrol user A (the fixture default).
+	_, err := fx.svc.Enroll(context.Background(), fx.user.ID)
+	require.NoError(t, err)
+	// Enrol user B.
+	_, err = fx.svc.Enroll(context.Background(), userB.ID)
+	require.NoError(t, err)
+
+	// Attacker: copy user B's ciphertext into user A's row.
+	rowA, _ := fx.store.snapshot(fx.user.ID)
+	rowB, _ := fx.store.snapshot(userB.ID)
+	require.NotEqual(t, rowA.SecretEncrypted, rowB.SecretEncrypted,
+		"prerequisite: each user must have distinct ciphertext bytes")
+	fx.store.mu.Lock()
+	rowA.SecretEncrypted = append([]byte(nil), rowB.SecretEncrypted...)
+	fx.store.rows[fx.user.ID] = rowA
+	fx.store.mu.Unlock()
+
+	// Confirm against user A: the decrypt call passes (tenant, scope,
+	// userA.ID) as AAD, but the ciphertext was Encrypt'd with userB.ID
+	// in its AAD. Decrypt MUST fail.
+	err = fx.svc.Confirm(context.Background(), fx.user.ID, "000000")
+	require.Error(t, err, "swap attack must surface as an error, not a successful confirm")
+	require.Contains(t, err.Error(), "kms decrypt",
+		"the failure must come from the KMS decrypt step (AAD mismatch)")
 }
 
 // Confirm on an already-enrolled row is idempotent (no-op).
@@ -821,13 +903,13 @@ func (k *errKMS) EnsureKEK(_ context.Context, _ uuid.UUID) (string, error) {
 func (k *errKMS) GenerateDataKey(_ context.Context, _ uuid.UUID) (tenancyapi.DataKey, error) {
 	return tenancyapi.DataKey{}, errors.New("not used")
 }
-func (k *errKMS) Encrypt(_ context.Context, _ uuid.UUID, plaintext []byte) ([]byte, error) {
+func (k *errKMS) Encrypt(_ context.Context, _ uuid.UUID, _, _ string, plaintext []byte) ([]byte, error) {
 	if k.encErr != nil {
 		return nil, k.encErr
 	}
 	return append([]byte{xorKMSHeader}, plaintext...), nil
 }
-func (k *errKMS) Decrypt(_ context.Context, _ uuid.UUID, ciphertext []byte) ([]byte, error) {
+func (k *errKMS) Decrypt(_ context.Context, _ uuid.UUID, _, _ string, ciphertext []byte) ([]byte, error) {
 	if k.decErr != nil {
 		return nil, k.decErr
 	}

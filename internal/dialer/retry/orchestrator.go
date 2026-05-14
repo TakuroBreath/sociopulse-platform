@@ -31,11 +31,17 @@ const (
 //
 // Production wiring passes a thin adapter around tenancy.KMSResolver
 // (the same surface the crm service uses on the read path).
+//
+// Plan 13.2.5 Task 6: respondentID is forwarded as the BuildAAD rowID
+// so the AEAD bind reproduces — the same value the RespondentService
+// used at Encrypt time.
 type Decryptor interface {
 	// Decrypt resolves the per-tenant DEK and decrypts the supplied
 	// ciphertext. The returned bytes are the E.164 phone number used
-	// by the dialer.
-	Decrypt(ctx context.Context, tenantID uuid.UUID, ciphertext []byte) ([]byte, error)
+	// by the dialer. respondentID is the owning row's UUID — bound into
+	// the AEAD AAD by the implementation (or ignored on the legacy
+	// decrypt path for pre-Plan-13.2.5 ciphertexts).
+	Decrypt(ctx context.Context, tenantID, respondentID uuid.UUID, ciphertext []byte) ([]byte, error)
 }
 
 // Config bundles the dependencies and settings for an Orchestrator.
@@ -287,7 +293,7 @@ func (o *Orchestrator) handleRow(ctx context.Context, row MatureRetryRow) {
 		return
 	}
 
-	phone, err := o.decrypt.Decrypt(ctx, row.TenantID, row.PhoneCiphertext)
+	phone, err := o.decrypt.Decrypt(ctx, row.TenantID, row.ID, row.PhoneCiphertext)
 	if err != nil {
 		o.log.Error("decrypt phone failed",
 			zap.Stringer("respondent_id", row.ID),
