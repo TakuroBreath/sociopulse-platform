@@ -66,10 +66,10 @@ func TestRelayMetrics_ParkedRowsMetricMetadata(t *testing.T) {
 	require.NoError(t, err)
 
 	const want = `
-		# HELP sociopulse_outbox_parked_rows_total Outbox rows parked at attempts >= MaxRetry; awaiting manual remediation. Alert: > 0 for 5m.
-		# TYPE sociopulse_outbox_parked_rows_total gauge
-		sociopulse_outbox_parked_rows_total{tenant="t1"} 3
+		# HELP sociopulse_outbox_parked_rows Outbox rows parked at attempts >= MaxRetry; awaiting manual remediation. Alert: > 0 for 5m.
+		# TYPE sociopulse_outbox_parked_rows gauge
+		sociopulse_outbox_parked_rows{tenant="t1"} 3
 	`
 	m.ParkedRows.WithLabelValues("t1").Set(3)
-	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(want), "sociopulse_outbox_parked_rows_total"))
+	require.NoError(t, testutil.GatherAndCompare(reg, strings.NewReader(want), "sociopulse_outbox_parked_rows"))
 }

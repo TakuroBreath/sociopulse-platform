@@ -18,8 +18,8 @@ import (
 type RelayMetrics struct {
 	// ParkedRows is the number of unpublished event_outbox rows whose
 	// attempts column has reached MaxRetry, per tenant. Operators alert
-	// on `sociopulse_outbox_parked_rows_total > 0 for 5m` and remediate
-	// by inspecting last_error / restarting the relay after fixing the
+	// on `sociopulse_outbox_parked_rows > 0 for 5m` and remediate by
+	// inspecting last_error / restarting the relay after fixing the
 	// downstream NATS subject.
 	//
 	// Gauge (not counter): parked rows can decrease (manual remediation
@@ -38,7 +38,7 @@ func RegisterRelayMetrics(reg prometheus.Registerer) (*RelayMetrics, error) {
 		ParkedRows: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace: "sociopulse",
 			Subsystem: "outbox",
-			Name:      "parked_rows_total",
+			Name:      "parked_rows",
 			Help:      "Outbox rows parked at attempts >= MaxRetry; awaiting manual remediation. Alert: > 0 for 5m.",
 		}, []string{"tenant"}),
 	}
