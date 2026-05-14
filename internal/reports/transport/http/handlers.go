@@ -96,6 +96,11 @@ func (h *Handlers) Export(c *gin.Context) {
 		// threshold. Reuse the parsed RenderInput; the actor becomes
 		// the notify target because the API contract for a sync
 		// fallback is "tell the same user who hit the endpoint".
+		if h.Queue == nil {
+			writeErr(c, http.StatusNotImplemented, "reports.async_unavailable",
+				"async path requires Redis; the reports queue is not configured on this deployment")
+			return
+		}
 		ticket, qerr := h.Queue.Enqueue(c.Request.Context(), reportsapi.JobInput{
 			RenderInput:  in,
 			NotifyUserID: in.ActorID,
@@ -119,6 +124,11 @@ func (h *Handlers) Export(c *gin.Context) {
 // validates the payload, enqueues a Job for kind=custom, and returns
 // 202 + JobTicket.
 func (h *Handlers) Custom(c *gin.Context) {
+	if h.Queue == nil {
+		writeErr(c, http.StatusNotImplemented, "reports.async_unavailable",
+			"async path requires Redis; the reports queue is not configured on this deployment")
+		return
+	}
 	in, herr := parseRenderInput(c, reportsapi.KindCustom)
 	if herr != nil {
 		writeErr(c, herr.status, herr.code, herr.message)
@@ -141,6 +151,11 @@ func (h *Handlers) Custom(c *gin.Context) {
 // belongs to the caller's tenant before this handler runs, so the
 // handler just fetches and serialises.
 func (h *Handlers) GetJob(c *gin.Context) {
+	if h.Queue == nil {
+		writeErr(c, http.StatusNotImplemented, "reports.async_unavailable",
+			"job tracking requires Redis; the reports queue is not configured on this deployment")
+		return
+	}
 	jobID := c.Param("jobID")
 	job, err := h.Queue.Get(c.Request.Context(), jobID)
 	if err != nil {
@@ -157,6 +172,11 @@ func (h *Handlers) GetJob(c *gin.Context) {
 // URL is minted eagerly by the consumer at MarkSucceeded; this handler
 // is a thin proxy.
 func (h *Handlers) Download(c *gin.Context) {
+	if h.Queue == nil {
+		writeErr(c, http.StatusNotImplemented, "reports.async_unavailable",
+			"job download requires Redis; the reports queue is not configured on this deployment")
+		return
+	}
 	jobID := c.Param("jobID")
 	job, err := h.Queue.Get(c.Request.Context(), jobID)
 	if err != nil {

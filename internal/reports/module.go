@@ -198,6 +198,12 @@ func (m *Module) Register(d modules.Deps) error {
 	} else if m.cfg.ObjectStore == nil {
 		logger.Warn("reports: ObjectStore unavailable, async Queue disabled")
 	} else {
+		// asynqClient owns a Redis connection pool. We do NOT call
+		// .Close() — cmd/api has no module-level Stop hook today
+		// (Module.Register is a one-shot wiring API). The OS releases
+		// the FDs at process exit; in tests that boot cmd/api in-process
+		// the leak is bounded by the process lifecycle. If a future
+		// PRD adds Module.Stop, wire asynqClient.Close into it.
 		asynqClient = asynq.NewClient(asynq.RedisClientOpt{
 			Addr:     d.Config.Database.Redis.Addr,
 			Password: d.Config.Database.Redis.Password,
