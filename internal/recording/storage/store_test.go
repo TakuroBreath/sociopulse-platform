@@ -3,8 +3,10 @@ package storage_test
 import (
 	"context"
 	"io"
+	"net/url"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -155,6 +157,76 @@ func TestLocalObjectStore_CtxCancelled(t *testing.T) {
 	require.ErrorIs(t, err, context.Canceled)
 
 	err = s.Delete(ctx, "bucket-A", "k")
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestLocalObjectStore_Put_RoundTrip(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	ctx := context.Background()
+
+	payload := []byte("hello world")
+	require.NoError(t, s.Put(ctx, "test-bucket", "test/key", payload, "text/plain"))
+
+	rc, err := s.Get(ctx, "test-bucket", "test/key")
+	require.NoError(t, err)
+	defer rc.Close()
+	got, err := io.ReadAll(rc)
+	require.NoError(t, err)
+	require.Equal(t, payload, got)
+}
+
+func TestLocalObjectStore_Put_OverwritesExisting(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	ctx := context.Background()
+	require.NoError(t, s.Put(ctx, "b", "k", []byte("v1"), "text/plain"))
+	require.NoError(t, s.Put(ctx, "b", "k", []byte("v2"), "text/plain"))
+	rc, err := s.Get(ctx, "b", "k")
+	require.NoError(t, err)
+	defer rc.Close()
+	got, _ := io.ReadAll(rc)
+	require.Equal(t, []byte("v2"), got)
+}
+
+func TestLocalObjectStore_Put_CtxCanceled(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err := s.Put(ctx, "b", "k", []byte("v"), "text/plain")
+	require.ErrorIs(t, err, context.Canceled)
+}
+
+func TestLocalObjectStore_PresignedURL_Shape(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	ctx := context.Background()
+	u, err := s.PresignedURL(ctx, "bucket-x", "key/sub", 24*time.Hour)
+	require.NoError(t, err)
+	parsed, err := url.Parse(u)
+	require.NoError(t, err)
+	require.Equal(t, "local", parsed.Scheme)
+	require.Equal(t, "bucket-x", parsed.Host)
+	require.Equal(t, "/key/sub", parsed.Path)
+	require.NotEmpty(t, parsed.Query().Get("expires"))
+}
+
+func TestLocalObjectStore_PresignedURL_RejectsNonPositiveTTL(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	_, err := s.PresignedURL(context.Background(), "b", "k", 0)
+	require.Error(t, err)
+	_, err = s.PresignedURL(context.Background(), "b", "k", -time.Second)
+	require.Error(t, err)
+}
+
+func TestLocalObjectStore_PresignedURL_CtxCanceled(t *testing.T) {
+	t.Parallel()
+	s := storage.NewLocalObjectStore()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := s.PresignedURL(ctx, "b", "k", time.Hour)
 	require.ErrorIs(t, err, context.Canceled)
 }
 
