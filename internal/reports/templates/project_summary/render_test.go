@@ -32,7 +32,7 @@ func sample() service.ProjectSummaryData {
 		},
 		Regions: []analyticsapi.RegionProgressRow{
 			{RegionCode: "RU-MOW", Done: 100, Plan: 200, Progress: 0.5},
-			{RegionCode: "RU-SPE", Done: 70, Plan: 150, Progress: 0.4667},
+			{RegionCode: "Регион-Север", Done: 70, Plan: 150, Progress: 0.4667},
 		},
 	}
 }
@@ -65,6 +65,20 @@ func TestRenderCSV_BOMAndSections(t *testing.T) {
 	require.Equal(t, "text/csv; charset=utf-8", res.MIME)
 	// Summary(7) + blank + State(5) + blank + Regions(3) = 17 newlines.
 	require.Equal(t, 17, bytes.Count(res.Bytes, []byte("\n")))
+}
+
+// TestRenderCSV_CyrillicRoundTrip pins the UTF-8 BOM + payload encoding
+// for non-ASCII region codes — Cyrillic must survive the BOM-prefixed
+// csv.Writer pipeline. (PDF Cyrillic is exercised end-to-end via the
+// operator_efficiency renderer test, which uses Cyrillic operator names;
+// gopdf's content-stream encoding makes PDF substring assertions
+// impractical, so we don't repeat that here.)
+func TestRenderCSV_CyrillicRoundTrip(t *testing.T) {
+	t.Parallel()
+	res, err := tmpl.RenderCSV(sample())
+	require.NoError(t, err)
+	require.True(t, bytes.Contains(res.Bytes, []byte("Регион-Север")),
+		"Cyrillic region code must round-trip through CSV unchanged")
 }
 
 func TestRenderPDF_ValidPrefix(t *testing.T) {

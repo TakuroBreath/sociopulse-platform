@@ -2,8 +2,6 @@ package hourly_activity //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
@@ -12,27 +10,29 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const pdfRowLimit = 5000
-
 // RenderPDF emits a (Hour, Count, AvgDurSec) table. Hour is formatted as
 // "2006-01-02 15:04" (human-readable). >5000 buckets return
 // reportsapi.ErrTooLarge.
 func RenderPDF(data service.HourlyActivityData) (reportsapi.RenderResult, error) {
-	if len(data.Buckets) > pdfRowLimit {
+	if len(data.Buckets) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("hourly_activity.pdf: %d rows > %d cap: %w",
-			len(data.Buckets), pdfRowLimit, reportsapi.ErrTooLarge)
+			len(data.Buckets), common.PDFRowLimit, reportsapi.ErrTooLarge)
 	}
 	pdf, err := common.PDFInit()
 	if err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("hourly_activity.pdf: %w", err)
 	}
-	defer pdf.Close()
+	defer func() { _ = pdf.Close() }()
 	if err := common.PDFHeader(pdf, "Hourly Activity"); err != nil {
 		return reportsapi.RenderResult{}, err
 	}
 	widths := []float64{160, 80, 80}
+	header := []string{"Hour", "Count", "AvgDurSec"}
+	writeHeader := func(y float64) (float64, error) {
+		return common.PDFRow(pdf, y, header, widths)
+	}
 	y := 80.0
-	y, err = common.PDFRow(pdf, y, []string{"Hour", "Count", "AvgDurSec"}, widths)
+	y, err = writeHeader(y)
 	if err != nil {
 		return reportsapi.RenderResult{}, err
 	}
@@ -48,18 +48,15 @@ func RenderPDF(data service.HourlyActivityData) (reportsapi.RenderResult, error)
 		if y > 800 {
 			pdf.AddPage()
 			y = 40
+			y, err = writeHeader(y)
+			if err != nil {
+				return reportsapi.RenderResult{}, err
+			}
 		}
 	}
 	buf := &bytes.Buffer{}
 	if _, err := pdf.WriteTo(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("hourly_activity.pdf: WriteTo: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("hourly_activity_%s.pdf", data.Window.From.Format("20060102")),
-		MIME:     "application/pdf",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, data.Window.From), nil
 }

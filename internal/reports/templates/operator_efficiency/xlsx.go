@@ -4,8 +4,6 @@ package operator_efficiency //nolint:revive // package name mirrors the module's
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -15,7 +13,10 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const sheetName = "operator_efficiency"
+const (
+	sheetName = "operator_efficiency"
+	kind      = "operator_efficiency"
+)
 
 // RenderXLSX produces an .xlsx artifact for the operator-efficiency
 // projection. One header row + N body rows under the "operator_efficiency"
@@ -64,12 +65,5 @@ func RenderXLSX(data service.OperatorEfficiencyData) (reportsapi.RenderResult, e
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("operator_efficiency_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }

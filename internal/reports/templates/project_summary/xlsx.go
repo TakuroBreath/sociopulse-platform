@@ -5,8 +5,6 @@ package project_summary //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -20,6 +18,7 @@ const (
 	sheetSummary = "Summary"
 	sheetState   = "OperatorState"
 	sheetRegions = "Regions"
+	kind         = "project_summary"
 )
 
 // RenderXLSX produces a 3-sheet workbook: Summary (Calls), OperatorState,
@@ -88,14 +87,7 @@ func RenderXLSX(data service.ProjectSummaryData) (reportsapi.RenderResult, error
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("project_summary.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("project_summary_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }
 
 // writeRows writes a sheet of N rows where row 0 is the styled header.

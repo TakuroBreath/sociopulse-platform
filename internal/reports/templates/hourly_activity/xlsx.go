@@ -7,8 +7,6 @@ package hourly_activity //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -18,7 +16,10 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const sheetName = "hourly_activity"
+const (
+	sheetName = "hourly_activity"
+	kind      = "hourly_activity"
+)
 
 // RenderXLSX produces a single-sheet workbook with header + N bucket rows.
 // The Hour column uses a date-format style for portability across Excel,
@@ -78,12 +79,5 @@ func RenderXLSX(data service.HourlyActivityData) (reportsapi.RenderResult, error
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("hourly_activity.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("hourly_activity_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }

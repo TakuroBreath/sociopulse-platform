@@ -2,8 +2,6 @@ package calls_by_status //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
@@ -12,20 +10,18 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const pdfRowLimit = 5000
-
 // RenderPDF emits 4 summary lines + (Status, Count) table. >5000 buckets
 // return reportsapi.ErrTooLarge.
 func RenderPDF(data service.CallsByStatusData) (reportsapi.RenderResult, error) {
-	if len(data.Result.ByStatus) > pdfRowLimit {
+	if len(data.Result.ByStatus) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("calls_by_status.pdf: %d rows > %d cap: %w",
-			len(data.Result.ByStatus), pdfRowLimit, reportsapi.ErrTooLarge)
+			len(data.Result.ByStatus), common.PDFRowLimit, reportsapi.ErrTooLarge)
 	}
 	pdf, err := common.PDFInit()
 	if err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("calls_by_status.pdf: %w", err)
 	}
-	defer pdf.Close()
+	defer func() { _ = pdf.Close() }()
 	if err := common.PDFHeader(pdf, "Calls by Status"); err != nil {
 		return reportsapi.RenderResult{}, err
 	}
@@ -44,7 +40,11 @@ func RenderPDF(data service.CallsByStatusData) (reportsapi.RenderResult, error) 
 		}
 	}
 	y += 12
-	y, err = common.PDFRow(pdf, y, []string{"Status", "Count"}, widths2)
+	tableHeader := []string{"Status", "Count"}
+	writeHeader := func(y float64) (float64, error) {
+		return common.PDFRow(pdf, y, tableHeader, widths2)
+	}
+	y, err = writeHeader(y)
 	if err != nil {
 		return reportsapi.RenderResult{}, err
 	}
@@ -56,18 +56,15 @@ func RenderPDF(data service.CallsByStatusData) (reportsapi.RenderResult, error) 
 		if y > 800 {
 			pdf.AddPage()
 			y = 40
+			y, err = writeHeader(y)
+			if err != nil {
+				return reportsapi.RenderResult{}, err
+			}
 		}
 	}
 	buf := &bytes.Buffer{}
 	if _, err := pdf.WriteTo(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("calls_by_status.pdf: WriteTo: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("calls_by_status_%s.pdf", data.Window.From.Format("20060102")),
-		MIME:     "application/pdf",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, data.Window.From), nil
 }

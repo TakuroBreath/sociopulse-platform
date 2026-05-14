@@ -7,8 +7,6 @@ package quality_control //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -18,7 +16,10 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const sheetName = "quality_control"
+const (
+	sheetName = "quality_control"
+	kind      = "quality_control"
+)
 
 // RenderXLSX produces a single-sheet workbook with 4 summary rows + a
 // (Status, Count) breakdown table.
@@ -82,12 +83,5 @@ func RenderXLSX(data service.QualityControlData) (reportsapi.RenderResult, error
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("quality_control.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("quality_control_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }

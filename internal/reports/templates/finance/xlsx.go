@@ -7,8 +7,6 @@ package finance
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -18,7 +16,10 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const sheetName = "finance"
+const (
+	sheetName = "finance"
+	kind      = "finance"
+)
 
 // RenderXLSX produces a single-sheet workbook with 5 labeled rows. No PDF
 // row cap because the row count is fixed.
@@ -65,12 +66,5 @@ func RenderXLSX(data service.FinanceData) (reportsapi.RenderResult, error) {
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("finance.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("finance_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }

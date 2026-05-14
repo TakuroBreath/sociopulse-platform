@@ -2,8 +2,6 @@ package operator_efficiency //nolint:revive // package name mirrors the module's
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
@@ -12,30 +10,34 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const pdfRowLimit = 5000
-
 // RenderPDF produces a PDF table of operator KPIs. Renderers with >5000
 // detail rows return reportsapi.ErrTooLarge so the runner can route the
 // caller to an XLSX fallback or async path.
 func RenderPDF(data service.OperatorEfficiencyData) (reportsapi.RenderResult, error) {
-	if len(data.Rows) > pdfRowLimit {
+	if len(data.Rows) > common.PDFRowLimit {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.pdf: %d rows > %d cap: %w",
-			len(data.Rows), pdfRowLimit, reportsapi.ErrTooLarge)
+			len(data.Rows), common.PDFRowLimit, reportsapi.ErrTooLarge)
 	}
 	pdf, err := common.PDFInit()
 	if err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.pdf: %w", err)
 	}
-	defer pdf.Close()
+	defer func() { _ = pdf.Close() }()
 	if err := common.PDFHeader(pdf, "Operator Efficiency"); err != nil {
 		return reportsapi.RenderResult{}, err
 	}
 	widths := []float64{120, 60, 80, 80, 80, 80}
+	header := []string{"Operator", "Calls", "Success", "AvgTalk", "Pause", "Above?"}
+	writeHeader := func(y float64) (float64, error) {
+		return common.PDFRow(pdf, y, header, widths)
+	}
+
 	y := 80.0
-	y, err = common.PDFRow(pdf, y, []string{"Operator", "Calls", "Success", "AvgTalk", "Pause", "Above?"}, widths)
+	y, err = writeHeader(y)
 	if err != nil {
 		return reportsapi.RenderResult{}, err
 	}
+
 	for _, row := range data.Rows {
 		y, err = common.PDFRow(pdf, y, []string{
 			row.DisplayName,
@@ -51,18 +53,15 @@ func RenderPDF(data service.OperatorEfficiencyData) (reportsapi.RenderResult, er
 		if y > 800 {
 			pdf.AddPage()
 			y = 40
+			y, err = writeHeader(y)
+			if err != nil {
+				return reportsapi.RenderResult{}, err
+			}
 		}
 	}
 	buf := &bytes.Buffer{}
 	if _, err := pdf.WriteTo(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("operator_efficiency.pdf: WriteTo: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("operator_efficiency_%s.pdf", data.Window.From.Format("20060102")),
-		MIME:     "application/pdf",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, data.Window.From), nil
 }

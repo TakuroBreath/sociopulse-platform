@@ -2,8 +2,6 @@ package quality_control //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
@@ -45,12 +43,5 @@ func RenderCSV(data service.QualityControlData) (reportsapi.RenderResult, error)
 	if err := w.Error(); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("quality_control.csv: flush: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("quality_control_%s.csv", data.Window.From.Format("20060102")),
-		MIME:     "text/csv; charset=utf-8",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMECSV, data.Window.From), nil
 }

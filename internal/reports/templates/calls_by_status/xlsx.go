@@ -4,8 +4,6 @@ package calls_by_status //nolint:revive // package name mirrors the module's fil
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 
 	"github.com/xuri/excelize/v2"
@@ -15,7 +13,10 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-const sheetName = "calls_by_status"
+const (
+	sheetName = "calls_by_status"
+	kind      = "calls_by_status"
+)
 
 // RenderXLSX produces a single-sheet workbook with 4 summary rows + a
 // header + N status-bucket rows.
@@ -81,12 +82,5 @@ func RenderXLSX(data service.CallsByStatusData) (reportsapi.RenderResult, error)
 	if err := f.Write(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("calls_by_status.xlsx: Write: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("calls_by_status_%s.xlsx", data.Window.From.Format("20060102")),
-		MIME:     "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEXlsx, data.Window.From), nil
 }

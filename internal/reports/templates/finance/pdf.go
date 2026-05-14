@@ -2,8 +2,6 @@ package finance
 
 import (
 	"bytes"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
 	"strconv"
 
@@ -12,19 +10,24 @@ import (
 	"github.com/sociopulse/platform/internal/reports/templates/common"
 )
 
-// RenderPDF emits 5 (metric, value) rows under a header. PDF row cap not
-// applicable — finance has a fixed 5-row layout.
+// RenderPDF emits a "Metric | Value" header row followed by 5 (metric, value)
+// rows. PDF row cap not applicable — finance has a fixed 5-row layout.
 func RenderPDF(data service.FinanceData) (reportsapi.RenderResult, error) {
 	pdf, err := common.PDFInit()
 	if err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("finance.pdf: %w", err)
 	}
-	defer pdf.Close()
+	defer func() { _ = pdf.Close() }()
 	if err := common.PDFHeader(pdf, "Finance"); err != nil {
 		return reportsapi.RenderResult{}, err
 	}
-	widths := []float64{200, 200}
+	widths := []float64{180, 180}
+	header := []string{"Metric", "Value"}
 	y := 80.0
+	y, err = common.PDFRow(pdf, y, header, widths)
+	if err != nil {
+		return reportsapi.RenderResult{}, err
+	}
 	rows := [][]string{
 		{"TotalCalls", strconv.FormatUint(data.Calls.Total, 10)},
 		{"TotalDurSec", strconv.FormatUint(data.Calls.TotalDurSec, 10)},
@@ -42,12 +45,5 @@ func RenderPDF(data service.FinanceData) (reportsapi.RenderResult, error) {
 	if _, err := pdf.WriteTo(buf); err != nil {
 		return reportsapi.RenderResult{}, fmt.Errorf("finance.pdf: WriteTo: %w", err)
 	}
-	payload := buf.Bytes()
-	sum := sha256.Sum256(payload)
-	return reportsapi.RenderResult{
-		Bytes:    payload,
-		Filename: fmt.Sprintf("finance_%s.pdf", data.Window.From.Format("20060102")),
-		MIME:     "application/pdf",
-		SHA256:   hex.EncodeToString(sum[:]),
-	}, nil
+	return common.NewRenderResult(buf.Bytes(), kind, common.MIMEPDF, data.Window.From), nil
 }
