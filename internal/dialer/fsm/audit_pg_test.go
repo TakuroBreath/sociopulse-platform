@@ -492,8 +492,8 @@ func TestEventStatusSubmitted_EmitsCallFinalizedOutboxRows(t *testing.T) {
 	require.NotEmpty(t, analyticsEvent.Date)
 	require.False(t, analyticsEvent.TS.IsZero())
 	// Q8/Q9 caveats: v1 ingester accepts empty-string sentinels.
-	require.Equal(t, "", analyticsEvent.HangupCause)
-	require.Equal(t, "", analyticsEvent.RegionCode)
+	require.Empty(t, analyticsEvent.HangupCause)
+	require.Empty(t, analyticsEvent.RegionCode)
 }
 
 // TestAppendStateLogAndOutbox_AlsoEmitsAnalyticsOpStateRow verifies the

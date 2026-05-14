@@ -14,6 +14,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
 	"time"
 
 	"github.com/google/uuid"
@@ -519,10 +520,11 @@ VALUES ($1, $2, $3, $4, $5, $6, $7, now())
 // floor-division (not rounding) matches the analytics SLO of "report
 // completed seconds, never inflate".
 func buildOutboxEvent(r store.RecordingRow, callCtx store.CallContext) (outbox.Event, error) {
-	durationSec := r.DurationMS / 1000
-	if durationSec < 0 {
-		durationSec = 0
-	}
+	// Clamp [0, math.MaxInt32]: lower bound guards a malformed negative
+	// duration_ms; upper bound is honest about the int64 → int32 cast
+	// (max ~2.1B seconds ≈ 68y — v1 calls are minutes, but the saturation
+	// makes the lint suppression unnecessary).
+	durationSec := max(int64(0), min(int64(math.MaxInt32), r.DurationMS/1000))
 	payload, err := json.Marshal(rapi.RecordingUploadedEvent{
 		RecordingID:        r.ID,
 		CallID:             r.CallID,
@@ -534,7 +536,7 @@ func buildOutboxEvent(r store.RecordingRow, callCtx store.CallContext) (outbox.E
 		EventID:            uuid.New(),
 		BytesSize:          r.BytesSize,
 		DurationMS:         r.DurationMS,
-		DurationSec:        int32(durationSec), //nolint:gosec // durationSec >= 0; int32 range is enough for any realistic call.
+		DurationSec:        int32(durationSec), //nolint:gosec // bounded [0, math.MaxInt32] by the max(0, min(...)) clamp at line 525.
 		SHA256Hex:          r.SHA256Hex,
 		Status:             r.Status,
 		CommittedAt:        r.CommittedAt.Unix(),

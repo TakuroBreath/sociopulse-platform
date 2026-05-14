@@ -20,12 +20,13 @@ const (
 	// SubjectCallFinalized is published when a call's terminal state is set.
 	// Includes cost-bearing fields. Consumed by analytics + billing.
 	SubjectCallFinalized = "tenant.<t>.dialer.call.finalized"
-
-	// SubjectAnalyticsCalls is the denormalised call event for ClickHouse.
-	SubjectAnalyticsCalls = "analytics.event.calls"
-	// SubjectAnalyticsOperatorState is the denormalised operator state row for ClickHouse.
-	SubjectAnalyticsOperatorState = "analytics.event.operator_state"
 )
+
+// The cross-tenant analytics subjects (analytics.event.calls,
+// analytics.event.operator_state) are declared in internal/analytics/api
+// as the single source of truth. The dialer publishers in
+// internal/dialer/fsm/audit.go reference them via the analyticsapi import
+// alias — avoid duplicating string literals here (silent-drift risk).
 
 // SubjectOpStateFor returns the concrete subject for an operator FSM
 // transition for the given tenant/operator.

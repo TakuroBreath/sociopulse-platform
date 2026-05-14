@@ -379,7 +379,12 @@ func (m *Machine) appendCallFinalizedOutbox(
 		ProjectID:    entry.ProjectID,
 		RespondentID: entry.RespondentID,
 		TrunkUsed:    entry.TrunkUsed,
-		DurationSec:  int32(entry.DurationSec), //nolint:gosec // DurationSec is bounded by uint32 in the entry
+		// Saturate at math.MaxInt32 to make the uint32 → int32 cast
+		// explicit and overflow-safe (uint32 max ~4.3B vs int32 ~2.1B).
+		// v1 always passes 0, but the next telephony plumb-through
+		// would otherwise wrap silently. gosec G115 can't see the
+		// min() clamp; the suppression is justified by the line above.
+		DurationSec:  int32(min(entry.DurationSec, uint32(math.MaxInt32))), //nolint:gosec // clamped to MaxInt32 immediately above.
 		Status:       entry.Status,
 		StorageBytes: entry.StorageBytes,
 		FinalizedAt:  entry.FinalizedAt.Unix(),

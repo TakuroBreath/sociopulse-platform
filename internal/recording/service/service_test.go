@@ -356,10 +356,8 @@ func TestCommit_OutboxPayload_HasAllAnalyticsFields(t *testing.T) {
 	// FSNode mirrors calls.freeswitch_node. In this test fixture the
 	// calls row is seeded with NULL freeswitch_node, so an empty string
 	// is the expected v1 fidelity caveat (analytics ingester treats ""
-	// as "unknown"). We assert the field exists in the JSON (decoded
-	// without error above) and that it is a string (decoded into a
-	// string field, so any non-error means it was a string).
-	_ = ev.FSNode
+	// as "unknown"). Make the invariant load-bearing in CI.
+	require.Empty(t, ev.FSNode)
 }
 
 // ────────── helpers ──────────
