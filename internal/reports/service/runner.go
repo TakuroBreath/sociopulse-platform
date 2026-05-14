@@ -32,6 +32,11 @@ type TenantRunner interface {
 	WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error
 }
 
+// Compile-time guard: *postgres.Pool must continue to satisfy the
+// TenantRunner contract. Catches a refactor of pool.WithTenant signature
+// at the right module instead of at cmd/api Build() construction site.
+var _ TenantRunner = (*postgres.Pool)(nil)
+
 // RunnerDeps is the set of ports the sync Runner needs.
 //
 // Note: NO ObjectStore here — sync path returns bytes inline; no S3
