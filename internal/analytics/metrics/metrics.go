@@ -199,3 +199,94 @@ func (m *IngestMetrics) ObserveFlushLatency(subject string, seconds float64) {
 	}
 	m.FlushLatency.WithLabelValues(subject).Observe(seconds)
 }
+
+// QueryMetrics aggregates Prometheus collectors for the analytics
+// read path (MetricsQuery + Redis cache). A nil receiver is safe —
+// every method becomes a no-op so unit tests can pass nil where a
+// metric tick is irrelevant.
+//
+// Cardinality discipline: every Vec carries at most the bounded
+// "method" label (6 enum values: calls / operator_state /
+// region_progress / hourly / operator_comparisons / overview). We
+// never label on tenant_id (high-cardinality) at this layer — the
+// upstream dashboards do that, not the query service.
+type QueryMetrics struct {
+	// QueryDuration observes the wall-clock duration of a single
+	// MetricsQuery method end-to-end (cache lookup + CH query +
+	// post-processing). Slow CH → growing 99p.
+	QueryDuration *prometheus.HistogramVec // labels: method
+
+	// CacheHits counts cache hits per method — successful read-through
+	// shortcuts that avoided a CH query.
+	CacheHits *prometheus.CounterVec // labels: method
+
+	// CacheMisses counts cache misses per method — the query was
+	// resolved against ClickHouse.
+	CacheMisses *prometheus.CounterVec // labels: method
+}
+
+// RegisterQueryMetrics constructs and (optionally) registers all
+// QueryMetrics collectors with reg. Returns the populated struct + a
+// non-nil error if any registration fails. reg may be nil — collectors
+// are still constructed but not registered (useful in unit tests).
+func RegisterQueryMetrics(reg prometheus.Registerer) (*QueryMetrics, error) {
+	m := &QueryMetrics{
+		QueryDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Namespace: "sociopulse",
+			Subsystem: "analytics_query",
+			Name:      "duration_seconds",
+			Help:      "Wall-clock duration of a single analytics MetricsQuery method end-to-end.",
+			Buckets:   prometheus.DefBuckets,
+		}, []string{"method"}),
+
+		CacheHits: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "analytics_query",
+			Name:      "cache_hits_total",
+			Help:      "Read-through cache hits per analytics MetricsQuery method.",
+		}, []string{"method"}),
+
+		CacheMisses: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "analytics_query",
+			Name:      "cache_misses_total",
+			Help:      "Read-through cache misses per analytics MetricsQuery method (CH was hit).",
+		}, []string{"method"}),
+	}
+
+	if reg == nil {
+		return m, nil
+	}
+
+	for _, c := range []prometheus.Collector{m.QueryDuration, m.CacheHits, m.CacheMisses} {
+		if err := reg.Register(c); err != nil {
+			return nil, fmt.Errorf("analytics metrics: register query: %w", err)
+		}
+	}
+	return m, nil
+}
+
+// IncCacheHit ticks the per-method cache-hit counter. nil-safe.
+func (m *QueryMetrics) IncCacheHit(method string) {
+	if m == nil {
+		return
+	}
+	m.CacheHits.WithLabelValues(method).Inc()
+}
+
+// IncCacheMiss ticks the per-method cache-miss counter. nil-safe.
+func (m *QueryMetrics) IncCacheMiss(method string) {
+	if m == nil {
+		return
+	}
+	m.CacheMisses.WithLabelValues(method).Inc()
+}
+
+// ObserveDuration records a single MetricsQuery method's wall-clock
+// duration. nil-safe.
+func (m *QueryMetrics) ObserveDuration(method string, seconds float64) {
+	if m == nil {
+		return
+	}
+	m.QueryDuration.WithLabelValues(method).Observe(seconds)
+}

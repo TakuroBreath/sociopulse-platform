@@ -115,6 +115,103 @@ func counterValue(t *testing.T, reg *prometheus.Registry, name, subjectVal strin
 	return 0
 }
 
+// TestRegisterQueryMetrics_NilReg asserts the constructor tolerates a
+// nil registry — analogous to RegisterIngestMetrics.
+func TestRegisterQueryMetrics_NilReg(t *testing.T) {
+	t.Parallel()
+	m, err := metrics.RegisterQueryMetrics(nil)
+	require.NoError(t, err)
+	require.NotNil(t, m)
+}
+
+// TestRegisterQueryMetrics_DuplicateFails asserts double-registration
+// on the same registry fails loudly.
+func TestRegisterQueryMetrics_DuplicateFails(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	_, err := metrics.RegisterQueryMetrics(reg)
+	require.NoError(t, err)
+	_, err = metrics.RegisterQueryMetrics(reg)
+	require.Error(t, err)
+}
+
+// TestQueryMetrics_NilReceiverNoOp asserts every helper is nil-safe.
+func TestQueryMetrics_NilReceiverNoOp(t *testing.T) {
+	t.Parallel()
+	var m *metrics.QueryMetrics
+	require.NotPanics(t, func() {
+		m.IncCacheHit("calls")
+		m.IncCacheMiss("calls")
+		m.ObserveDuration("calls", 0.001)
+	})
+}
+
+// TestQueryMetrics_CounterIncrement asserts ticks move the underlying
+// counters and histogram.
+func TestQueryMetrics_CounterIncrement(t *testing.T) {
+	t.Parallel()
+	reg := prometheus.NewRegistry()
+	m, err := metrics.RegisterQueryMetrics(reg)
+	require.NoError(t, err)
+
+	m.IncCacheHit("calls")
+	m.IncCacheHit("calls")
+	m.IncCacheMiss("calls")
+	m.ObserveDuration("calls", 0.05)
+
+	got := methodCounterValue(t, reg, "sociopulse_analytics_query_cache_hits_total", "calls")
+	require.InDelta(t, 2.0, got, 0.0001)
+
+	got = methodCounterValue(t, reg, "sociopulse_analytics_query_cache_misses_total", "calls")
+	require.InDelta(t, 1.0, got, 0.0001)
+
+	require.Equal(t, uint64(1), methodHistogramSampleCount(t, reg, "sociopulse_analytics_query_duration_seconds", "calls"))
+}
+
+// methodCounterValue mirrors counterValue but for the "method" label
+// used by QueryMetrics.
+func methodCounterValue(t *testing.T, reg *prometheus.Registry, name, methodVal string) float64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, fam := range families {
+		if fam.GetName() != name {
+			continue
+		}
+		for _, mp := range fam.GetMetric() {
+			for _, lp := range mp.GetLabel() {
+				if lp.GetName() == "method" && lp.GetValue() == methodVal {
+					return mp.GetCounter().GetValue()
+				}
+			}
+		}
+	}
+	t.Fatalf("counter %q with method=%s not found", name, methodVal)
+	return 0
+}
+
+// methodHistogramSampleCount mirrors histogramSampleCount for the
+// "method" label.
+func methodHistogramSampleCount(t *testing.T, reg *prometheus.Registry, name, methodVal string) uint64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, fam := range families {
+		if fam.GetName() != name {
+			continue
+		}
+		for _, mp := range fam.GetMetric() {
+			for _, lp := range mp.GetLabel() {
+				if lp.GetName() == "method" && lp.GetValue() == methodVal {
+					return mp.GetHistogram().GetSampleCount()
+				}
+			}
+		}
+	}
+	t.Fatalf("histogram %q with method=%s not found", name, methodVal)
+	return 0
+}
+
 // histogramSampleCount returns the cumulative observation count for the
 // named histogram in reg, filtered by the "subject" label value.
 func histogramSampleCount(t *testing.T, reg *prometheus.Registry, name, subjectVal string) uint64 {
