@@ -39,6 +39,21 @@
 
 begin;
 
+-- ─── step -1: empty-table guard ──────────────────────────────────────────────
+-- The migration's column reshape (PK swap uuid→text, status→state CHECK,
+-- kind→7-value enum CHECK) assumes the legacy table is empty. If a future
+-- code path seeds reports_jobs via a side channel before this migration
+-- runs, fail loudly rather than silently corrupting data — the legacy
+-- 'kind'/'status' values would not satisfy the new CHECK constraints and
+-- 'id' values would be overwritten with synthetic 'legacy-<uuid>' strings.
+do $$
+begin
+    if (select count(*) from reports_jobs) > 0 then
+        raise exception 'reports_jobs is non-empty (% rows); Plan 13.3 migration assumes empty table — manual mapping of legacy kind/status to new enums is required before re-running',
+            (select count(*) from reports_jobs);
+    end if;
+end$$;
+
 -- ─── step 0: drop the legacy index that referenced status before we drop the column ──
 drop index if exists reports_jobs_queue_idx;
 
