@@ -93,6 +93,18 @@ func (s *fakeObjectStore) Delete(_ context.Context, bucket, key string) error {
 	return s.nextErr
 }
 
+// Put + PresignedURL stubbed in for the Plan 13.3 ObjectStore extension —
+// retention worker tests do not exercise them; calls should never happen
+// in this suite, so the stubs return synthetic errors to surface
+// accidental usage rather than silently no-op'ing.
+func (s *fakeObjectStore) Put(_ context.Context, _, _ string, _ []byte, _ string) error {
+	return errors.New("fakeObjectStore.Put: not used by worker tests")
+}
+
+func (s *fakeObjectStore) PresignedURL(_ context.Context, _, _ string, _ time.Duration) (string, error) {
+	return "", errors.New("fakeObjectStore.PresignedURL: not used by worker tests")
+}
+
 func (s *fakeObjectStore) deleteCount() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
