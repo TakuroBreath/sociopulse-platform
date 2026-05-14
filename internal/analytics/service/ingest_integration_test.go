@@ -20,11 +20,13 @@ import (
 	"github.com/google/uuid"
 	"github.com/nats-io/nats-server/v2/server"
 	"github.com/nats-io/nats.go"
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	tcclickhouse "github.com/testcontainers/testcontainers-go/modules/clickhouse"
 	"go.uber.org/zap"
 
 	apianalytics "github.com/sociopulse/platform/internal/analytics/api"
+	"github.com/sociopulse/platform/internal/analytics/metrics"
 	"github.com/sociopulse/platform/internal/analytics/service"
 	"github.com/sociopulse/platform/internal/analytics/store"
 	recordingapi "github.com/sociopulse/platform/internal/recording/api"
@@ -403,4 +405,274 @@ func TestIngest_DrainOnContextDone_FlushesResidualBuffers(t *testing.T) {
 	// in CH.
 	require.Equal(t, uint64(5), chRowCount(t, conn, "events_calls", tenantID),
 		"drain must flush all 5 buffered rows")
+}
+
+// chRowCountFINAL is the deduped-view analogue of chRowCount. Reads
+// `SELECT count() FROM <table> FINAL` to force ReplacingMergeTree's
+// async dedup-on-merge to converge before counting. Used by the
+// duplicate-replay test below — without FINAL, two rows with the same
+// event_id can both be visible until the next background merge.
+func chRowCountFINAL(t *testing.T, conn *store.Conn, table string, tenantID uuid.UUID) uint64 {
+	t.Helper()
+	var c uint64
+	row := conn.Driver().QueryRow(t.Context(),
+		"SELECT count() FROM "+table+" FINAL WHERE tenant_id = ?",
+		tenantID,
+	)
+	if err := row.Scan(&c); err != nil {
+		t.Logf("chRowCountFINAL %q: scan error: %v (will retry)", table, err)
+		return 0
+	}
+	return c
+}
+
+// chRowCountWithCtx mirrors chRowCount but takes an explicit ctx so it
+// can be used from a closure that already owns a context — chRowCount
+// derives from t.Context() which contextcheck flags as a context leak
+// when invoked from a nested closure carrying its own ctx.
+func chRowCountWithCtx(ctx context.Context, t *testing.T, conn *store.Conn, table string, tenantID uuid.UUID) uint64 {
+	t.Helper()
+	var c uint64
+	row := conn.Driver().QueryRow(ctx,
+		"SELECT count() FROM "+table+" WHERE tenant_id = ?",
+		tenantID,
+	)
+	if err := row.Scan(&c); err != nil {
+		t.Logf("chRowCountWithCtx %q: scan error: %v (will retry)", table, err)
+		return 0
+	}
+	return c
+}
+
+// TestIngest_DuplicateEventsReplaced_AfterMerge asserts that the
+// migration to ReplacingMergeTree(_inserted_at) ORDER BY (tenant_id,
+// event_id) deduplicates rows that share an event_id when the table
+// is forced through OPTIMIZE … FINAL or queried with SELECT … FINAL.
+//
+// Scenario: bypass the LRU entirely by writing the same event payload
+// twice directly via the StoreAdapter (a real CH dup is what happens
+// when consumer A and consumer B in two replicas both see the same
+// NATS redelivery and both pass their own cold LRUs). Force a merge
+// with OPTIMIZE TABLE … FINAL, then SELECT FINAL and assert count == 1.
+// Without ReplacingMergeTree the count would be 2.
+func TestIngest_DuplicateEventsReplaced_AfterMerge(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	dsns := startCH(t)
+	migrateUp(t, dsns.migrate)
+	conn, err := store.Open(ctx, store.Config{
+		DSN:           dsns.verify,
+		BatchSize:     100,
+		FlushInterval: time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	adapter := &service.StoreAdapter{Conn: conn}
+
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	eventID := uuid.New()
+	callID := uuid.New()
+
+	mkRow := func() apianalytics.AnalyticsCallEventPayload {
+		return apianalytics.AnalyticsCallEventPayload{
+			Date:        "2026-05-14",
+			TS:          time.Now().UTC(),
+			TenantID:    tenantID,
+			ProjectID:   projectID,
+			OperatorID:  uuid.New(),
+			CallID:      callID,
+			Status:      "success",
+			DurationSec: 60,
+			HangupCause: "NORMAL_CLEARING",
+			RegionCode:  "MSK",
+			AttemptNo:   1,
+			TrunkUsed:   "trunk-a",
+			EventID:     eventID, // same event_id for both writes
+		}
+	}
+
+	// First insert: brand new row.
+	require.NoError(t, adapter.InsertCalls(ctx, []apianalytics.AnalyticsCallEventPayload{mkRow()}))
+	// Slight wall-clock delay so the DateTime64(3) DEFAULT now64() value
+	// differs between the two writes — ReplacingMergeTree keeps the row
+	// with the LARGEST _inserted_at per ORDER BY tuple. A 5ms gap is
+	// well above DateTime64(3)'s 1ms granularity.
+	time.Sleep(5 * time.Millisecond)
+	require.NoError(t, adapter.InsertCalls(ctx, []apianalytics.AnalyticsCallEventPayload{mkRow()}))
+
+	// Without FINAL: two rows visible (ReplacingMergeTree dedups on
+	// merge, not on insert).
+	awaitCount(t, 5*time.Second, 2, func() uint64 {
+		return chRowCount(t, conn, "events_calls", tenantID)
+	})
+
+	// Force the dedup-merge so SELECT … FINAL converges immediately.
+	require.NoError(t, conn.Driver().Exec(ctx, "OPTIMIZE TABLE events_calls FINAL"))
+
+	// After FINAL: exactly one row per (tenant_id, event_id).
+	require.Equal(t, uint64(1), chRowCountFINAL(t, conn, "events_calls", tenantID),
+		"ReplacingMergeTree must collapse to 1 row per (tenant_id, event_id) under SELECT FINAL")
+}
+
+// TestIngest_DedupMissCounterIncrements_OnLRUColdRestart asserts that
+// the new sociopulse_analytics_ingest_dedup_miss_total counter ticks
+// when the LRU is cold (the pipeline just started or was restarted)
+// and a row arrives whose event_id is NOT in the in-memory LRU. This is
+// the canonical "we don't know if this is a redelivery from before we
+// were running" signal — ReplacingMergeTree will reconcile at merge
+// time but the metric tells ops the rate of unverifiable inserts so
+// they can tune LRU size.
+//
+// Scenario:
+//  1. Boot the pipeline with a fresh LRU; publish one event; assert it
+//     lands in CH; assert dedup_miss_total ticks once (the cold-start
+//     miss).
+//  2. Cancel the pipeline, boot a SECOND pipeline with its own fresh
+//     LRU, publish the SAME event_id; assert dedup_miss_total ticks
+//     AGAIN — even though the row is a true duplicate at the CH
+//     storage layer, the in-memory LRU has no record of it and the
+//     pipeline treats it as a cold-start add. ReplacingMergeTree
+//     reconciles via OPTIMIZE FINAL below.
+func TestIngest_DedupMissCounterIncrements_OnLRUColdRestart(t *testing.T) {
+	t.Parallel()
+	ctx := t.Context()
+
+	natsURL := startEmbeddedNATS(t)
+	pub, err := eventbus.NewNATSPublisher(ctx, []string{natsURL}, "")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = pub.Close() })
+
+	ensureStream(t, natsURL, "ANALYTICS", []string{
+		apianalytics.SubjectCallsAnalytics,
+		apianalytics.SubjectOperatorStateAnalytics,
+	})
+	ensureStream(t, natsURL, "RECORDING", []string{"tenant.>"})
+
+	dsns := startCH(t)
+	migrateUp(t, dsns.migrate)
+	conn, err := store.Open(ctx, store.Config{
+		DSN:           dsns.verify,
+		BatchSize:     100,
+		FlushInterval: time.Second,
+	})
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	tenantID := uuid.New()
+	projectID := uuid.New()
+	eventID := uuid.New()
+
+	mkPayload := func() []byte {
+		ev := apianalytics.AnalyticsCallEventPayload{
+			Date:        "2026-05-14",
+			TS:          time.Now().UTC(),
+			TenantID:    tenantID,
+			ProjectID:   projectID,
+			OperatorID:  uuid.New(),
+			CallID:      uuid.New(),
+			Status:      "success",
+			DurationSec: 60,
+			HangupCause: "NORMAL_CLEARING",
+			RegionCode:  "MSK",
+			AttemptNo:   1,
+			TrunkUsed:   "trunk-a",
+			EventID:     eventID, // same event_id every time
+		}
+		raw, err := json.Marshal(ev)
+		require.NoError(t, err)
+		return raw
+	}
+
+	runOne := func(runCtx context.Context, reg *prometheus.Registry, expected uint64) {
+		// Per-invocation: a fresh NATSSubscriber so its consumer is
+		// torn down with its context, and a fresh LRU inside the
+		// pipeline.
+		runCtx, runCancel := context.WithCancel(runCtx)
+		defer runCancel()
+
+		sub, err := eventbus.NewNATSSubscriber(runCtx, []string{natsURL}, "")
+		require.NoError(t, err)
+
+		m, err := metrics.RegisterIngestMetrics(reg)
+		require.NoError(t, err)
+
+		p, err := service.NewIngestPipeline(
+			sub,
+			&service.StoreAdapter{Conn: conn},
+			zap.NewNop(),
+			m,
+			service.IngestConfig{
+				BatchSize:     1,
+				FlushInterval: 200 * time.Millisecond,
+				DedupSize:     1000,
+			},
+		)
+		require.NoError(t, err)
+
+		runErrCh := make(chan error, 1)
+		go func() { runErrCh <- p.Run(runCtx) }()
+
+		// Allow handler registration.
+		time.Sleep(200 * time.Millisecond)
+
+		require.NoError(t, pub.Publish(runCtx, apianalytics.SubjectCallsAnalytics, mkPayload()))
+		awaitCount(t, 5*time.Second, expected, func() uint64 {
+			return chRowCountWithCtx(runCtx, t, conn, "events_calls", tenantID)
+		})
+
+		// Assert the miss counter ticked at least once on the
+		// cold-LRU add.
+		require.Eventually(t,
+			func() bool { return gatherDedupMiss(t, reg) >= 1 },
+			3*time.Second, 50*time.Millisecond,
+			"dedup_miss_total must tick when LRU is cold and a new event_id is added",
+		)
+
+		runCancel()
+		_ = sub.Close()
+		require.ErrorIs(t, <-runErrCh, context.Canceled)
+	}
+
+	reg1 := prometheus.NewRegistry()
+	runOne(ctx, reg1, 1)
+
+	// Second invocation — same event_id, FRESH LRU (separate pipeline,
+	// fresh DedupLRU). The CH row count would be 2 without dedup; FINAL
+	// brings it back to 1 below. The miss counter on the fresh registry
+	// reflects ONLY this run's cold-start adds.
+	reg2 := prometheus.NewRegistry()
+	runOne(ctx, reg2, 2)
+
+	// ReplacingMergeTree reconciles asynchronously; force the merge to
+	// assert the storage-level dedup invariant.
+	require.NoError(t, conn.Driver().Exec(ctx, "OPTIMIZE TABLE events_calls FINAL"))
+	require.Equal(t, uint64(1), chRowCountFINAL(t, conn, "events_calls", tenantID),
+		"after OPTIMIZE FINAL the duplicate (same event_id, two cold-LRU adds) must collapse to 1 row")
+}
+
+// gatherDedupMiss returns the value of
+// sociopulse_analytics_ingest_dedup_miss_total filtered to the calls
+// subject. Mirrors counterValueOrZero in ingest_test.go but takes a
+// generic Gatherer.
+func gatherDedupMiss(t *testing.T, g prometheus.Gatherer) uint64 {
+	t.Helper()
+	families, err := g.Gather()
+	require.NoError(t, err)
+	const wantName = "sociopulse_analytics_ingest_dedup_miss_total"
+	for _, fam := range families {
+		if fam.GetName() != wantName {
+			continue
+		}
+		for _, mp := range fam.GetMetric() {
+			for _, lp := range mp.GetLabel() {
+				if lp.GetName() == "subject" && lp.GetValue() == apianalytics.SubjectCallsAnalytics {
+					return uint64(mp.GetCounter().GetValue())
+				}
+			}
+		}
+	}
+	return 0
 }

@@ -306,6 +306,11 @@ func (p *IngestPipeline) Run(ctx context.Context) error {
 //   - EventID == uuid.Nil → ack + IncDeadLetter (sentinel: producer
 //     forgot to set it; dedup LRU requires non-zero key).
 //   - DedupLRU dup hit → ack + IncDedupHit (already inserted; skip).
+//   - DedupLRU cold (WasEmpty) or saturated (Evicted) add → IncDedupMiss
+//     and continue to buffer. The row is still inserted; the metric
+//     signals that the LRU could not prove the row isn't a redelivery
+//     of a row already in ClickHouse. ReplacingMergeTree reconciles at
+//     merge time.
 //   - newly-inserted into LRU → append to buffer; flush if full.
 func (p *IngestPipeline) handleCalls(subject string, payload []byte) error {
 	p.metrics.IncReceived(subject)
@@ -328,9 +333,13 @@ func (p *IngestPipeline) handleCalls(subject string, payload []byte) error {
 		return nil
 	}
 
-	if dup := p.callsLRU.Add(row.EventID); dup {
+	addRes := p.callsLRU.Add(row.EventID)
+	if addRes.Dup {
 		p.metrics.IncDedupHit(subject)
 		return nil
+	}
+	if addRes.WasEmpty || addRes.Evicted {
+		p.metrics.IncDedupMiss(subject)
 	}
 
 	p.mu.Lock()
@@ -372,9 +381,13 @@ func (p *IngestPipeline) handleOpState(subject string, payload []byte) error {
 		return nil
 	}
 
-	if dup := p.opStateLRU.Add(row.EventID); dup {
+	addRes := p.opStateLRU.Add(row.EventID)
+	if addRes.Dup {
 		p.metrics.IncDedupHit(subject)
 		return nil
+	}
+	if addRes.WasEmpty || addRes.Evicted {
+		p.metrics.IncDedupMiss(subject)
 	}
 
 	p.mu.Lock()
@@ -416,9 +429,13 @@ func (p *IngestPipeline) handleRecUploaded(subject string, payload []byte) error
 		return nil
 	}
 
-	if dup := p.recUploadedLRU.Add(row.EventID); dup {
+	addRes := p.recUploadedLRU.Add(row.EventID)
+	if addRes.Dup {
 		p.metrics.IncDedupHit(subject)
 		return nil
+	}
+	if addRes.WasEmpty || addRes.Evicted {
+		p.metrics.IncDedupMiss(subject)
 	}
 
 	p.mu.Lock()

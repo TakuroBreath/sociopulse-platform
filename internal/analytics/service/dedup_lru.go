@@ -59,22 +59,53 @@ func NewDedupLRU(capacity int) *DedupLRU {
 	}
 }
 
-// Add returns true if id was already present in the LRU (duplicate
-// hit). It returns false if id was newly inserted (and possibly evicted
-// the oldest entry to make room).
+// AddResult is the rich return value of DedupLRU.Add. It surfaces two
+// "best-effort missing-from-dedup-history" signals that the
+// IngestPipeline's dedup_miss_total counter consumes:
 //
-// Both paths promote id to MRU — a dup-hit refreshes the id's
-// recency, and a newly-inserted id is by construction the most-recent.
-// The IngestPipeline observes the return value to bump the per-subject
-// "deduped" metric without ever touching the buffer.
-func (l *DedupLRU) Add(id uuid.UUID) bool {
+//   - Dup    — id was already present (a true dedup hit; the row should
+//     be dropped).
+//   - WasEmpty — the LRU had zero entries BEFORE this Add. Reflects the
+//     cold-start case where a consumer just restarted with no
+//     in-memory history; any incoming row could be a redelivery of a
+//     row already in ClickHouse. The signal fires exactly once per
+//     freshly-constructed LRU (after the first non-dup Add the LRU is
+//     non-empty), which is enough for the cold-restart probe.
+//   - Evicted — this Add forced an eviction of the oldest entry to
+//     make room. Reflects the LRU-saturation case where the evicted
+//     id is no longer tracked, so a future redelivery of that
+//     particular id would slip past the in-memory dedup. Best-effort
+//     under-counting: it does not fire for the id that just got
+//     evicted, but for the new id whose insertion caused the eviction
+//     — close enough for "LRU is undersized, tune it" alerting.
+//
+// Callers that ignore the signals and only want the Dup bit should
+// read result.Dup; the legacy boolean contract is preserved this way.
+type AddResult struct {
+	Dup      bool
+	WasEmpty bool
+	Evicted  bool
+}
+
+// Add inserts id into the LRU and returns an AddResult describing the
+// outcome. See AddResult for the full semantics of the three flags.
+//
+// Both Dup and non-Dup paths promote id to MRU — a dup-hit refreshes
+// the id's recency, and a newly-inserted id is by construction the
+// most-recent. The IngestPipeline observes the return value to bump
+// the per-subject "deduped" / "dedup-miss" metrics without ever
+// touching the buffer.
+func (l *DedupLRU) Add(id uuid.UUID) AddResult {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
 	if el, ok := l.index[id]; ok {
 		l.ll.MoveToFront(el)
-		return true
+		return AddResult{Dup: true}
 	}
+
+	res := AddResult{WasEmpty: l.ll.Len() == 0}
+
 	if l.ll.Len() >= l.cap {
 		oldest := l.ll.Back()
 		if oldest != nil {
@@ -86,11 +117,12 @@ func (l *DedupLRU) Add(id uuid.UUID) bool {
 				delete(l.index, oldestID)
 			}
 			l.ll.Remove(oldest)
+			res.Evicted = true
 		}
 	}
 	el := l.ll.PushFront(id)
 	l.index[id] = el
-	return false
+	return res
 }
 
 // Has reports whether id is currently in the LRU. It is a read-only

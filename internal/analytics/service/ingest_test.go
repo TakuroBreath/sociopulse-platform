@@ -611,3 +611,132 @@ func counterValueOrZero(t *testing.T, reg *prometheus.Registry, name string) flo
 	}
 	return 0
 }
+
+// TestIngestPipeline_DedupMissCounterIncrements_OnLRUColdAdd asserts
+// the dedup_miss_total counter ticks every time a row is added to the
+// LRU under one of the two "cold" conditions:
+//   - the LRU was completely empty BEFORE the Add (pipeline cold start
+//     / consumer just restarted with no in-memory history)
+//   - the Add caused a capacity-driven eviction (LRU was full; the
+//     evicted key's id is no longer tracked → another redelivery of
+//     that id would slip past the LRU)
+//
+// This unit test exercises the cold-start path without ClickHouse.
+// First call to Add on a fresh LRU → counter increments. Subsequent
+// distinct adds while LRU has room → no increment. ReplacingMergeTree
+// reconciliation at storage layer is tested in the integration suite.
+func TestIngestPipeline_DedupMissCounterIncrements_OnLRUColdAdd(t *testing.T) {
+	t.Parallel()
+	bus := newFakeBus()
+	fs := &fakeStore{}
+	reg := prometheus.NewRegistry()
+	m, err := metrics.RegisterIngestMetrics(reg)
+	require.NoError(t, err)
+	cfg := service.IngestConfig{
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		DedupSize:     16,
+	}
+	cancel, runErrCh := startPipeline(t, bus, fs, m, cfg)
+
+	// First event into a cold (empty) LRU → cold-miss → counter ticks.
+	ev := newCallEvent()
+	raw, err := json.Marshal(ev)
+	require.NoError(t, err)
+	require.NoError(t, bus.Publish(t, apianalytics.SubjectCallsAnalytics, raw))
+	awaitCond(t, func() bool { return fs.callsCount() == 1 })
+
+	require.Eventually(t, func() bool {
+		return counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dedup_miss_total") >= 1
+	}, time.Second, 5*time.Millisecond, "cold-LRU Add must increment dedup_miss_total")
+
+	cancel()
+	require.ErrorIs(t, <-runErrCh, context.Canceled)
+}
+
+// TestIngestPipeline_DedupMissCounterIncrements_OnEviction asserts the
+// counter ticks when the LRU is at capacity and a new event_id forces
+// an eviction of the oldest tracked id. Setup: DedupSize=2, publish 3
+// distinct events — the third Add evicts the first and must register a
+// miss.
+func TestIngestPipeline_DedupMissCounterIncrements_OnEviction(t *testing.T) {
+	t.Parallel()
+	bus := newFakeBus()
+	fs := &fakeStore{}
+	reg := prometheus.NewRegistry()
+	m, err := metrics.RegisterIngestMetrics(reg)
+	require.NoError(t, err)
+	cfg := service.IngestConfig{
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		DedupSize:     2, // tiny — third distinct event forces eviction
+	}
+	cancel, runErrCh := startPipeline(t, bus, fs, m, cfg)
+
+	for range 3 {
+		ev := newCallEvent()
+		raw, err := json.Marshal(ev)
+		require.NoError(t, err)
+		require.NoError(t, bus.Publish(t, apianalytics.SubjectCallsAnalytics, raw))
+	}
+	awaitCond(t, func() bool { return fs.callsCount() == 3 })
+
+	// At least 2 misses: the first cold-LRU add + the eviction-driven
+	// add (third event displacing the first). We don't pin the exact
+	// count — the implementation's classification of the second add
+	// (LRU had Len=1 before, not 0) may or may not count as cold; the
+	// test asserts only that BOTH cold-start AND eviction cases tick.
+	require.Eventually(t, func() bool {
+		return counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dedup_miss_total") >= 2
+	}, time.Second, 5*time.Millisecond,
+		"cold-start + eviction must each tick dedup_miss_total (≥ 2 total)")
+
+	cancel()
+	require.ErrorIs(t, <-runErrCh, context.Canceled)
+}
+
+// TestIngestPipeline_DedupMissCounter_NotIncremented_OnDuplicate
+// asserts the counter is NOT incremented when an event is a TRUE
+// duplicate (event_id already in the LRU). Duplicates fire the dedup
+// hits counter; the miss counter is reserved for unverifiable cold
+// inserts.
+func TestIngestPipeline_DedupMissCounter_NotIncremented_OnDuplicate(t *testing.T) {
+	t.Parallel()
+	bus := newFakeBus()
+	fs := &fakeStore{}
+	reg := prometheus.NewRegistry()
+	m, err := metrics.RegisterIngestMetrics(reg)
+	require.NoError(t, err)
+	cfg := service.IngestConfig{
+		BatchSize:     1,
+		FlushInterval: time.Hour,
+		DedupSize:     64,
+	}
+	cancel, runErrCh := startPipeline(t, bus, fs, m, cfg)
+
+	ev := newCallEvent()
+	raw, err := json.Marshal(ev)
+	require.NoError(t, err)
+	// First publish: cold add → one miss expected.
+	require.NoError(t, bus.Publish(t, apianalytics.SubjectCallsAnalytics, raw))
+	awaitCond(t, func() bool { return fs.callsCount() == 1 })
+
+	missBaseline := counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dedup_miss_total")
+
+	// Second publish — same event_id, dup hit. Must NOT tick miss.
+	require.NoError(t, bus.Publish(t, apianalytics.SubjectCallsAnalytics, raw))
+	awaitCond(t, func() bool {
+		return counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dedup_hits_total") >= 1
+	})
+
+	require.InDelta(t,
+		missBaseline,
+		counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dedup_miss_total"),
+		0,
+		"duplicate hit must not increment dedup_miss_total",
+	)
+	require.Equal(t, 1, fs.callsCount(), "duplicate must not reach the store")
+
+	cancel()
+	require.ErrorIs(t, <-runErrCh, context.Canceled)
+}

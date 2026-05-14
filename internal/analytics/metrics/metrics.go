@@ -53,6 +53,24 @@ type IngestMetrics struct {
 	// per-subject LRU. The handler acks and skips the buffer.
 	DedupHits *prometheus.CounterVec // labels: subject
 
+	// DedupMiss counts rows that arrived under one of two "cold"
+	// conditions where the in-memory LRU cannot confidently say
+	// whether the row is a true duplicate of one already in
+	// ClickHouse:
+	//   - LRU was COMPLETELY EMPTY before the Add (the pipeline just
+	//     started or was restarted; any in-flight redelivery from
+	//     before the restart slips past the LRU).
+	//   - LRU was AT CAPACITY and this Add forced an eviction of the
+	//     oldest tracked id (the LRU is sized too small; a future
+	//     redelivery of the evicted id would slip past).
+	//
+	// The signal is best-effort — neither condition guarantees the
+	// row IS a duplicate, only that the LRU could not prove it
+	// isn't. ReplacingMergeTree (Plan 13.2.5 Task 4) reconciles at
+	// merge time. Non-zero rate at steady state typically means LRU
+	// undersizing — bump DedupSize.
+	DedupMiss *prometheus.CounterVec // labels: subject
+
 	// BatchSize observes the row-count of every flush (including
 	// ticker-driven flushes that may be small or zero). Buckets cover
 	// 1..10_000 so the typical ~100-row flush lands on a bucket
@@ -107,6 +125,16 @@ func RegisterIngestMetrics(reg prometheus.Registerer) (*IngestMetrics, error) {
 			Help:      "Messages whose event_id was already in the per-subject dedup LRU.",
 		}, []string{"subject"}),
 
+		DedupMiss: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Namespace: "sociopulse",
+			Subsystem: "analytics_ingest",
+			Name:      "dedup_miss_total",
+			Help: "Rows inserted after the in-memory dedup LRU was empty (cold start) " +
+				"or had to evict to make room. Best-effort signal: a non-zero rate " +
+				"at steady state suggests the LRU is undersized. ReplacingMergeTree " +
+				"reconciles any true duplicates asynchronously at merge time.",
+		}, []string{"subject"}),
+
 		BatchSize: prometheus.NewHistogramVec(prometheus.HistogramOpts{
 			Namespace: "sociopulse",
 			Subsystem: "analytics_ingest",
@@ -130,7 +158,7 @@ func RegisterIngestMetrics(reg prometheus.Registerer) (*IngestMetrics, error) {
 
 	for _, c := range []prometheus.Collector{
 		m.Received, m.Inserted, m.Failed,
-		m.DeadLetter, m.DedupHits,
+		m.DeadLetter, m.DedupHits, m.DedupMiss,
 		m.BatchSize, m.FlushLatency,
 	} {
 		if err := reg.Register(c); err != nil {
@@ -180,6 +208,17 @@ func (m *IngestMetrics) IncDedupHit(subject string) {
 		return
 	}
 	m.DedupHits.WithLabelValues(subject).Inc()
+}
+
+// IncDedupMiss ticks the per-subject dedup-miss counter. nil-safe.
+// Called when the LRU was cold (empty) or saturated (eviction) at the
+// time a non-dup event_id was added — both signal "LRU could not prove
+// the row isn't a true duplicate". See IngestMetrics.DedupMiss Help.
+func (m *IngestMetrics) IncDedupMiss(subject string) {
+	if m == nil {
+		return
+	}
+	m.DedupMiss.WithLabelValues(subject).Inc()
 }
 
 // ObserveBatchSize records a single batch's row count into the

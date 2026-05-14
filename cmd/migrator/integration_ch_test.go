@@ -186,8 +186,14 @@ func TestRunCH_ConnectionError_DistinctFromUsage(t *testing.T) {
 
 // TestSchema_EventsCalls_HasExpectedColumns asserts the engine,
 // partition + sort keys, and full column shape of events_calls after
-// applying the real migrations from migrations/clickhouse. Locked-in
-// per master spec §6.4.
+// applying the real migrations from migrations/clickhouse.
+//
+// Schema baseline as of Plan 13.2.5 Task 4 (migration 000007): engine
+// flipped from MergeTree to ReplacingMergeTree(_inserted_at) and
+// ORDER BY changed to (tenant_id, event_id) so duplicate event_ids
+// from cold-LRU restarts converge at merge time. The _inserted_at
+// column type is also DateTime64(3) (was DateTime) so finer-grained
+// "latest wins" works for sub-second redelivery storms.
 func TestSchema_EventsCalls_HasExpectedColumns(t *testing.T) {
 	t.Parallel()
 
@@ -203,9 +209,9 @@ func TestSchema_EventsCalls_HasExpectedColumns(t *testing.T) {
 		WHERE database = currentDatabase() AND name = 'events_calls'
 	`).Scan(&engine, &partitionKey, &sortingKey))
 
-	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "ReplacingMergeTree", engine)
 	require.Equal(t, "toYYYYMM(date)", partitionKey)
-	require.Equal(t, "tenant_id, project_id, ts", sortingKey)
+	require.Equal(t, "tenant_id, event_id", sortingKey)
 
 	// Column types live on system.columns. Use a map for unordered
 	// comparison; ORDER BY position is kept for readable failure output.
@@ -239,14 +245,15 @@ func TestSchema_EventsCalls_HasExpectedColumns(t *testing.T) {
 		"attempt_no":   "UInt8",
 		"trunk_used":   "LowCardinality(String)",
 		"event_id":     "UUID",
-		"_inserted_at": "DateTime",
+		"_inserted_at": "DateTime64(3)",
 	}
 	require.Equal(t, want, got)
 }
 
 // TestSchema_EventsOperatorState_HasExpectedColumns asserts the engine,
 // partition + sort keys, and full column shape of events_operator_state.
-// Locked-in per master spec §6.4.
+// Plan 13.2.5 Task 4 flipped this to ReplacingMergeTree(_inserted_at)
+// ORDER BY (tenant_id, event_id) for the same reasons as events_calls.
 func TestSchema_EventsOperatorState_HasExpectedColumns(t *testing.T) {
 	t.Parallel()
 
@@ -261,9 +268,9 @@ func TestSchema_EventsOperatorState_HasExpectedColumns(t *testing.T) {
 		WHERE database = currentDatabase() AND name = 'events_operator_state'
 	`).Scan(&engine, &partitionKey, &sortingKey))
 
-	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "ReplacingMergeTree", engine)
 	require.Equal(t, "toYYYYMM(date)", partitionKey)
-	require.Equal(t, "tenant_id, user_id, ts", sortingKey)
+	require.Equal(t, "tenant_id, event_id", sortingKey)
 
 	rows, err := db.Query(`
 		SELECT name, type FROM system.columns
@@ -290,15 +297,16 @@ func TestSchema_EventsOperatorState_HasExpectedColumns(t *testing.T) {
 		"duration_in_state_sec": "UInt32",
 		"project_id":            "Nullable(UUID)",
 		"event_id":              "UUID",
-		"_inserted_at":          "DateTime",
+		"_inserted_at":          "DateTime64(3)",
 	}
 	require.Equal(t, want, got)
 }
 
 // TestSchema_EventsRecordingUploaded_HasExpectedColumns asserts the
 // engine, partition + sort keys, and full column shape of
-// events_recording_uploaded. Out-of-spec relative to master §6.4 but
-// required for the QC report use case in Plan 13.3 — see references Q4.
+// events_recording_uploaded. Plan 13.2.5 Task 4 flipped this to
+// ReplacingMergeTree(_inserted_at) ORDER BY (tenant_id, event_id) for
+// the same idempotency reasons as the other two source tables.
 func TestSchema_EventsRecordingUploaded_HasExpectedColumns(t *testing.T) {
 	t.Parallel()
 
@@ -313,9 +321,9 @@ func TestSchema_EventsRecordingUploaded_HasExpectedColumns(t *testing.T) {
 		WHERE database = currentDatabase() AND name = 'events_recording_uploaded'
 	`).Scan(&engine, &partitionKey, &sortingKey))
 
-	require.Equal(t, "MergeTree", engine)
+	require.Equal(t, "ReplacingMergeTree", engine)
 	require.Equal(t, "toYYYYMM(date)", partitionKey)
-	require.Equal(t, "tenant_id, ts", sortingKey)
+	require.Equal(t, "tenant_id, event_id", sortingKey)
 
 	rows, err := db.Query(`
 		SELECT name, type FROM system.columns
@@ -345,7 +353,7 @@ func TestSchema_EventsRecordingUploaded_HasExpectedColumns(t *testing.T) {
 		"duration_sec":         "UInt32",
 		"encryption_key_alias": "LowCardinality(String)",
 		"event_id":             "UUID",
-		"_inserted_at":         "DateTime",
+		"_inserted_at":         "DateTime64(3)",
 	}
 	require.Equal(t, want, got)
 }
@@ -374,7 +382,7 @@ func TestRunCH_UpIsIdempotent(t *testing.T) {
 		SELECT version, dirty FROM schema_migrations
 		ORDER BY sequence DESC LIMIT 1
 	`).Scan(&version, &dirty))
-	require.Equal(t, uint64(6), version, "expected version=6 after applying 000001..000006")
+	require.Equal(t, uint64(10), version, "expected version=10 after applying 000001..000010")
 	require.False(t, dirty)
 }
 
