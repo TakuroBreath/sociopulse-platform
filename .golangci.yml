@@ -310,6 +310,24 @@ linters-settings:
           - pkg: "github.com/jackc/pgx/v5/pgxpool"
             desc: "use pkg/postgres.Pool — direct pgxpool import bypasses SET LOCAL app.tenant_id and RLS"
 
+      # clickhouse-go/v2 is the ClickHouse driver. Direct imports are
+      # restricted to:
+      #   - cmd/migrator: blank-import the database/sql driver for the
+      #     golang-migrate path (Plan 13.1 Task 1).
+      #   - internal/analytics/**: native protocol via store.Conn +
+      #     batch helpers (Plan 13.2 Task 2). Every other analytics
+      #     package consumes ClickHouse through *store.Conn.
+      # Anywhere else, the dependency must go through the analytics
+      # module boundary — internal/analytics/api or the store wrapper.
+      clickhouse-go-isolation:
+        list-mode: lax
+        files:
+          - "!**/cmd/migrator/**"
+          - "!**/internal/analytics/**"
+        deny:
+          - pkg: "github.com/ClickHouse/clickhouse-go/v2"
+            desc: "clickhouse-go is allowed only in cmd/migrator and internal/analytics/* — use *store.Conn elsewhere"
+
       # Yandex Cloud SDK is provider-specific. Reserved for KMS resolver
       # (internal/tenancy/store) and recording-uploader (object storage).
       # Anywhere else, the call must go through internal/tenancy/api or
