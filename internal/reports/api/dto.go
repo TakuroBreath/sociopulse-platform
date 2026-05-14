@@ -112,11 +112,18 @@ type Job struct {
 }
 
 // ListJobsFilter narrows JobQueue.List.
+//
+// TenantID is REQUIRED — the JobQueue.List interface contract is per-
+// tenant scoped, but the method signature does not carry tenantID as a
+// dedicated parameter. The HTTP handler (Task 7) reads claims.TenantID
+// from the gin context and injects it here before delegating to the
+// Queue. A zero TenantID is rejected by Queue.List with ErrInvalidParams.
 type ListJobsFilter struct {
-	State  *JobState
-	Kind   *ReportKind
-	From   *time.Time
-	To     *time.Time
-	Cursor string
-	Limit  int
+	TenantID uuid.UUID
+	State    *JobState
+	Kind     *ReportKind
+	From     *time.Time
+	To       *time.Time
+	Cursor   string
+	Limit    int
 }
