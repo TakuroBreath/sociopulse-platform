@@ -10,40 +10,17 @@
 package api
 
 import (
-	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
 )
 
-// EventKind enumerates the NATS event kinds the ingester accepts.
-// Values mirror the subject constants in events.go so the kind tag is
-// human-readable in logs / traces. EventEnvelope.Kind is currently
-// informational only — the ingester routes on the bound subject, not
-// the payload field — but the explicit enum is kept so unmarshalled
-// payloads can be sanity-checked against the subject they arrived on.
-type EventKind string
-
-const (
-	// EventKindCalls corresponds to SubjectCallsAnalytics.
-	EventKindCalls EventKind = "analytics.event.calls"
-	// EventKindOperatorState corresponds to SubjectOperatorStateAnalytics.
-	EventKindOperatorState EventKind = "analytics.event.operator_state"
-	// EventKindRecordingUploaded corresponds to the per-tenant
-	// tenant.<t>.recording.uploaded subject (see
-	// SubjectRecordingUploadedWildcard for the ingester binding).
-	EventKindRecordingUploaded EventKind = "recording.uploaded"
-)
-
-// EventEnvelope is the canonical wrapper used to deliver any analytics-bound
-// event over NATS. Payload is the kind-specific JSON body.
-type EventEnvelope struct {
-	EventID   uuid.UUID       `json:"event_id"`
-	Kind      EventKind       `json:"kind"`
-	TenantID  uuid.UUID       `json:"tenant_id"`
-	Timestamp time.Time       `json:"ts"`
-	Payload   json.RawMessage `json:"payload"`
-}
+// Note (Plan 13.2 Task 3): the original `EventEnvelope` + `EventKind`
+// abstraction was removed — the producer (dialer FSM) marshals
+// specific payload structs directly onto the bus, and the ingester
+// unmarshals straight into those structs. The envelope wrapper was
+// dead code. If a future producer wants a generic transport,
+// reintroduce it (and a corresponding test) at that time.
 
 // IngestStats is the runtime counters surface for /metrics.
 type IngestStats struct {

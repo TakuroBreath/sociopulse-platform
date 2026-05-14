@@ -353,7 +353,7 @@ func TestIngestPipeline_PoisonAcksAndIncrementsDeadLetter(t *testing.T) {
 	awaitCond(t, func() bool {
 		return counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dead_letter_total") == 1
 	})
-	require.Equal(t, 0, fs.callsCount())
+	require.Zero(t, fs.callsCount())
 
 	cancel()
 	require.ErrorIs(t, <-runErrCh, context.Canceled)
@@ -386,7 +386,7 @@ func TestIngestPipeline_PoisonMissingEventID(t *testing.T) {
 	awaitCond(t, func() bool {
 		return counterValueOrZero(t, reg, "sociopulse_analytics_ingest_dead_letter_total") == 1
 	})
-	require.Equal(t, 0, fs.callsCount())
+	require.Zero(t, fs.callsCount())
 
 	cancel()
 	require.ErrorIs(t, <-runErrCh, context.Canceled)
@@ -468,7 +468,7 @@ func TestIngestPipeline_DrainOnContextDone(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, bus.Publish(t, apianalytics.SubjectCallsAnalytics, raw))
 	}
-	require.Equal(t, 0, fs.callsCount(), "no flush should have fired yet")
+	require.Zero(t, fs.callsCount(), "no flush should have fired yet")
 
 	cancel()
 	require.ErrorIs(t, <-runErrCh, context.Canceled)
@@ -506,7 +506,7 @@ func TestIngestPipeline_TransientFailureIncrementsFailed(t *testing.T) {
 	})
 	// The injected failure on InsertCalls means the store buffer stays
 	// empty even though the flush was attempted.
-	require.Equal(t, 0, fs.callsCount(), "failed flush => no rows landed")
+	require.Zero(t, fs.callsCount(), "failed flush => no rows landed")
 	require.GreaterOrEqual(t, int(fs.flushCallsInv.Load()), 1, "flush was attempted")
 
 	cancel()

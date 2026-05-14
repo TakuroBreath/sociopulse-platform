@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -160,7 +161,7 @@ type IngestPipeline struct {
 	metrics *metrics.IngestMetrics
 	cfg     IngestConfig
 
-	mu             sync.Mutex // guards bufs + LRUs
+	mu             sync.Mutex // guards the three subject buffers (the LRUs have their own internal mutex)
 	callsBuf       []apianalytics.AnalyticsCallEventPayload
 	opStateBuf     []apianalytics.AnalyticsOperatorStateEventPayload
 	recUploadedBuf []recordingapi.RecordingUploadedEvent
@@ -172,8 +173,16 @@ type IngestPipeline struct {
 	// runMu serialises Run invocations. running flips to true on entry
 	// and stays true even after Run returns — second Run is rejected
 	// for the lifetime of the pipeline.
+	//
+	// runCtx is captured on entry to Run and used as the ancestor for
+	// count-threshold flushes invoked from handlers (which themselves
+	// receive no ctx from the bus). Wrapped in context.WithoutCancel at
+	// the call site so a parent cancellation does not abort an
+	// in-flight flush. Reads from handler goroutines are safe because
+	// runCtx is assigned BEFORE p.bus.Subscribe registers any handler.
 	runMu   sync.Mutex
 	running bool
+	runCtx  context.Context
 }
 
 // NewIngestPipeline constructs a pipeline. bus and store MUST be
@@ -233,6 +242,7 @@ func (p *IngestPipeline) Run(ctx context.Context) error {
 		return errors.New("analytics/service: IngestPipeline.Run called more than once")
 	}
 	p.running = true
+	p.runCtx = ctx
 	p.runMu.Unlock()
 
 	if err := p.bus.Subscribe(ctx, apianalytics.SubjectCallsAnalytics, p.cfg.QueueGroup, p.handleCalls); err != nil {
@@ -274,14 +284,12 @@ func (p *IngestPipeline) Run(ctx context.Context) error {
 	<-ctx.Done()
 	wg.Wait()
 
-	// Drain phase: detach from the cancelled parent so the final
-	// flushes have time to complete. context.WithTimeout from
-	// context.Background gives the drain its own deadline. The
-	// contextcheck linter flags this — by design: the drain MUST
-	// outlive the cancelled parent.
-	drainCtx, drainCancel := context.WithTimeout(context.Background(), p.cfg.DrainTimeout)
+	// Drain phase: detach the cancellation signal so the final flushes
+	// have time to complete, but keep ctx values (trace/log
+	// correlation) via context.WithoutCancel. WithTimeout adds the
+	// drain deadline; no contextcheck suppression needed.
+	drainCtx, drainCancel := context.WithTimeout(context.WithoutCancel(ctx), p.cfg.DrainTimeout)
 	defer drainCancel()
-	//nolint:contextcheck // intentional: drain must outlive cancelled parent.
 	p.flushAll(drainCtx)
 
 	p.logger.Info("analytics ingest pipeline stopped", zap.Error(ctx.Err()))
@@ -331,11 +339,11 @@ func (p *IngestPipeline) handleCalls(subject string, payload []byte) error {
 	p.mu.Unlock()
 
 	if full {
-		// Use the bus's delivery context — the handler is allowed to
-		// block here; subsequent messages queue behind it. A real
-		// production tune could push the flush onto a worker goroutine,
-		// but v1 keeps it synchronous for backpressure visibility.
-		p.flushCalls(context.Background())
+		// Count-threshold flush runs inside the bus handler, which
+		// carries no ctx. WithoutCancel propagates Run's ctx values
+		// (trace/log correlation) while detaching from cancellation —
+		// an in-flight flush completes even if the parent ctx fires.
+		p.flushCalls(context.WithoutCancel(p.runCtx))
 	}
 	return nil
 }
@@ -375,7 +383,7 @@ func (p *IngestPipeline) handleOpState(subject string, payload []byte) error {
 	p.mu.Unlock()
 
 	if full {
-		p.flushOpState(context.Background())
+		p.flushOpState(context.WithoutCancel(p.runCtx))
 	}
 	return nil
 }
@@ -419,7 +427,7 @@ func (p *IngestPipeline) handleRecUploaded(subject string, payload []byte) error
 	p.mu.Unlock()
 
 	if full {
-		p.flushRecUploaded(context.Background())
+		p.flushRecUploaded(context.WithoutCancel(p.runCtx))
 	}
 	return nil
 }
@@ -527,34 +535,18 @@ func (p *IngestPipeline) flushRecUploaded(ctx context.Context) {
 // (prepare_batch | send | other) so cardinality stays small.
 //
 // We don't unwrap a typed error from clickhouse-go here — the
-// distinction matters only for dashboards, and the store wraps with
-// descriptive prose ("prepare batch calls", "send calls batch"). A
-// substring match keeps the classification stable while we add or
-// remove store-side messages.
+// distinction matters only for dashboards. The match anchors include
+// the "analytics/store:" prefix from batch.go's error wrapping so an
+// inner driver message like "tcp send buffer full" does NOT
+// false-positive into the "send" bucket.
 func classifyStoreErr(err error) string {
 	msg := err.Error()
 	switch {
-	case containsAny(msg, "prepare batch"):
+	case strings.Contains(msg, "analytics/store: prepare batch"):
 		return "prepare_batch"
-	case containsAny(msg, "send"):
+	case strings.Contains(msg, "analytics/store: send"):
 		return "send"
 	default:
 		return "other"
 	}
-}
-
-// containsAny is a tiny substring matcher; kept here to avoid pulling
-// in strings.Contains every place classifyStoreErr fires (which is
-// every failed flush).
-func containsAny(haystack string, needles ...string) bool {
-	for _, n := range needles {
-		if len(n) > 0 && len(haystack) >= len(n) {
-			for i := 0; i+len(n) <= len(haystack); i++ {
-				if haystack[i:i+len(n)] == n {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
