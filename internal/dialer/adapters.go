@@ -7,15 +7,18 @@ import (
 	"fmt"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"go.uber.org/zap"
 
 	dialerapi "github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/dialer/capacity"
 	"github.com/sociopulse/platform/internal/dialer/hours"
 	"github.com/sociopulse/platform/internal/dialer/retry"
+	dialertnats "github.com/sociopulse/platform/internal/dialer/transport/nats"
 	"github.com/sociopulse/platform/internal/modules"
 	telephonyapi "github.com/sociopulse/platform/internal/telephony/api"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
+	"github.com/sociopulse/platform/pkg/postgres"
 )
 
 // Locator keys this module CONSUMES (registered by other modules).
@@ -254,3 +257,79 @@ func lookupCommandPublisher(loc modules.ServiceLocator, log *zap.Logger) (teleph
 // the interface the FSM Machine implements — keeps the locator-key
 // type matching honest.
 var _ dialerapi.OperatorFSM = (interface{ dialerapi.OperatorFSM })(nil)
+
+// PgCallOperatorLookup resolves (tenant_id, call_id) → operator_id by
+// reading the calls table under tenant RLS. Used by the
+// dialer/transport/nats subscriber that routes telephony events into
+// OperatorFSM transitions — the telephony event payload carries
+// tenant_id + call_id but not operator_id, so the subscriber needs
+// this projection to call the FSM.
+//
+// Runs inside pool.WithTenant — the RLS predicate (calls_iso) gates
+// the row by tenant_id, defending against a poisoned event payload
+// that names another tenant's call_id.
+//
+// Exported because cmd/worker constructs one directly (it does NOT go
+// through Module.Register). cmd/api uses newPgCallOperatorLookup via
+// Module.Register.
+type PgCallOperatorLookup struct {
+	pool *postgres.Pool
+}
+
+// Compile-time interface check.
+var _ dialertnats.CallOperatorLookup = (*PgCallOperatorLookup)(nil)
+
+// NewPgCallOperatorLookup constructs the adapter. pool MUST be non-nil
+// — wiring without one is a programmer bug.
+//
+// Exported sibling of newPgCallOperatorLookup; cmd/worker calls this
+// directly (it bypasses Module.Register).
+func NewPgCallOperatorLookup(pool *postgres.Pool) *PgCallOperatorLookup {
+	if pool == nil {
+		panic("dialer.NewPgCallOperatorLookup: pool must be non-nil")
+	}
+	return &PgCallOperatorLookup{pool: pool}
+}
+
+// newPgCallOperatorLookup is the package-private constructor used by
+// Module.Register. Kept thin so the exported variant remains the
+// canonical entry point.
+func newPgCallOperatorLookup(pool *postgres.Pool) *PgCallOperatorLookup {
+	return NewPgCallOperatorLookup(pool)
+}
+
+// LookupOperator satisfies dialertnats.CallOperatorLookup. Returns
+// dialertnats.ErrOperatorNotFound when no row matches OR when the
+// matched row has a NULL operator_id (a call placed without operator
+// binding is not actionable by the FSM). Anything else propagates as a
+// transient error so the subscriber NAKs for redelivery.
+func (a *PgCallOperatorLookup) LookupOperator(ctx context.Context, tenantID, callID uuid.UUID) (uuid.UUID, error) {
+	if tenantID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("dialer/lookup_operator: nil tenantID")
+	}
+	if callID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("dialer/lookup_operator: nil callID")
+	}
+
+	// operator_id is nullable on the calls table so we scan into a
+	// pointer and translate the NULL into ErrOperatorNotFound.
+	var opPtr *uuid.UUID
+	err := a.pool.WithTenant(ctx, tenantID, func(tx postgres.Tx) error {
+		const q = `SELECT operator_id FROM calls WHERE id = $1 LIMIT 1`
+		row := tx.QueryRow(ctx, q, callID)
+		switch err := row.Scan(&opPtr); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return dialertnats.ErrOperatorNotFound
+		case err != nil:
+			return fmt.Errorf("dialer/lookup_operator: scan: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	if opPtr == nil {
+		return uuid.Nil, dialertnats.ErrOperatorNotFound
+	}
+	return *opPtr, nil
+}

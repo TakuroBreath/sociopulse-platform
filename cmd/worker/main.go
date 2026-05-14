@@ -1,6 +1,6 @@
 // Package main is the entrypoint for cmd/worker — the СоциоПульс
-// background worker process. Today it owns four errgroup-driven
-// daemons:
+// background worker process. Today it owns five errgroup-driven
+// daemons (one passive push subscriber + four active runners):
 //
 //   - dialer.retry.Orchestrator (Plan 10 Task 10) — leader-elected
 //     retry pipeline that drains failed dialer calls back into the queue.
@@ -15,6 +15,12 @@
 //     recording.uploaded) into ClickHouse via per-subject batched
 //     inserts with dedup-LRU. Best-effort: NATS or CH unreachable at
 //     boot → WARN + skip; the other daemons keep running.
+//   - dialer.transport.nats.CallEventSubscriber (Plan 13.2.5 Task 2) —
+//     passive push subscriber on tenant.*.telephony.event.> that routes
+//     CHANNEL_ANSWER / CHANNEL_HANGUP events to OperatorFSM.RecordCall*.
+//     Shares the "dialer-call-events" JetStream queue group with
+//     cmd/api's Module.Register subscription so events load-balance
+//     across replicas.
 //
 // Composition root:
 //
@@ -259,6 +265,36 @@ func run(ctx context.Context, configDir string) error {
 		return fmt.Errorf("build analytics ingest: %w", err)
 	}
 	defer analyticsRunner.Close(logger)
+
+	// 4e. Dialer telephony-event subscriber — Plan 13.2.5 Task 2. Wires
+	//     tenant.*.telephony.event.> JetStream subjects into the
+	//     OperatorFSM so a CHANNEL_ANSWER / CHANNEL_HANGUP fired by
+	//     cmd/telephony-bridge actually drives the operator FSM state
+	//     forward. Before this wiring, the FSM only left dialing/call
+	//     via the 30s heartbeat watchdog — calls hung in operator UI
+	//     for half a minute after the respondent hung up.
+	//
+	//     Degraded boot: nil + nil when the bus is unreachable or the
+	//     redis client isn't the concrete *redis.Client this codepath
+	//     needs (the fsm.Machine uses Lua scripts which require the
+	//     non-Cluster client). cmd/worker's other daemons keep running.
+	//
+	//     The shared JetStream queue group ("dialer-call-events") lets
+	//     cmd/api's Module.Register-side subscription (if present) and
+	//     ours share message delivery — JetStream load-balances events
+	//     across the cmd/api + cmd/worker pods so no event is processed
+	//     twice.
+	dialerEventsBoot, err := buildCallEventSubscriber(dialerEventConfig{
+		ctx:    ctx,
+		bus:    natsSubIface,
+		pool:   pool,
+		redis:  asRedisClientForFSM(rdb),
+		logger: logger.Named("dialer.events"),
+	})
+	if err != nil {
+		return fmt.Errorf("build dialer call-event subscriber: %w", err)
+	}
+	defer dialerEventsBoot.Close(logger)
 
 	// 5. /healthz listener. k8s readiness probes hit this; we keep
 	//    the surface tiny (just liveness) because the orchestrator's

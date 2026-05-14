@@ -78,6 +78,7 @@ import (
 	"github.com/sociopulse/platform/internal/dialer/retry"
 	"github.com/sociopulse/platform/internal/dialer/router"
 	transporthttp "github.com/sociopulse/platform/internal/dialer/transport/http"
+	transportnats "github.com/sociopulse/platform/internal/dialer/transport/nats"
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/pkg/outbox"
 	"github.com/sociopulse/platform/pkg/regions"
@@ -94,6 +95,8 @@ const (
 	LocatorRDDGenerator        = "dialer.RDDGenerator"
 	LocatorRetryOrchestrator   = "dialer.RetryOrchestrator"
 	LocatorSnapshotPubSub      = "dialer.SnapshotPubSub"
+	LocatorCallOperatorLookup  = "dialer.CallOperatorLookup"
+	LocatorCallEventSubscriber = "dialer.CallEventSubscriber"
 )
 
 // Locator keys this module CONSUMES (registered by other modules).
@@ -392,6 +395,42 @@ func (m *Module) Register(d modules.Deps) error {
 		logger.Debug("d.HTTPRouter is nil — skipping dialer HTTP transport mount")
 	}
 
+	// 11b. Telephony → dialer FSM bus subscriber (Plan 13.2.5 Task 2).
+	//      Plan 10's dialer.api.Router.Subscribe was declared but never
+	//      called by any cmd binary; FSM transitions out of dialing/call
+	//      relied on the 30s heartbeat watchdog instead. This wiring
+	//      closes that CRITICAL gap by binding the JetStream
+	//      "tenant.*.telephony.event.>" pattern to the OperatorFSM via
+	//      transport/nats.CallEventSubscriber.
+	//
+	//      Gated on (d.Subscriber, calls-table-backed lookup): degraded
+	//      boots (no NATS, no PG pool) skip the wiring with a WARN — the
+	//      heartbeat watchdog path is the fallback. The same shared
+	//      queue group is used by both cmd/api and cmd/worker subscribes
+	//      so JetStream load-balances events across replicas without
+	//      double-processing.
+	if d.Subscriber != nil {
+		lookup := newPgCallOperatorLookup(d.Pool)
+		ces := transportnats.NewCallEventSubscriber(machine, lookup, logger.Named("call_event_subscriber"))
+		// Register-time Subscribe: the bus push handler runs on a
+		// goroutine owned by pkg/eventbus.NATSSubscriber. ctx scopes
+		// the JetStream consumer-create RPC only; delivery lifetime is
+		// owned by the bus's Close (cmd/api / cmd/worker shutdown).
+		subscribeCtx := d.Ctx
+		if subscribeCtx == nil {
+			subscribeCtx = context.Background()
+		}
+		if err := ces.Subscribe(subscribeCtx, d.Subscriber, transportnats.DefaultQueueGroup); err != nil {
+			logger.Warn("dialer: call-event subscriber registration failed; FSM cannot react to telephony events in this process",
+				zap.Error(err))
+		} else {
+			d.Locator.Register(LocatorCallOperatorLookup, transportnats.CallOperatorLookup(lookup))
+			d.Locator.Register(LocatorCallEventSubscriber, ces)
+		}
+	} else {
+		logger.Warn("dialer: NATS subscriber missing from Deps — telephony→FSM wiring skipped (heartbeat-only fallback)")
+	}
+
 	// 12. Locator registrations.
 	d.Locator.Register(LocatorOperatorFSM, dialerapi.OperatorFSM(machine))
 	d.Locator.Register(LocatorCallQueue, dialerapi.CallQueue(q))
@@ -410,6 +449,7 @@ func (m *Module) Register(d modules.Deps) error {
 		zap.Bool("http_mounted", d.HTTPRouter != nil && dialerRouter != nil),
 		zap.Bool("router_wired", dialerRouter != nil),
 		zap.Bool("rdd_wired", rddGen != nil),
+		zap.Bool("call_event_subscriber_wired", d.Subscriber != nil),
 	)
 	return nil
 }
