@@ -84,13 +84,13 @@ func buildAnalyticsIngest(
 		return nil, fmt.Errorf("cmd/worker: analytics config: %w", err)
 	}
 
-	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second) //nolint:mnd // mirrors recording.openCH dial timeout
+	openCtx, cancel := context.WithTimeout(ctx, 5*time.Second) //nolint:mnd // mirrors internal/analytics/module.go::openCH dial timeout
 	defer cancel()
 	chConn, err := store.Open(openCtx, store.Config{
 		DSN:           cfg.Database.ClickHouse.DSN,
 		BatchSize:     cfg.Analytics.BatchSize,
 		FlushInterval: cfg.Analytics.FlushInterval,
-		DialTimeout:   5 * time.Second, //nolint:mnd // mirrors recording.openCH dial timeout
+		DialTimeout:   5 * time.Second, //nolint:mnd // mirrors internal/analytics/module.go::openCH dial timeout
 		Logger:        logger.Named("store"),
 	})
 	if err != nil {

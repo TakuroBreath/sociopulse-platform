@@ -254,11 +254,11 @@ func run(ctx context.Context, configDir string) error {
 	if natsSub != nil {
 		natsSubIface = natsSub
 	}
-	analyticsBoot, err := buildAnalyticsIngest(ctx, cfg, natsSubIface, logger.Named("analytics"))
+	analyticsRunner, err := buildAnalyticsIngest(ctx, cfg, natsSubIface, logger.Named("analytics"))
 	if err != nil {
 		return fmt.Errorf("build analytics ingest: %w", err)
 	}
-	defer analyticsBoot.Close(logger)
+	defer analyticsRunner.Close(logger)
 
 	// 5. /healthz listener. k8s readiness probes hit this; we keep
 	//    the surface tiny (just liveness) because the orchestrator's
@@ -288,9 +288,9 @@ func run(ctx context.Context, configDir string) error {
 			return nil
 		})
 	}
-	if analyticsBoot != nil {
+	if analyticsRunner != nil {
 		g.Go(func() error {
-			return analyticsBoot.run(gctx, logger.Named("analytics"))
+			return analyticsRunner.run(gctx, logger.Named("analytics"))
 		})
 	}
 	g.Go(func() error {

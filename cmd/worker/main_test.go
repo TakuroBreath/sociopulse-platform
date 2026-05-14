@@ -221,8 +221,7 @@ func TestBuildAnalyticsIngest_BadConfigFailsBoot(t *testing.T) {
 	// reaches the Validate step.
 	sub := fakeSubscriberForAnalyticsTest{}
 	_, err := buildAnalyticsIngest(t.Context(), cfg, sub, zaptestLogger(t))
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "analytics config")
+	require.ErrorIs(t, err, config.ErrInvalidAnalyticsConfig)
 }
 
 // TestAnalyticsBoot_RunIsNilSafe asserts that the run-method gracefully
