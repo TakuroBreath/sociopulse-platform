@@ -33,7 +33,16 @@ type Snapshot struct {
 	CurrentCallID  *uuid.UUID
 	RespondentID   *uuid.UUID
 	PauseReason    *string
-	Version        int64
+	// Outcome carries the classified call result while State == status
+	// and is consulted by the (status, go_verify) → verify transition.
+	// Set by RecordCallEnded (transition dialing|call → status); reset to
+	// zero on transitions out of status (StatusSubmitted, GoPause, EndShift).
+	// Persisted in the Redis hash under field "outcome" so an operator
+	// that pauses between RecordCallEnded and GoVerify (or that crosses
+	// a process restart) retains the outcome for the eventual verify
+	// decision.
+	Outcome api.StatusOutcome
+	Version int64
 }
 
 // toAPI converts the package-private Snapshot into the public DTO that
@@ -49,6 +58,7 @@ func (s Snapshot) toAPI(tenantID, operatorID uuid.UUID) api.Snapshot {
 		RespondentID:   s.RespondentID,
 		PauseReason:    s.PauseReason,
 		HeartbeatAt:    s.HeartbeatAt,
+		Outcome:        s.Outcome,
 	}
 }
 
@@ -123,6 +133,15 @@ func parseHash(h map[string]string) (Snapshot, error) {
 	if v := h["pause_reason"]; v != "" {
 		reason := v
 		s.PauseReason = &reason
+	}
+	if v := h["outcome"]; v != "" {
+		// We accept any string here and let consumers gate on
+		// IsSuccessClass / Valid — a corrupt outcome merely makes the
+		// (status, go_verify) edge fail-loud, which is the desired
+		// behaviour. parseHash already surfaces an error for unknown
+		// State values, so the operator's overall state remains
+		// well-typed.
+		s.Outcome = api.StatusOutcome(v)
 	}
 	if v := h["version"]; v != "" {
 		n, err := strconv.ParseInt(v, 10, 64)
@@ -225,6 +244,7 @@ func snapshotPayload(s Snapshot) ([]byte, error) {
 		"current_call_id":  uuidPtrToString(s.CurrentCallID),
 		"respondent_id":    uuidPtrToString(s.RespondentID),
 		"pause_reason":     stringPtrToString(s.PauseReason),
+		"outcome":          string(s.Outcome),
 	})
 }
 

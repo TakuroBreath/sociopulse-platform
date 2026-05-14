@@ -164,6 +164,29 @@ func (m *Machine) publish(snap api.Snapshot) {
 // or Postgres are UTC; the operator UI does the local-time rendering.
 func (m *Machine) now() time.Time { return m.clock().UTC() }
 
+// buildNextSnapshot is the centralized "compute the snapshot we're
+// about to write" helper used by every applyEvent path. It propagates
+// timestamps and resets fields whose lifetime is bounded to a specific
+// state — currently just Outcome, which lives only on the `status`
+// snapshot. mutate (called by the caller after this helper returns)
+// gets a clean baseline to override.
+//
+// Extracted out of applyEventFull to keep that function under the
+// gocyclo cap.
+func buildNextSnapshot(cur Snapshot, next api.State, now time.Time) Snapshot {
+	updated := cur
+	updated.State = next
+	updated.StateEnteredAt = now
+	updated.HeartbeatAt = now
+	// Outcome lives only on the `status` snapshot. Any transition that
+	// leaves `status` resets it so it can't carry stale data into the
+	// next state cycle.
+	if cur.State == api.StateStatus && next != api.StateStatus {
+		updated.Outcome = OutcomeUnknown
+	}
+	return updated
+}
+
 // applyEvent runs the canonical (load → check transition → CAS →
 // audit) flow for every non-shift method. mutate runs against the
 // computed `next` snapshot before the CAS write so callers can stash
@@ -245,10 +268,10 @@ func (m *Machine) applyEventFull(
 	if replayShortCircuit != nil && replayShortCircuit(cur) {
 		return cur.toAPI(tenantID, operatorID), nil
 	}
-	next, ok := transitions[edge{from: cur.State, event: evt}]
-	if !ok {
+	next, err := resolveTransition(cur.State, evt, cur.Outcome)
+	if err != nil {
 		m.metrics.observeInvalid(cur.State, evt)
-		return api.Snapshot{}, fmt.Errorf("%w: %s --%s-->", api.ErrInvalidTransition, cur.State, evt)
+		return api.Snapshot{}, err
 	}
 	if cur.State == next {
 		// Idempotent replay: nothing changes, no audit row.
@@ -256,10 +279,7 @@ func (m *Machine) applyEventFull(
 	}
 
 	now := m.now()
-	updated := cur
-	updated.State = next
-	updated.StateEnteredAt = now
-	updated.HeartbeatAt = now
+	updated := buildNextSnapshot(cur, next, now)
 	if mutate != nil {
 		mutate(&updated)
 	}
@@ -415,10 +435,10 @@ func (m *Machine) EndShift(ctx context.Context, tenantID, operatorID uuid.UUID) 
 		return cur.toAPI(tenantID, operatorID), nil
 	}
 	// EndShift is only valid from the documented set (ready/pause/status).
-	if _, ok := transitions[edge{from: cur.State, event: api.EventEndShift}]; !ok {
+	// Outcome is ignored for end_shift (the guard only fires for go_verify).
+	if _, err := resolveTransition(cur.State, api.EventEndShift, cur.Outcome); err != nil {
 		m.metrics.observeInvalid(cur.State, api.EventEndShift)
-		return api.Snapshot{},
-			fmt.Errorf("%w: %s --end_shift-->", api.ErrInvalidTransition, cur.State)
+		return api.Snapshot{}, err
 	}
 
 	now := m.now()
@@ -431,6 +451,7 @@ func (m *Machine) EndShift(ctx context.Context, tenantID, operatorID uuid.UUID) 
 	updated.CurrentCallID = nil
 	updated.RespondentID = nil
 	updated.PauseReason = nil
+	updated.Outcome = OutcomeUnknown
 
 	if err := m.casStore(ctx, tenantID, operatorID, cur.Version, updated); err != nil {
 		return api.Snapshot{}, fmt.Errorf("fsm/end_shift: cas: %w", err)
@@ -536,8 +557,16 @@ func (m *Machine) RecordCallStarted(ctx context.Context, req api.CallStartedRequ
 // after talk) route to the wrap-up state. The call_id and
 // respondent_id flow through unchanged so SubmitStatus has the
 // call_id to attach the status row to.
+//
+// The classified req.Outcome is stashed onto the new `status` snapshot.
+// It gates the eventual (status, go_verify) → verify transition:
+// CONTEXT.md requires verify reachable only from success-class outcomes.
+// An unset / zero outcome is fail-loud at the next GoVerify call rather
+// than silently letting it through.
 func (m *Machine) RecordCallEnded(ctx context.Context, req api.CallEndedRequest) (api.Snapshot, error) {
-	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventCallEnded, nil)
+	return m.applyEvent(ctx, req.TenantID, req.OperatorID, api.EventCallEnded, func(s *Snapshot) {
+		s.Outcome = req.Outcome
+	})
 }
 
 // SubmitStatus implements api.OperatorFSM. Clears the call_id /
@@ -560,6 +589,10 @@ func (m *Machine) SubmitStatus(ctx context.Context, req api.SubmitStatusRequest)
 		func(s *Snapshot) {
 			s.CurrentCallID = nil
 			s.RespondentID = nil
+			// Outcome was set by RecordCallEnded to gate go_verify; the
+			// operator is now leaving status, so reset to OutcomeUnknown
+			// — a future status pass must classify a fresh outcome.
+			s.Outcome = OutcomeUnknown
 		},
 		nil, // replayShortCircuit
 		m.callFinalizedExtras(req),
@@ -679,6 +712,10 @@ func (m *Machine) Force(
 	updated.CurrentCallID = nil
 	updated.RespondentID = nil
 	updated.PauseReason = nil
+	// Force bypasses the transition table; clear Outcome so a forced
+	// state landing outside `status` cannot carry a stale outcome into
+	// a subsequent legitimate transition.
+	updated.Outcome = OutcomeUnknown
 	if target == api.StateOffline {
 		updated.SessionID = nil
 		updated.ProjectID = nil

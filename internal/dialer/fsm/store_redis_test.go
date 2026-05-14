@@ -129,22 +129,42 @@ func TestIntegration_FullRoundTrip(t *testing.T) {
 	})
 	require.NoError(t, err)
 
+	// RecordCallEnded with OutcomeSuccess so the subsequent GoVerify
+	// gate passes (CONTEXT.md: verify reachable only from success-class).
 	_, err = f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
-		TenantID: tenantID, OperatorID: operatorID, CallID: callID, Cause: "NORMAL_CLEARING",
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID,
+		Cause:   "NORMAL_CLEARING",
+		Outcome: api.OutcomeSuccess,
 	})
 	require.NoError(t, err)
 
-	// SubmitStatus: status → ready (clears call_id / respondent_id).
-	_, err = f.machine.SubmitStatus(ctx, api.SubmitStatusRequest{
-		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID, Status: "success",
-	})
-	require.NoError(t, err)
-
-	// GoVerify is entered from ready (operator-initiated listen-in).
+	// GoVerify is entered from `status` with a success-class outcome
+	// per CONTEXT.md spec.
 	_, err = f.machine.GoVerify(ctx, tenantID, operatorID)
 	require.NoError(t, err)
 
 	_, err = f.machine.VerifyDone(ctx, tenantID, operatorID)
+	require.NoError(t, err)
+
+	// SubmitStatus on a fresh dialing/call cycle proves status → ready
+	// clears call_id / respondent_id (the original assertion).
+	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+	_, err = f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID,
+		Cause:   "NORMAL_CLEARING",
+		Outcome: api.OutcomeNoAnswer,
+	})
+	require.NoError(t, err)
+	_, err = f.machine.SubmitStatus(ctx, api.SubmitStatusRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID, Status: "no_answer",
+	})
 	require.NoError(t, err)
 
 	_, err = f.machine.GoPause(ctx, api.GoPauseRequest{TenantID: tenantID, OperatorID: operatorID, Reason: "bio_break"})

@@ -102,7 +102,62 @@ func (r ForceReason) Valid() bool {
 	return false
 }
 
+// StatusOutcome classifies the result of a completed call attempt. It
+// flows from RecordCallEnded into the operator's Snapshot for the
+// `status` state, where it is consulted by the FSM transition
+// (status, go_verify) — per CONTEXT.md, `verify` is reachable only from
+// success-class outcomes. The label is low-cardinality and safe to ship
+// into Prometheus metrics.
+//
+// Adding a new constant requires extending Valid() and IsSuccessClass()
+// (the latter governs the (status, go_verify) gate).
+type StatusOutcome string
+
+const (
+	// OutcomeSuccess marks an answered, completed survey conversation.
+	// Only outcomes in the success class permit the verify transition.
+	OutcomeSuccess StatusOutcome = "success"
+	// OutcomeNoAnswer marks a call that timed out without an answer.
+	OutcomeNoAnswer StatusOutcome = "no_answer"
+	// OutcomeBusy marks a busy signal / SIT response.
+	OutcomeBusy StatusOutcome = "busy"
+	// OutcomeWrongPerson marks an answered call that did not reach the
+	// intended respondent (relative, IVR, voicemail, ...).
+	OutcomeWrongPerson StatusOutcome = "wrong_person"
+	// OutcomeDNCHit marks a do-not-call list hit detected after dialing.
+	OutcomeDNCHit StatusOutcome = "dnc_hit"
+	// OutcomeTechFailure marks a telephony / network failure
+	// (congestion, codec mismatch, ...).
+	OutcomeTechFailure StatusOutcome = "tech_failure"
+)
+
+// Valid reports whether o is one of the recognized StatusOutcome enum
+// values. The zero value ("") is NOT valid — callers that don't have an
+// outcome yet must omit the field rather than send the empty string.
+func (o StatusOutcome) Valid() bool {
+	switch o {
+	case OutcomeSuccess, OutcomeNoAnswer, OutcomeBusy,
+		OutcomeWrongPerson, OutcomeDNCHit, OutcomeTechFailure:
+		return true
+	}
+	return false
+}
+
+// IsSuccessClass reports whether o falls into the success class — the
+// set of outcomes that permit the (status, go_verify) → verify
+// transition. Today only OutcomeSuccess qualifies; the helper exists so
+// future "answered but partial completion" outcomes can be folded in
+// without scattering the predicate across the codebase.
+func (o StatusOutcome) IsSuccessClass() bool {
+	return o == OutcomeSuccess
+}
+
 // Snapshot is the immutable view of one operator's FSM state.
+//
+// Outcome carries the classified call result while State == StateStatus
+// and is consulted by the (status, go_verify) → verify transition. It
+// is zero-valued ("") in every other state. Transitions out of `status`
+// reset it back to zero.
 type Snapshot struct {
 	TenantID       uuid.UUID
 	OperatorID     uuid.UUID
@@ -113,6 +168,7 @@ type Snapshot struct {
 	RespondentID   *uuid.UUID
 	PauseReason    *string
 	HeartbeatAt    time.Time
+	Outcome        StatusOutcome
 }
 
 // QueueItem is one row in the call queue. Priority+EnqueuedAt drives the
@@ -164,6 +220,14 @@ type CallStartedRequest struct {
 }
 
 // CallEndedRequest is the input for OperatorFSM.RecordCallEnded.
+//
+// Outcome carries the classified result of the call attempt and is
+// stored on the resulting `status` Snapshot. It gates the subsequent
+// (status, go_verify) → verify transition: only success-class outcomes
+// are allowed through (per CONTEXT.md). Callers MUST set Outcome to a
+// valid value before invoking RecordCallEnded; an empty / unknown
+// outcome makes the subsequent GoVerify call fail-loud with
+// ErrInvalidTransition.
 type CallEndedRequest struct {
 	TenantID   uuid.UUID
 	OperatorID uuid.UUID
@@ -171,6 +235,7 @@ type CallEndedRequest struct {
 	EndedAt    time.Time
 	Cause      string
 	DurationMS int
+	Outcome    StatusOutcome
 }
 
 // SubmitStatusRequest is the input for OperatorFSM.SubmitStatus.

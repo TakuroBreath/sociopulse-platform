@@ -8,25 +8,37 @@
 //
 // # OperatorFSM transition diagram
 //
+// CONTEXT.md authoritative spec:
+//
+//	offline → ready → dialing → call → status → verify → ready
+//	plus pause from any non-offline / non-pause state
+//	verify is reachable ONLY from status with a success-class outcome
+//
 //	    ┌────────────────────────────────────────────────────────────────────┐
 //	    │                                                                    │
 //	    │  EndShift                                                          │
 //	    ▼                                                                    │
 //	[offline] ──StartShift──▶ [ready] ──GoPause──▶ [pause] ──Resume──▶ [ready]
-//	                              │                                         │
-//	                              │ CallStarted (dial begins)               │
-//	                              ▼                                         │
-//	                          [dialing] ──CallStarted (ANSWER)──▶ [call]    │
-//	                              │                                  │      │
-//	                              │ CallEnded / CallFailed           │      │
-//	                              │                                  │      │
-//	                              ▼                                  ▼      │
-//	                          [status] ◀──── CallEnded ──────────[call]     │
-//	                              │                                         │
-//	                              │ StatusSubmitted                         │
-//	                              └─────────────────────────────────────────┘
+//	                              │                  ▲
+//	                              │ CallStarted      │  GoPause (panic-pause)
+//	                              ▼                  │  reachable from any
+//	                          [dialing] ──CallStarted (ANSWER)──▶ [call]
+//	                              │                                  │
+//	                              │ CallEnded / CallFailed           │ CallEnded
+//	                              │                                  │
+//	                              ▼                                  ▼
+//	                          [status] ◀──────────── CallEnded ─────[call]
+//	                              │  (RecordCallEnded carries StatusOutcome
+//	                              │   onto the snapshot)
+//	                              │ StatusSubmitted
+//	                              ▼
+//	                            [ready]
 //
-//	[ready] ──GoVerify──▶ [verify] ──VerifyDone──▶ [ready]
+//	[status] ──GoVerify──▶ [verify] ──VerifyDone──▶ [ready]
+//	          ↑ only when carried StatusOutcome.IsSuccessClass()
+//
+//	[ready], [dialing], [call], [status], [verify]
+//	    ──GoPause──▶ [pause] ──Resume──▶ [ready]
 //
 // Force(target, reason) is the escape hatch invoked by the heartbeat watchdog
 // when presence:<tid>:user:<id> TTL expires. Force bypasses the transition

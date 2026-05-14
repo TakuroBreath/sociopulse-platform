@@ -513,19 +513,43 @@ func TestFullHappyPath(t *testing.T) {
 }
 
 // TestVerifyFlow covers the supervisor-style verify path:
-// ready → verify → ready. Verify is operator-initiated listen-in
-// from the idle (ready) state, not from status wrap-up.
+// status (with success outcome) → verify → ready. Per CONTEXT.md,
+// verify is reachable only from `status` and only when the carried
+// StatusOutcome is success-class. Driving the FSM through the canonical
+// shift+call sequence keeps the test aligned with the production wiring.
 func TestVerifyFlow(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	tenantID, operatorID, projectID := uuid.New(), uuid.New(), uuid.New()
+	respondentID, callID := uuid.New(), uuid.New()
 	ctx := context.Background()
 
 	_, err := f.machine.StartShift(ctx, newReq(tenantID, operatorID, projectID))
 	require.NoError(t, err)
 
-	// ready → verify
-	snap, err := f.machine.GoVerify(ctx, tenantID, operatorID)
+	// Drive ready → dialing → call so the next RecordCallEnded lands
+	// in `status` with a classified outcome.
+	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+
+	// RecordCallEnded with OutcomeSuccess → status with success-class
+	// outcome stashed on the snapshot.
+	snap, err := f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID,
+		Outcome: api.OutcomeSuccess,
+	})
+	require.NoError(t, err)
+	require.Equal(t, api.StateStatus, snap.State)
+	require.Equal(t, api.OutcomeSuccess, snap.Outcome)
+
+	// status (success-class) → verify
+	snap, err = f.machine.GoVerify(ctx, tenantID, operatorID)
 	require.NoError(t, err)
 	require.Equal(t, api.StateVerify, snap.State)
 
@@ -533,6 +557,38 @@ func TestVerifyFlow(t *testing.T) {
 	snap, err = f.machine.VerifyDone(ctx, tenantID, operatorID)
 	require.NoError(t, err)
 	require.Equal(t, api.StateReady, snap.State)
+}
+
+// TestVerifyFlow_NonSuccessOutcome_RejectsGoVerify asserts the
+// CONTEXT.md guarantee that non-success outcomes block the verify
+// transition. A no-answer / busy / tech-failure operator must finish
+// wrap-up via SubmitStatus rather than entering verify.
+func TestVerifyFlow_NonSuccessOutcome_RejectsGoVerify(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	tenantID, operatorID, projectID := uuid.New(), uuid.New(), uuid.New()
+	respondentID, callID := uuid.New(), uuid.New()
+	ctx := context.Background()
+
+	_, err := f.machine.StartShift(ctx, newReq(tenantID, operatorID, projectID))
+	require.NoError(t, err)
+
+	_, err = f.machine.RecordCallStarted(ctx, api.CallStartedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID, RespondentID: respondentID,
+	})
+	require.NoError(t, err)
+
+	// dialing → status with OutcomeNoAnswer (hangup before answer).
+	snap, err := f.machine.RecordCallEnded(ctx, api.CallEndedRequest{
+		TenantID: tenantID, OperatorID: operatorID, CallID: callID,
+		Outcome: api.OutcomeNoAnswer,
+	})
+	require.NoError(t, err)
+	require.Equal(t, api.StateStatus, snap.State)
+
+	// GoVerify must fail-loud — outcome is not success class.
+	_, err = f.machine.GoVerify(ctx, tenantID, operatorID)
+	require.ErrorIs(t, err, api.ErrInvalidTransition)
 }
 
 // TestRecordCallStarted_ReplaySameCallID — replay with the same call_id
