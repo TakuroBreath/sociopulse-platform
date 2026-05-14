@@ -16,6 +16,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap"
 
@@ -335,4 +337,212 @@ func maxAttempts(t *testing.T, ctx context.Context, pool *postgres.Pool) int {
 		return tx.QueryRow(ctx, `SELECT coalesce(max(attempts), 0) FROM event_outbox`).Scan(&n)
 	}))
 	return n
+}
+
+// seedParkedRows inserts n parked rows for the given tenant. "Parked"
+// means attempts >= maxRetry AND published_at IS NULL — exactly the rows
+// the DLQ poll counts.
+func seedParkedRows(t *testing.T, ctx context.Context, pool *postgres.Pool, tenantID uuid.UUID, n, maxRetry int) {
+	t.Helper()
+	w := outbox.NewPostgresWriter()
+
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		for i := 0; i < n; i++ {
+			aggID := uuid.New()
+			if err := w.Append(ctx, tx, outbox.Event{
+				TenantID:    &tenantID,
+				AggregateID: &aggID,
+				Subject:     "test.parked",
+				Payload:     []byte(`{"i":` + intToStr(i) + `}`),
+			}); err != nil {
+				return err
+			}
+		}
+		// Force attempts to MaxRetry so the DLQ predicate matches.
+		_, err := tx.Exec(ctx,
+			`UPDATE event_outbox SET attempts = $1
+			 WHERE tenant_id = $2 AND published_at IS NULL`,
+			maxRetry, tenantID)
+		return err
+	}))
+}
+
+// resetAttempts pulls every parked row for tenantID back below the DLQ
+// threshold. Used to simulate operator remediation between poll cycles.
+func resetAttempts(t *testing.T, ctx context.Context, pool *postgres.Pool, tenantID uuid.UUID) {
+	t.Helper()
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE event_outbox SET attempts = 0
+			 WHERE tenant_id = $1 AND published_at IS NULL`,
+			tenantID)
+		return err
+	}))
+}
+
+// resetOneAttempt picks a single parked row for tenantID and resets its
+// attempts to 0 — used to assert the gauge tracks partial remediation.
+func resetOneAttempt(t *testing.T, ctx context.Context, pool *postgres.Pool, tenantID uuid.UUID) {
+	t.Helper()
+	require.NoError(t, pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		_, err := tx.Exec(ctx,
+			`UPDATE event_outbox SET attempts = 0
+			 WHERE id = (
+			   SELECT id FROM event_outbox
+			   WHERE tenant_id = $1 AND published_at IS NULL AND attempts > 0
+			   ORDER BY id LIMIT 1
+			 )`,
+			tenantID)
+		return err
+	}))
+}
+
+// gaugeFor reads the current value of m.ParkedRows for the supplied tenant.
+// Returns 0 if the label combination is not present.
+func gaugeFor(t *testing.T, m *outbox.RelayMetrics, tenantID uuid.UUID) float64 {
+	t.Helper()
+	return testutil.ToFloat64(m.ParkedRows.WithLabelValues(tenantID.String()))
+}
+
+// newRelayWithMetrics builds a Relay wired to a fresh metrics struct,
+// with DLQ polling DISABLED in Run (interval=0). Tests drive PollOnce
+// explicitly so they don't depend on timer scheduling.
+func newRelayWithMetrics(t *testing.T, pool *postgres.Pool, pub *fakePublisher, maxRetry int) (*outbox.Relay, *outbox.RelayMetrics) {
+	t.Helper()
+	reg := prometheus.NewRegistry()
+	m, err := outbox.RegisterRelayMetrics(reg)
+	require.NoError(t, err)
+
+	relay := outbox.NewRelay(pool, pub, outbox.RelayConfig{
+		BatchSize:       10,
+		Tick:            50 * time.Millisecond,
+		MaxRetry:        maxRetry,
+		PublishTimeout:  time.Second,
+		DLQPollInterval: 0, // disable poll goroutine; tests drive PollOnce
+		Metrics:         m,
+	}, zap.NewNop())
+	return relay, m
+}
+
+// TestRelay_DLQGauge_TracksParkedRowsPerTenant seeds 3 parked rows for
+// tenant A and 2 parked rows for tenant B; PollOnce must publish the
+// per-tenant counts to the gauge.
+func TestRelay_DLQGauge_TracksParkedRowsPerTenant(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newOutboxTestPool(t)
+
+	const maxRetry = 3
+	tenantA := uuid.New()
+	tenantB := uuid.New()
+	seedParkedRows(t, ctx, pool, tenantA, 3, maxRetry)
+	seedParkedRows(t, ctx, pool, tenantB, 2, maxRetry)
+
+	relay, m := newRelayWithMetrics(t, pool, &fakePublisher{}, maxRetry)
+
+	require.NoError(t, relay.PollOnce(ctx))
+
+	require.InDelta(t, 3.0, gaugeFor(t, m, tenantA), 0.0,
+		"tenant A should report 3 parked rows")
+	require.InDelta(t, 2.0, gaugeFor(t, m, tenantB), 0.0,
+		"tenant B should report 2 parked rows")
+}
+
+// TestRelay_DLQGauge_ResetsWhenAttemptsDropBelowMax verifies that after a
+// row is remediated (attempts pulled below MaxRetry), the next poll
+// reflects the new lower count for that tenant.
+func TestRelay_DLQGauge_ResetsWhenAttemptsDropBelowMax(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newOutboxTestPool(t)
+
+	const maxRetry = 3
+	tenantA := uuid.New()
+	seedParkedRows(t, ctx, pool, tenantA, 3, maxRetry)
+
+	relay, m := newRelayWithMetrics(t, pool, &fakePublisher{}, maxRetry)
+
+	require.NoError(t, relay.PollOnce(ctx))
+	require.InDelta(t, 3.0, gaugeFor(t, m, tenantA), 0.0)
+
+	resetOneAttempt(t, ctx, pool, tenantA)
+	require.NoError(t, relay.PollOnce(ctx))
+	require.InDelta(t, 2.0, gaugeFor(t, m, tenantA), 0.0,
+		"gauge should track partial remediation")
+}
+
+// TestRelay_DLQGauge_DisappearsWhenAllRowsClear asserts that when a
+// previously parked tenant has zero rows on the next poll, the gauge
+// label combination is removed (not left at the prior count).
+func TestRelay_DLQGauge_DisappearsWhenAllRowsClear(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newOutboxTestPool(t)
+
+	const maxRetry = 3
+	tenantA := uuid.New()
+	seedParkedRows(t, ctx, pool, tenantA, 3, maxRetry)
+
+	relay, m := newRelayWithMetrics(t, pool, &fakePublisher{}, maxRetry)
+
+	require.NoError(t, relay.PollOnce(ctx))
+	require.InDelta(t, 3.0, gaugeFor(t, m, tenantA), 0.0)
+
+	resetAttempts(t, ctx, pool, tenantA)
+	require.NoError(t, relay.PollOnce(ctx))
+
+	// After all rows clear, the tenant's label must be deleted from the
+	// gauge entirely (DeleteLabelValues). Count via CollectAndCount: 0
+	// means no series, which is what we want.
+	got := testutil.CollectAndCount(m.ParkedRows, "sociopulse_outbox_parked_rows_total")
+	require.Equal(t, 0, got,
+		"gauge label for tenant with zero parked rows must be deleted, not left at 0")
+}
+
+// TestRelay_DLQPollGoroutineExits_OnContextCancel verifies the poll
+// goroutine respects ctx cancellation. goleak (TestMain) backs this up.
+func TestRelay_DLQPollGoroutineExits_OnContextCancel(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	pool := newOutboxTestPool(t)
+
+	reg := prometheus.NewRegistry()
+	m, err := outbox.RegisterRelayMetrics(reg)
+	require.NoError(t, err)
+
+	relay := outbox.NewRelay(pool, &fakePublisher{}, outbox.RelayConfig{
+		BatchSize:       5,
+		Tick:            50 * time.Millisecond,
+		MaxRetry:        3,
+		PublishTimeout:  time.Second,
+		DLQPollInterval: 50 * time.Millisecond, // poll goroutine MUST also exit on cancel
+		Metrics:         m,
+	}, zap.NewNop())
+
+	runCtx, runCancel := context.WithCancel(ctx)
+	done := make(chan error, 1)
+	go func() { done <- relay.Run(runCtx) }()
+
+	// Let the poll goroutine tick at least once.
+	time.Sleep(150 * time.Millisecond)
+	runCancel()
+
+	select {
+	case err := <-done:
+		require.NoError(t, err, "Run must return nil on graceful shutdown")
+	case <-time.After(time.Second):
+		t.Fatal("Run did not exit within 1s of cancel — DLQ-poll goroutine likely leaked")
+	}
 }

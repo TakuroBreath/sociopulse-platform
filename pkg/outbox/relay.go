@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"go.uber.org/zap"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/postgres"
@@ -20,6 +21,13 @@ const (
 	defaultRelayTick           = time.Second
 	defaultRelayMaxRetry       = 10
 	defaultRelayPublishTimeout = 5 * time.Second
+
+	// DefaultRelayDLQPollInterval is the canonical production value for
+	// RelayConfig.DLQPollInterval — exposed so callers wire it
+	// explicitly rather than relying on a hidden default in this file.
+	// Tests pass 0 here to disable the poll goroutine and drive
+	// PollOnce manually.
+	DefaultRelayDLQPollInterval = 60 * time.Second
 
 	// maxLastErrorLen caps how much of an upstream error message we
 	// persist on the row. Postgres TEXT has no hard limit but we keep
@@ -42,6 +50,14 @@ type Relay struct {
 	publisher eventbus.Publisher
 	cfg       RelayConfig
 	logger    *zap.Logger
+
+	// trackedTenants records the set of tenant-label values currently
+	// published on the ParkedRows gauge. The DLQ poll prunes labels
+	// that disappear from the scan via DeleteLabelValues so stale
+	// tenants don't keep firing alerts. Accessed only from pollOnce,
+	// which is serialised (one goroutine in production; one call at a
+	// time from tests).
+	trackedTenants map[string]struct{}
 }
 
 // RelayConfig parameterises Relay. Each binary that runs the relay
@@ -66,6 +82,24 @@ type RelayConfig struct {
 	// PublishTimeout bounds an individual Publisher.Publish call.
 	// Default 5s.
 	PublishTimeout time.Duration
+
+	// DLQPollInterval controls how often the relay polls for parked
+	// rows (attempts >= MaxRetry, published_at IS NULL) and refreshes
+	// the ParkedRows gauge. Operators alert on the gauge to detect
+	// stuck downstreams.
+	//
+	// Production callers set this to DefaultRelayDLQPollInterval
+	// (60s). Zero or negative disables the poll goroutine in Run —
+	// useful in tests that drive PollOnce manually to avoid timing
+	// races. There is no implicit default applied by defaults() so
+	// the caller's intent is unambiguous.
+	DLQPollInterval time.Duration
+
+	// Metrics, when non-nil, receives ParkedRows updates on each DLQ
+	// poll. The composition root wires the gauge into the binary's
+	// Prometheus registry via outbox.RegisterRelayMetrics; the relay
+	// itself never registers collectors. nil disables metric emission.
+	Metrics *RelayMetrics
 }
 
 func (c *RelayConfig) defaults() {
@@ -96,10 +130,11 @@ func NewRelay(pool *postgres.Pool, publisher eventbus.Publisher, cfg RelayConfig
 		logger = zap.NewNop()
 	}
 	return &Relay{
-		pool:      pool,
-		publisher: publisher,
-		cfg:       cfg,
-		logger:    logger,
+		pool:           pool,
+		publisher:      publisher,
+		cfg:            cfg,
+		logger:         logger,
+		trackedTenants: make(map[string]struct{}),
 	}
 }
 
@@ -113,6 +148,11 @@ func NewRelay(pool *postgres.Pool, publisher eventbus.Publisher, cfg RelayConfig
 //	g.Go(func() error { return relay.Run(gctx) })
 //
 // inside an errgroup orchestrating the binary's long-running goroutines.
+//
+// Internally Run runs two goroutines: the drain loop and an optional
+// DLQ-poll loop (active when cfg.DLQPollInterval > 0). Both share the
+// same errgroup so a panic or non-nil return in either tears down both;
+// goleak-clean shutdown is the contract.
 func (r *Relay) Run(ctx context.Context) error {
 	if r.pool == nil {
 		return errors.New("outbox: relay requires a non-nil pool")
@@ -125,8 +165,31 @@ func (r *Relay) Run(ctx context.Context) error {
 		zap.Int("batch_size", r.cfg.BatchSize),
 		zap.Duration("tick", r.cfg.Tick),
 		zap.Int("max_retry", r.cfg.MaxRetry),
+		zap.Duration("dlq_poll_interval", r.cfg.DLQPollInterval),
 	)
 
+	g, gctx := errgroup.WithContext(ctx)
+	g.Go(func() error { return r.runDrainLoop(gctx) })
+	if r.cfg.DLQPollInterval > 0 && r.cfg.Metrics != nil {
+		g.Go(func() error { return r.runDLQPollLoop(gctx) })
+	}
+
+	if err := g.Wait(); err != nil {
+		// Drain/poll loops return nil on graceful ctx cancellation and
+		// only surface non-nil for genuine init failures (none today).
+		// Treat ctx errors as "stopped" rather than failure.
+		if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+// runDrainLoop owns the main drain ticker: drain-everything → wait for
+// Tick or ctx.Done → repeat. Returns nil on ctx cancellation so the
+// outer errgroup doesn't treat orderly shutdown as failure.
+func (r *Relay) runDrainLoop(ctx context.Context) error {
 	// time.NewTimer + Reset in the loop avoids the timer-leak per iteration
 	// trap that bites time.After (golang-concurrency § BP6).
 	timer := time.NewTimer(r.cfg.Tick)
@@ -138,7 +201,7 @@ func (r *Relay) Run(ctx context.Context) error {
 		// once we don't add Tick to every event's tail latency.
 		if err := r.drainUntilEmpty(ctx); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-				r.logger.Info("outbox relay stopping")
+				r.logger.Info("outbox relay drain loop stopping")
 				return nil
 			}
 			r.logger.Error("outbox drain failed", zap.Error(err))
@@ -160,12 +223,112 @@ func (r *Relay) Run(ctx context.Context) error {
 
 		select {
 		case <-ctx.Done():
-			r.logger.Info("outbox relay stopping")
+			r.logger.Info("outbox relay drain loop stopping")
 			return nil
 		case <-timer.C:
 			// loop
 		}
 	}
+}
+
+// runDLQPollLoop owns the DLQ ticker: every DLQPollInterval, scan
+// event_outbox for parked rows and refresh the ParkedRows gauge.
+// Returns nil on ctx cancellation. Errors mid-poll are logged and the
+// loop continues — a transient DB hiccup must not take down the relay.
+//
+// time.NewTicker (not NewTimer) is appropriate here: the interval is
+// fixed and we drop ticks if a single poll takes longer than expected
+// (back-pressure rather than queue-up).
+func (r *Relay) runDLQPollLoop(ctx context.Context) error {
+	ticker := time.NewTicker(r.cfg.DLQPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			r.logger.Info("outbox relay dlq-poll loop stopping")
+			return nil
+		case <-ticker.C:
+			if err := r.pollOnce(ctx); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					r.logger.Info("outbox relay dlq-poll loop stopping")
+					return nil
+				}
+				r.logger.Error("outbox dlq poll failed", zap.Error(err))
+			}
+		}
+	}
+}
+
+// pollOnce scans event_outbox for parked rows (attempts >= MaxRetry,
+// published_at IS NULL), groups by tenant_id, and refreshes the
+// ParkedRows gauge. Tenants whose count dropped to zero since the last
+// poll are removed from the gauge via DeleteLabelValues so stale
+// alerts don't linger.
+//
+// The query bypasses RLS — event_outbox is platform-internal and owned
+// by tenancy_admin; the application role doesn't see it under RLS.
+// Rows with tenant_id IS NULL (platform-global events) are bucketed
+// under an empty-string label so ops can still see the backlog.
+//
+// pollOnce is safe to call manually from tests in lieu of letting the
+// DLQ-poll goroutine schedule it. Concurrent invocations are not
+// supported — there's no mutex on trackedTenants.
+func (r *Relay) pollOnce(ctx context.Context) error {
+	if r.cfg.Metrics == nil {
+		return nil
+	}
+
+	type row struct {
+		tenantID *string
+		count    int64
+	}
+	var rows []row
+
+	err := r.pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		const q = `
+			SELECT tenant_id::text, count(*)
+			FROM event_outbox
+			WHERE attempts >= $1 AND published_at IS NULL
+			GROUP BY tenant_id`
+		pgRows, err := tx.Query(ctx, q, r.cfg.MaxRetry)
+		if err != nil {
+			return fmt.Errorf("outbox: dlq poll query: %w", err)
+		}
+		defer pgRows.Close()
+
+		for pgRows.Next() {
+			var r row
+			if err := pgRows.Scan(&r.tenantID, &r.count); err != nil {
+				return fmt.Errorf("outbox: dlq poll scan: %w", err)
+			}
+			rows = append(rows, r)
+		}
+		return pgRows.Err()
+	})
+	if err != nil {
+		return err
+	}
+
+	// Build the current set of tenants seen this poll. Set the gauge
+	// for each. Any tenant in trackedTenants but not in current must
+	// be deleted from the gauge to clear stale series.
+	current := make(map[string]struct{}, len(rows))
+	for _, row := range rows {
+		label := ""
+		if row.tenantID != nil {
+			label = *row.tenantID
+		}
+		current[label] = struct{}{}
+		r.cfg.Metrics.ParkedRows.WithLabelValues(label).Set(float64(row.count))
+	}
+	for label := range r.trackedTenants {
+		if _, stillParked := current[label]; !stillParked {
+			r.cfg.Metrics.ParkedRows.DeleteLabelValues(label)
+		}
+	}
+	r.trackedTenants = current
+	return nil
 }
 
 // drainUntilEmpty repeatedly drains a batch until a pass returns 0 rows.
