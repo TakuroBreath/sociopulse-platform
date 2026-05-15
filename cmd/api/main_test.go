@@ -157,6 +157,43 @@ func TestBuildProviders_TenancyIsFirstEntry(t *testing.T) {
 			"auth/crm/surveys (Plan 21 Tasks 2+) depend on its locator publish")
 }
 
+// TestBuildProviders_ContainsAuthCrmSurveys asserts the compile-time
+// wiring of the three Plan 21 Task 2 modules. They sit after tenancy
+// (Task 1) in dependency order: auth consumes tenancy.{TenantService,
+// KMSResolver}; crm consumes tenancy.{KMSResolver, PhoneHasher} +
+// (optional) auth.{RBACChecker, ClaimsValidator}; surveys consumes
+// auth.{ClaimsValidator, RBACChecker}.
+//
+// The runtime locator-entries assertion (e.g. auth.Authenticator
+// actually published to the locator) lives in the smoke harness
+// (Plan 21 Task 7) where a real Postgres+Redis stack backs the
+// auth/crm Register paths.
+func TestBuildProviders_ContainsAuthCrmSurveys(t *testing.T) {
+	t.Parallel()
+
+	providers := buildProviders(buildProvidersDeps{})
+
+	names := make(map[string]int) // name → index for ordering checks
+	for i, mod := range providers.Modules {
+		if mod == nil {
+			continue
+		}
+		names[mod.Name()] = i
+	}
+
+	require.Contains(t, names, "tenancy", "Task 1 wiring lost")
+	require.Contains(t, names, "auth", "auth.Module missing from providers")
+	require.Contains(t, names, "crm", "crm.Module missing from providers")
+	require.Contains(t, names, "surveys", "surveys.Module missing from providers")
+
+	// Dependency order: tenancy < auth; auth < crm; auth < surveys.
+	// (Module.Register is called in slice order; consumers must come
+	// after producers so locator.Lookup succeeds at Register time.)
+	assert.Less(t, names["tenancy"], names["auth"], "tenancy must precede auth (auth consumes tenancy.*)")
+	assert.Less(t, names["auth"], names["crm"], "auth must precede crm (crm consumes auth.RBACChecker)")
+	assert.Less(t, names["auth"], names["surveys"], "auth must precede surveys (surveys consumes auth.ClaimsValidator)")
+}
+
 // pickFreeAddr asks the kernel for a free TCP port, returns "127.0.0.1:N".
 // The listener is closed immediately; race-prone in theory, fine in practice
 // for serial test boots a few seconds apart.
@@ -309,6 +346,11 @@ auth:
     access_ttl: 15m
     refresh_ttl: 720h
     algorithm: HS256
+    # Plan 21 Task 2 — deterministic dev value so auth.Module.Register
+    # doesn't WARN-skip on Config.Auth.JWT.Secret == "". Production
+    # MUST load this from Yandex Lockbox via secret_lockbox_key
+    # (ADR-0001); never use this literal outside dev/test.
+    secret: smoke-test-secret-do-not-use-in-prod
 observability:
   otel:
     endpoint: localhost:4317

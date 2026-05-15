@@ -4,12 +4,15 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/sociopulse/platform/internal/analytics"
+	"github.com/sociopulse/platform/internal/auth"
 	"github.com/sociopulse/platform/internal/billing"
+	"github.com/sociopulse/platform/internal/crm"
 	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/modules"
 	"github.com/sociopulse/platform/internal/recording"
 	"github.com/sociopulse/platform/internal/recording/storage"
 	"github.com/sociopulse/platform/internal/reports"
+	"github.com/sociopulse/platform/internal/surveys"
 	"github.com/sociopulse/platform/internal/telephony"
 	"github.com/sociopulse/platform/internal/tenancy"
 )
@@ -38,6 +41,15 @@ type buildProvidersDeps struct {
 	// ObjectStore). Same nil semantics as Dialer above — safe for
 	// Name()-only inspection, unsafe for Register invocation.
 	Recording *recording.Module
+
+	// Crm is the *crm.Module produced at run-time so run() can defer
+	// its Stop() before the Redis client closes. crm.Module.Register
+	// spawns an asynq.Server goroutine when Redis is non-nil; without
+	// a deferred Stop the asynq subscriber races rdb.Close at
+	// shutdown and panics on a nil pubsub message (asynq@v0.26.0
+	// subscriber.go:83). Tests that only inspect Module.Name() may
+	// pass nil; the providers walk skips a nil-Crm entry.
+	Crm *crm.Module
 
 	// MetricsRegistry is the *prometheus.Registry that analytics +
 	// any other module-built-with-New() collectors register against.
@@ -68,11 +80,34 @@ func buildProviders(deps buildProvidersDeps) modules.Registry {
 		// pins both presence AND first-position.
 		&tenancy.Module{},
 
+		// Plan 21 Task 2 — auth MUST come immediately after tenancy
+		// and BEFORE any module that consumes auth locator keys
+		// (crm, surveys, billing, future analytics). Consumes
+		// tenancy.{TenantService, KMSResolver}; publishes
+		// auth.{Authenticator, UserService, TOTPService,
+		// RBACChecker, ClaimsValidator, SessionRevoker}.
+		//
+		// Closes Plan 14 Production Lesson #1: billing's requireRBAC
+		// today falls through to its role-fast-path because
+		// auth.RBACChecker is not in the locator. Wiring auth here
+		// makes the matrix-checker the active gate.
+		auth.Module{},
+
 		telephony.Module{},
 		deps.Dialer,
 		deps.Recording,
 		analytics.New(analytics.Config{Registerer: deps.MetricsRegistry}),
 		reports.New(reports.Config{ObjectStore: deps.RecordingObjects}),
 		billing.Module{},
+
+		// Plan 21 Task 2 — crm and surveys are siblings (independent
+		// of each other); each one consumes auth's locator keys so
+		// both MUST come after auth in this slice. crm is passed in
+		// via deps so the composition root can defer its Stop()
+		// AHEAD of rdb.Close() — see buildProvidersDeps.Crm for the
+		// asynq-shutdown rationale. surveys is stateless so the
+		// value-receiver inline construction suffices.
+		deps.Crm,
+		surveys.Module{},
 	}}
 }

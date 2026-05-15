@@ -84,6 +84,15 @@ auth:
     refresh_ttl: 720h
     algorithm: HS256
     secret_lockbox_key: jwt-signing-secret-dev
+    # Plan 21 Task 2 — deterministic dev secret so auth.Module.Register
+    # succeeds when running cmd/api against `make dev-up` without a
+    # Lockbox provider wired. Production MUST load via the lockbox key
+    # above (ADR-0001) and leave this slot empty. NOTE: today the
+    # JWTConfig.Secret field carries `mapstructure:"-"` so YAML alone
+    # does not populate it; this key is documentary intent until a
+    # post-unmarshal binding (or env override SOCIOPULSE_AUTH_JWT_SECRET)
+    # lands in pkg/config/load.go.
+    secret: smoke-test-secret-do-not-use-in-prod
   password:
     argon2id_memory_kb: 65536
     argon2id_iterations: 3

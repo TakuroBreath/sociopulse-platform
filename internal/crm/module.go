@@ -47,7 +47,6 @@ import (
 	"sync"
 
 	"github.com/hibiken/asynq"
-	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
 	auditapi "github.com/sociopulse/platform/internal/audit/api"
@@ -177,9 +176,15 @@ func (m *Module) wireImportPath(d modules.Deps, svc *crmservice.RespondentServic
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	redisOpt := buildAsynqRedisOpt(d.Redis)
-	client := asynq.NewClient(redisOpt)
-	server := asynq.NewServer(redisOpt, asynq.Config{
+	// Plan 21 Task 2 — *FromRedisClient constructors flip asynq's
+	// sharedConnection flag to true; Shutdown/Close then leave the
+	// underlying d.Redis client alone (cmd/api owns the lifecycle).
+	// The plain RedisConnOpt constructors would set
+	// sharedConnection=false and call broker.Close at shutdown, which
+	// closes the SHARED redis.UniversalClient and crashes any sibling
+	// asynq server still draining (subscriber.go:83 nil-pubsub panic).
+	client := asynq.NewClientFromRedisClient(d.Redis)
+	server := asynq.NewServerFromRedisClient(d.Redis, asynq.Config{
 		Concurrency: 4,
 		Queues: map[string]int{
 			asynqQueueCRM: 1,
@@ -232,9 +237,11 @@ func (m *Module) Stop() error {
 		m.asynqServer = nil
 	}
 	if m.asynqClient != nil {
-		if err := m.asynqClient.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close asynq client: %w", err))
-		}
+		// Plan 21 Task 2 — the client was built via
+		// asynq.NewClientFromRedisClient (shared-connection mode), so
+		// asynq.Client.Close returns "redis connection is shared so
+		// the Client can't be closed through asynq" — cmd/api owns
+		// rdb.Close. Drop the reference rather than calling Close.
 		m.asynqClient = nil
 	}
 	if len(errs) > 0 {
@@ -272,8 +279,11 @@ func (m *Module) wirePurgePath(d modules.Deps, store crmapi.RespondentStorePort,
 	purgeMux := asynq.NewServeMux()
 	purgeMux.HandleFunc(crmapi.TaskRespondentsPurge, worker.HandlePurgeTask)
 
-	redisOpt := buildAsynqRedisOpt(d.Redis)
-	purgeServer := asynq.NewServer(redisOpt, asynq.Config{
+	// Plan 21 Task 2 — see wireImportPath: *FromRedisClient
+	// constructors avoid the shared-connection close at Shutdown.
+	// Without this, the purge server's Shutdown crashes the import
+	// server's subscriber (and vice versa) when both share d.Redis.
+	purgeServer := asynq.NewServerFromRedisClient(d.Redis, asynq.Config{
 		Concurrency: 1,
 		Queues: map[string]int{
 			asynqQueueCRM: 1,
@@ -284,7 +294,7 @@ func (m *Module) wirePurgePath(d modules.Deps, store crmapi.RespondentStorePort,
 		return fmt.Errorf("start asynq purge server: %w", err)
 	}
 
-	scheduler := asynq.NewScheduler(redisOpt, &asynq.SchedulerOpts{
+	scheduler := asynq.NewSchedulerFromRedisClient(d.Redis, &asynq.SchedulerOpts{
 		Logger: zapAsynqLogger{l: d.Logger.Named("asynq.scheduler")},
 	})
 	task := asynq.NewTask(crmapi.TaskRespondentsPurge, nil)
@@ -445,26 +455,6 @@ func lookupPhoneHasher(loc modules.ServiceLocator, log *zap.Logger) tenancyapi.P
 	}
 	return h
 }
-
-// buildAsynqRedisOpt constructs asynq's RedisConnOpt from the project's
-// existing Redis client. asynq insists on an opt that exposes a
-// MakeRedisClient method; passing the universal client we already
-// hold is the simplest way to keep the connection pool shared.
-func buildAsynqRedisOpt(rdb redis.UniversalClient) asynq.RedisConnOpt {
-	return asynqClientOpt{client: rdb}
-}
-
-// asynqClientOpt is a private adapter that satisfies asynq.RedisConnOpt
-// by returning the supplied UniversalClient verbatim. This way the
-// crm module reuses cmd/api's connection pool instead of opening a
-// second one.
-type asynqClientOpt struct {
-	client redis.UniversalClient
-}
-
-// MakeRedisClient returns the wrapped client. asynq accepts an
-// interface{} so we don't need to import a more specific type.
-func (o asynqClientOpt) MakeRedisClient() any { return o.client }
 
 // zapAsynqLogger adapts zap to asynq's Logger interface (Print-style
 // methods). asynq invokes these for queue-server lifecycle events; we

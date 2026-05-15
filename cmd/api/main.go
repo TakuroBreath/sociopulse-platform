@@ -30,6 +30,7 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
+	"github.com/sociopulse/platform/internal/crm"
 	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
@@ -284,6 +285,14 @@ func run(ctx context.Context, configDir string) error {
 	//    empty-fallback path — which rejects every cross-tenant lookup
 	//    and is strictly safer than no check.
 	dialerModule := &dialer.Module{}
+	// Plan 21 Task 2 — crm.Module is constructed here (not inline in
+	// buildProviders) so its pointer-receiver Stop() can be deferred
+	// in run() AHEAD of rdb.Close. crm.Register spawns an asynq.Server
+	// goroutine when Redis is reachable; without an ordered Stop the
+	// asynq subscriber panics on a nil pubsub message during shutdown
+	// (asynq@v0.26.0 subscriber.go:83) once the Redis client closes
+	// underneath it.
+	crmModule := &crm.Module{}
 	realtimeModule := realtime.New(realtime.Config{Registerer: metrics.Registry})
 	// Plan 12.1 Task 5 — recording module. Has no upstream module
 	// deps (just Pool + Logger + Locator) so it joins the providers
@@ -352,6 +361,7 @@ func run(ctx context.Context, configDir string) error {
 	providers := buildProviders(buildProvidersDeps{
 		Dialer:           dialerModule,
 		Recording:        recordingModule,
+		Crm:              crmModule,
 		MetricsRegistry:  metrics.Registry,
 		RecordingObjects: recordingObjects,
 	})
@@ -374,6 +384,17 @@ func run(ctx context.Context, configDir string) error {
 	defer func() {
 		if err := recordingModule.Stop(); err != nil {
 			logger.Warn("recording module Stop failed", zap.Error(err))
+		}
+	}()
+	// Plan 21 Task 2 — crm.Module owns an asynq.Server goroutine
+	// (Plan 06 Task 5). Stop drains the queue and closes the asynq
+	// client; deferring it AFTER the modules above (LIFO → executes
+	// FIRST when run() returns) keeps it ahead of the rdb.Close defer
+	// set early in run(), so asynq's pubsub channel is shut down
+	// cleanly before the underlying Redis client disappears.
+	defer func() {
+		if err := crmModule.Stop(); err != nil {
+			logger.Warn("crm module Stop failed", zap.Error(err))
 		}
 	}()
 
