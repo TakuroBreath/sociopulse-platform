@@ -471,27 +471,38 @@ The mechanically enforced parts of this strategy:
 | Comma-ok type assertions | `forcetypeassert` |
 | Module isolation `internal/X/api/` only | `depguard:module-boundaries` |
 
-## What this strategy does NOT yet cover (system-level gap)
+## What this strategy DOES cover at the system level (Phase 1 closed 2026-05-16)
 
-The pyramid above is solid at the **per-module** level. What it does
-not yet cover is the **system level** — full `cmd/api` boot against
-the real backing stack, with cross-module flows exercised over the
-public HTTP / WS surface. As of 2026-05-10:
+`tests/smoke/` (build tag `smoke`) boots `cmd/api` against a
+testcontainer Postgres + Redis + NATS stack and walks the public
+HTTP / WS surface end-to-end. **10 named scenarios** ship as of
+v0.0.27 (Plan 21 + Plan 21b):
 
-- No `tests/smoke/` package exists yet (planned in
-  `09-agent-workflow-improvements.md` § Improvement #5).
-- No REST collection (Bruno / Postman) for manual exploration.
-- No Frontend E2E (Playwright) — owned by `sociopulse-web` repo,
-  Plan 15+.
-- No real-FreeSWITCH integration — owned by Plan 08.
-- No real-Yandex-SDK adapter coverage — owned by Plan 01.
-- No chaos / load — pre-launch milestone.
+1. `TestSmoke_HarnessBootsAndHealthz` — harness shakedown.
+2. `TestSmoke_HealthAndReadiness` — `/healthz` + `/readyz` (postgres+nats checks) + `/metrics` go-runtime.
+3. `TestSmoke_AuthFullFlow` — login → refresh → logout → 401 on revoked refresh.
+4. `TestSmoke_RbacEnforcement` — operator JWT against admin POST → 403; admin JWT → 201.
+5. `TestSmoke_TenantIsolation` — tenant-B JWT against tenant-A `:id` → 404 (RLS + RequireSameTenant); same for `:id/hangup`.
+6. `TestSmoke_SurveyCreatePreviewActivate` — surveys CRUD + version activation + `survey_versions_active_one` partial-unique constraint regression.
+7. `TestSmoke_AdminCreatesProjectAndImportsRespondents` — multipart-CSV → asynq → KMS-encrypted phones in PG; cross-tenant 404 regression.
+8. `TestSmoke_OperatorReadyAndStateBroadcast` — `coder/websocket` dial → POST /api/sessions/{start,pause,end} → assert state-change frames (`SnapshotDTO`) on the WS.
+9. `TestSmoke_RecordingSearchAndStream` — pre-encrypted `LocalObjectStore` fixture → search asserts ciphertext sha256 contract → stream returns plaintext → Range header → 416 (ADR-0005 §15.4); cross-tenant → 404.
+10. `TestSmoke_RespondentSoftDelete152FZ` — HTTP soft-delete → in-test `crmservice.NewPurgeWorker` with `FutureClock(31d)` → `Run(ctx)` → row physically gone; idempotent re-Run.
+
+CI: dedicated `smoke` job runs `go test -tags=smoke -race -count=1`
+on every push to `main` and on every `v*` tag push. Tag-push deploys
+gate on smoke green.
+
+**Phase 1 of the closure plan is COMPLETE.** Remaining phases:
+
+- **Phase 2** — REST collection (Bruno / Postman / Hurl) for manual exploration / QA pre-release sweep. ~4 hours of work; not yet scheduled.
+- **Phase 3** — Frontend E2E (Playwright) — owned by `sociopulse-web` repo, Plans 15-19.
+- **Phase 4** — Real FreeSWITCH integration (Plan 08) + real Yandex SDK (Plan 01).
+- **Phase 5** — Chaos / load (k6, SIPp, Chaos Mesh) — pre-launch milestone.
 
 The full gap analysis, the rationale ("not coverage — confidence"),
 the failure-class examples, and the phased closure plan live in
 **[`10-end-to-end-testing-gaps.md`](./10-end-to-end-testing-gaps.md)**.
-Read that document before assuming "the system is tested" based on
-the unit + integration numbers above.
 
 ## Cross-references
 

@@ -169,7 +169,10 @@ tests don't span the publish-side and the consumer-side together.
 
 ## Closure plan
 
-### Phase 1 — `tests/smoke/` (target: 2-3 days of focused work)
+### Phase 1 — `tests/smoke/` ✅ **COMPLETE** (2026-05-15 Plan 21 + 2026-05-16 Plan 21b)
+
+> **Status: shipped.** Plan 21 (`v0.0.26-e2e-smoke-foundation`) delivered the harness + 4 scenarios (Health/Auth/RBAC/TenantIsolation). Plan 21b (`v0.0.27-phase-1b-smoke-scenarios`) delivered the remaining 5 (admin import, operator WS, surveys CRUD, recording stream, 152-ФЗ purge), bringing the suite to **10 named scenarios**. CI `smoke` job is the canonical gate. **Section retained below as the original design / decision record; the present tense should be read as "shipped".**
+
 
 A new package `tests/smoke/` gated by `//go:build smoke`. Each test
 boots a fresh testcontainer stack (PG + Redis + NATS + MinIO),
@@ -290,13 +293,13 @@ single Plan.
 
 The gap is **closed at Phase 1** when:
 
-- ≥ 8 smoke scenarios live in `tests/smoke/` and run green locally.
+- ≥ 8 smoke scenarios live in `tests/smoke/` and run green locally. ✅ **10 scenarios shipped (2026-05-16)**.
 - A `smoke` job in `.github/workflows/ci.yml` runs on every push to
-  `main` and on every `v*` tag push.
-- Pre-release (tag) workflow is **blocked** if smoke is red.
+  `main` and on every `v*` tag push. ✅ **Plan 21**.
+- Pre-release (tag) workflow is **blocked** if smoke is red. ✅ `build` job's `needs: [lint, test, smoke]` (Plan 21).
 - At least one cross-module contract regression has been caught in
   PR by smoke that would have been missed by per-module tests
-  (this is the proof that the layer is doing real work).
+  (this is the proof that the layer is doing real work). ✅ **Plan 21b shipped four production fixes via smoke**: migration `000015_admin_grants_surveys` (handler unit tests with fake services missed it), `LocalKMSClient` KEK pre-registration seam (asynq import stalled with `ErrKEKNotFound`), recording-handler Range-header 416 enforcement (was only advertising `Accept-Ranges: none`), `cmd/api/main_test.go` TestMain build-tag split (smoke binary orphaned pgPool + testcontainers).
 
 The gap is **fully closed (all phases)** when E and F deliver real-
 component coverage and frontend Playwright runs against a live
