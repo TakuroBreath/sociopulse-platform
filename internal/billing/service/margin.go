@@ -103,6 +103,9 @@ func (m *marginReport) Margin(ctx context.Context, tenantID uuid.UUID, p billing
 		}
 		out = append(out, row)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i].TotalMin > out[j].TotalMin })
+	// SliceStable preserves the SQL-side ORDER BY p.name secondary order
+	// when two projects share TotalMin — so equal-spend rows in the
+	// dashboard render in alphabetical order. Caught in Step F review.
+	sort.SliceStable(out, func(i, j int) bool { return out[i].TotalMin > out[j].TotalMin })
 	return out, nil
 }
