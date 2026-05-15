@@ -217,3 +217,19 @@ analytics:
   long_window_threshold: 24h
   queue_group: analytics-ingest
   drain_timeout: 5s
+
+# billing — Plan 14 Step A.
+# Defaults applied when a tenant has not yet PATCHed
+# /api/billing/tariffs. Per-tenant overrides land in tenant_settings
+# (key: "billing.tariffs") and shadow these defaults; the YAML values
+# stay untouched. All numbers are int64 minor units (kopecks).
+billing:
+  defaults:
+    trunk_costs_minor:
+      mtt-msk-1: 342
+      mango-fed: 378
+      beeline-srf: 412
+    wage_per_survey_minor: 12000
+    respondent_bases_minor: 50
+    storage_minor_per_gb_mo: 150
+    fixed_fees_minor: 5000000

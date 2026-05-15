@@ -165,6 +165,18 @@ func TestLoadRealDevConfig(t *testing.T) {
 	assert.Equal(t, "sociopulse", c.Observability.Metrics.Namespace)
 	assert.Equal(t, int64(10*1024*1024), c.HTTP.MaxBodySize)
 	assert.Equal(t, 15*time.Second, c.Shutdown.GracePeriod)
+
+	// Plan 14 Step A — billing defaults from configs/development/config.yaml.
+	// The mapstructure tags on Tariffs override viper's CamelCase→snake_case
+	// auto-conversion, so the YAML uses clean names ("storage_minor_per_gb_mo"
+	// rather than "storage_minor_per_g_b_mo").
+	assert.Equal(t, int64(12000), c.Billing.Defaults.WagePerSurveyMinor)
+	assert.Equal(t, int64(50), c.Billing.Defaults.RespondentBasesMinor)
+	assert.Equal(t, int64(150), c.Billing.Defaults.StorageMinorPerGBMo)
+	assert.Equal(t, int64(5000000), c.Billing.Defaults.FixedFeesMinor)
+	assert.Equal(t, int64(342), c.Billing.Defaults.TrunkCostsMinor["mtt-msk-1"])
+	assert.Equal(t, int64(378), c.Billing.Defaults.TrunkCostsMinor["mango-fed"])
+	assert.Equal(t, int64(412), c.Billing.Defaults.TrunkCostsMinor["beeline-srf"])
 }
 
 // findRepoConfigsDir walks up from the test working directory until it finds

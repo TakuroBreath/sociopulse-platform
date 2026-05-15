@@ -55,6 +55,8 @@ var rbacMatrix = map[authapi.Role]map[authapi.Action]struct{}{
 		// Reports.
 		authapi.ActionReportGenerate,
 		authapi.ActionReportList,
+		// Billing — view only; tariff updates remain admin-only.
+		authapi.ActionBillingView,
 	),
 	authapi.RoleAdmin: setOf(
 		// User administration.
@@ -83,6 +85,9 @@ var rbacMatrix = map[authapi.Role]map[authapi.Action]struct{}{
 		// Reports.
 		authapi.ActionReportGenerate,
 		authapi.ActionReportList,
+		// Billing — full access (view + tariff updates).
+		authapi.ActionBillingView,
+		authapi.ActionBillingTariffUpdate,
 	),
 }
 

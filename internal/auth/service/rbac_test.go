@@ -111,6 +111,16 @@ func canonicalCases() []rbacCase {
 		{"operator/report.list denied", []authapi.Role{authapi.RoleOperator}, authapi.ActionReportList, false},
 		{"supervisor/report.list allowed", []authapi.Role{authapi.RoleSupervisor}, authapi.ActionReportList, true},
 		{"admin/report.list allowed", []authapi.Role{authapi.RoleAdmin}, authapi.ActionReportList, true},
+
+		// ---- billing.view -- supervisor + admin (Plan 14) -------
+		{"operator/billing.view denied", []authapi.Role{authapi.RoleOperator}, authapi.ActionBillingView, false},
+		{"supervisor/billing.view allowed", []authapi.Role{authapi.RoleSupervisor}, authapi.ActionBillingView, true},
+		{"admin/billing.view allowed", []authapi.Role{authapi.RoleAdmin}, authapi.ActionBillingView, true},
+
+		// ---- billing.tariff_update -- admin only (Plan 14) ------
+		{"operator/billing.tariff_update denied", []authapi.Role{authapi.RoleOperator}, authapi.ActionBillingTariffUpdate, false},
+		{"supervisor/billing.tariff_update denied", []authapi.Role{authapi.RoleSupervisor}, authapi.ActionBillingTariffUpdate, false},
+		{"admin/billing.tariff_update allowed", []authapi.Role{authapi.RoleAdmin}, authapi.ActionBillingTariffUpdate, true},
 	}
 }
 

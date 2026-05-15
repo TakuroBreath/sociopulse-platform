@@ -49,6 +49,13 @@ const (
 	// Reports — supervisor + admin.
 	ActionReportGenerate Action = "report.generate"
 	ActionReportList     Action = "report.list"
+
+	// Billing — finance dashboard + tariff editor (Plan 14).
+	// View is supervisor + admin; tariff updates are admin-only because
+	// they change cost-per-minute rates that flow into every future
+	// call_costs row.
+	ActionBillingView         Action = "billing.view"          // view dashboard, history, projects
+	ActionBillingTariffUpdate Action = "billing.tariff_update" // admin-only PATCH /api/billing/tariffs
 )
 
 // ResourceUser returns a Resource pointing at the user with the given ID.

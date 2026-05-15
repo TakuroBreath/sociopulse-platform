@@ -39,6 +39,7 @@ type Config struct {
 	Shutdown      ShutdownConfig      `mapstructure:"shutdown"`
 	Outbox        OutboxConfig        `mapstructure:"outbox"`
 	Analytics     AnalyticsConfig     `mapstructure:"analytics"`
+	Billing       BillingConfig       `mapstructure:"billing"`
 }
 
 // ServiceConfig holds the cross-cutting service attributes.
@@ -71,6 +72,7 @@ func (c *Config) Validate() error {
 		{"s3", c.S3.Validate},
 		{"analytics", c.Analytics.Validate},
 		{"reports", c.Reports.Validate},
+		{"billing", c.Billing.Validate},
 	}
 	for _, s := range subs {
 		if err := s.fn(); err != nil {
