@@ -5,6 +5,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -208,4 +209,100 @@ func mustSmokeGet(ctx context.Context, t *testing.T, cli *http.Client, url strin
 	resp, err := cli.Do(req)
 	require.NoError(t, err, "GET %s", url)
 	return resp
+}
+
+// TestSmoke_AuthFullFlow — Plan 21 Task 6.
+//
+// Walks the canonical auth lifecycle against a fully-booted cmd/api:
+//
+//  1. POST /api/auth/login with valid creds → 200 + access + refresh
+//  2. POST /api/auth/refresh with the refresh → 200 + fresh tokens
+//  3. POST /api/auth/logout with the refresh → 204
+//  4. POST /api/auth/refresh with the logged-out refresh → 401
+//
+// Catches the JWT claims schema drift class (10-end-to-end-testing-gaps.md
+// failure scenario #3): any change that breaks login serialisation, JWT
+// signing, or Redis-backed refresh invalidation surfaces here.
+func TestSmoke_AuthFullFlow(t *testing.T) {
+	t.Parallel()
+
+	stack := smoke.GetSharedStack(t)
+	httpAddr, _ := bootAPI(t, stack)
+
+	admin := smoke.SeedTenantAndAdmin(t, stack, "SMOKE-A", "alice", "AlicePass123!")
+
+	ctx := t.Context()
+	cli := &http.Client{Timeout: 10 * time.Second}
+
+	// 1. Login. We read the body bytes once and decode from them so the
+	// diagnostic on a non-200 status carries the actual response without
+	// racing the Decoder for the same Reader.
+	loginBody := fmt.Sprintf(`{"org_id":%q,"login":%q,"password":%q}`,
+		admin.OrgCode, admin.Login, admin.Password)
+	loginStatus, loginBytes := postJSONAndRead(ctx, t, cli,
+		"http://"+httpAddr+"/api/auth/login", loginBody)
+	require.Equalf(t, http.StatusOK, loginStatus,
+		"login must 200 for seeded admin; got %d body=%s", loginStatus, string(loginBytes))
+
+	var login struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	require.NoError(t, json.Unmarshal(loginBytes, &login), "decode login response: %s", string(loginBytes))
+	require.NotEmpty(t, login.AccessToken, "access_token present")
+	require.NotEmpty(t, login.RefreshToken, "refresh_token present")
+
+	// 2. Refresh — must mint a NEW access_token (rotation).
+	refreshBody := fmt.Sprintf(`{"refresh_token":%q}`, login.RefreshToken)
+	refreshStatus, refreshBytes := postJSONAndRead(ctx, t, cli,
+		"http://"+httpAddr+"/api/auth/refresh", refreshBody)
+	require.Equalf(t, http.StatusOK, refreshStatus,
+		"refresh must 200; got %d body=%s", refreshStatus, string(refreshBytes))
+
+	var refreshed struct {
+		AccessToken  string `json:"access_token"`
+		RefreshToken string `json:"refresh_token"`
+	}
+	require.NoError(t, json.Unmarshal(refreshBytes, &refreshed), "decode refresh response: %s", string(refreshBytes))
+	require.NotEmpty(t, refreshed.AccessToken)
+	assert.NotEqual(t, login.AccessToken, refreshed.AccessToken,
+		"refresh must mint a fresh access_token (rotation)")
+
+	// 3. Logout — body carries the most-recent refresh (the rotated one).
+	logoutBody := fmt.Sprintf(`{"refresh_token":%q}`, refreshed.RefreshToken)
+	logoutStatus, logoutBytes := postJSONAndRead(ctx, t, cli,
+		"http://"+httpAddr+"/api/auth/logout", logoutBody)
+	require.Truef(t,
+		logoutStatus == http.StatusNoContent || logoutStatus == http.StatusOK,
+		"logout must 204 (or 200); got %d body=%s", logoutStatus, string(logoutBytes))
+
+	// 4. Refresh with the logged-out token → 401. The body is the same
+	// rotated refresh-token payload as the logout step; the session
+	// revocation triggered above MUST surface as 401 here.
+	revokedStatus, revokedBytes := postJSONAndRead(ctx, t, cli,
+		"http://"+httpAddr+"/api/auth/refresh", logoutBody)
+	assert.Equalf(t, http.StatusUnauthorized, revokedStatus,
+		"refresh after logout must 401 (revoked session); got %d body=%s",
+		revokedStatus, string(revokedBytes))
+}
+
+// postJSONAndRead issues a POST against url with a JSON body, returning
+// the status code and the fully-consumed body bytes. The response body
+// is always closed before return so the caller can use the bytes for
+// both Decode and diagnostic logging without racing the Reader.
+//
+// Transport-level failures (build, dial, read) fail the test via
+// require.NoError — they are never the test's intent and a nil response
+// would only cause a confusing nil-deref one line later.
+func postJSONAndRead(ctx context.Context, t *testing.T, cli *http.Client, url, body string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
+	require.NoError(t, err, "build POST %s", url)
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := cli.Do(req)
+	require.NoError(t, err, "POST %s", url)
+	defer func() { _ = resp.Body.Close() }()
+	buf, err := io.ReadAll(resp.Body)
+	require.NoError(t, err, "read body for POST %s", url)
+	return resp.StatusCode, buf
 }
