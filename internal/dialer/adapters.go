@@ -340,3 +340,69 @@ func (a *PgCallOperatorLookup) LookupOperator(ctx context.Context, tenantID, cal
 	}
 	return *opPtr, nil
 }
+
+// PgCallTenantResolver resolves a call_id to its owning tenant by
+// reading the calls table via pool.BypassRLS. Plan 21 Task 3 — feeds
+// the tenant.RequireSameTenant middleware on POST /api/calls/:id/hangup
+// (closes the Plan 13.2.5 out-of-scope finding tracked for v0.0.26).
+//
+// Why BypassRLS (not WithTenant): the middleware does not yet know
+// which tenant owns the call — that's the predicate we are about to
+// verify. A WithTenant scan would silently miss rows owned by another
+// tenant, defeating the cross-tenant guard. BypassRLS is the canonical
+// path for "I need the tenant identity of an unknown-tenant row".
+//
+// Sibling of PgCallOperatorLookup but distinct in two ways:
+//   - Uses BypassRLS instead of WithTenant (resolving, not enforcing).
+//   - Reads only tenant_id (no operator_id semantics — a row with NULL
+//     operator_id still has a non-NULL tenant_id; calls.tenant_id is
+//     NOT NULL per the 000001_init schema).
+type PgCallTenantResolver struct {
+	pool *postgres.Pool
+}
+
+// Compile-time check that PgCallTenantResolver satisfies the port.
+var _ dialerapi.CallTenantResolver = (*PgCallTenantResolver)(nil)
+
+// NewPgCallTenantResolver constructs the adapter. pool MUST be non-nil
+// — wiring without one is a programmer bug surfaced at composition.
+func NewPgCallTenantResolver(pool *postgres.Pool) *PgCallTenantResolver {
+	if pool == nil {
+		panic("dialer.NewPgCallTenantResolver: pool must be non-nil")
+	}
+	return &PgCallTenantResolver{pool: pool}
+}
+
+// LookupCallTenant satisfies dialerapi.CallTenantResolver. Returns
+// dialerapi.ErrCallNotFound when no row matches; anything else is
+// wrapped and propagates as a 500 through the middleware adapter (a
+// transient storage hiccup must not silently downgrade to a 404 that
+// lets the request pass through).
+//
+// Runs inside pool.BypassRLS — the scan is by-design cross-tenant
+// because the caller does not yet know the tenant. tenancy_admin has
+// SELECT on calls via migration 000014 (Plan 21 Task 3); without that
+// grant the query would fail with permission_denied even under the
+// BYPASSRLS role flag.
+func (a *PgCallTenantResolver) LookupCallTenant(ctx context.Context, callID uuid.UUID) (uuid.UUID, error) {
+	if callID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("dialer/lookup_call_tenant: nil callID")
+	}
+
+	var tenantID uuid.UUID
+	err := a.pool.BypassRLS(ctx, func(tx postgres.Tx) error {
+		const q = `SELECT tenant_id FROM calls WHERE id = $1 LIMIT 1`
+		row := tx.QueryRow(ctx, q, callID)
+		switch err := row.Scan(&tenantID); {
+		case errors.Is(err, pgx.ErrNoRows):
+			return dialerapi.ErrCallNotFound
+		case err != nil:
+			return fmt.Errorf("dialer/lookup_call_tenant: scan: %w", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return uuid.Nil, err
+	}
+	return tenantID, nil
+}

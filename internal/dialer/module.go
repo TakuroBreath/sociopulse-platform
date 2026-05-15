@@ -542,6 +542,13 @@ func (m *Module) mountHTTP(
 		Logger:          m.logger.Named("http"),
 		SnapshotPubSub:  snapshotPubsub,
 		RefreshPresence: refresh,
+		// Plan 21 Task 3 — cross-tenant guard on POST /api/calls/:id/hangup.
+		// PgCallTenantResolver runs a BypassRLS SELECT against the calls
+		// table; migration 000014 grants tenancy_admin SELECT so the
+		// SET LOCAL ROLE path inside BypassRLS succeeds. Constructed
+		// once per Register so the underlying *postgres.Pool is shared
+		// with the rest of the dialer's PG paths.
+		CallTenantResolver: NewPgCallTenantResolver(d.Pool),
 	})
 	m.logger.Info("dialer HTTP transport mounted under /api")
 	return nil

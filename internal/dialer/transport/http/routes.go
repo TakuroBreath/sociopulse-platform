@@ -1,6 +1,9 @@
 package http
 
 import (
+	"context"
+	"errors"
+
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -8,6 +11,7 @@ import (
 	authapi "github.com/sociopulse/platform/internal/auth/api"
 	dialerapi "github.com/sociopulse/platform/internal/dialer/api"
 	authmw "github.com/sociopulse/platform/pkg/middleware/auth"
+	tenantmw "github.com/sociopulse/platform/pkg/middleware/tenant"
 )
 
 // Deps captures the collaborators that the dialer transport needs.
@@ -21,6 +25,13 @@ type Deps struct {
 	Queue    dialerapi.CallQueue
 	Hours    dialerapi.WorkingHoursChecker
 	Capacity dialerapi.LineCapacityTracker
+
+	// CallTenantResolver gates POST /api/calls/:id/hangup against
+	// cross-tenant access. The transport wraps it in a
+	// tenant.RequireSameTenant middleware that aborts 404-no-body on
+	// mismatch (existence-probe defence). Plan 21 Task 3 closes the
+	// Plan 13.2.5 out-of-scope finding tracked for v0.0.26.
+	CallTenantResolver dialerapi.CallTenantResolver
 
 	Validator authapi.ClaimsValidator
 	RBAC      authapi.RBACChecker
@@ -114,7 +125,18 @@ func Mount(group *gin.RouterGroup, deps Deps) {
 	calls := authed.Group("/calls")
 	calls.Use(requireRole(authapi.RoleOperator, authapi.RoleSupervisor, authapi.RoleAdmin))
 	calls.POST("/:id/status", h.submitStatus)
-	calls.POST("/:id/hangup", h.hangup)
+	// Plan 21 Task 3 — RequireSameTenant cross-tenant guard on hangup.
+	// Closes the Plan 13.2.5 finding: tenant A's operator JWT could
+	// previously hang up tenant B's call because the Router.Hangup
+	// publish path has no tenant predicate. The middleware reads :id
+	// from the URL, looks up calls.tenant_id via BypassRLS, and aborts
+	// 404-no-body when the resolved tenant differs from the claims
+	// tenant (existence-probe defence). ErrCallNotFound → 404 (same
+	// shape) so an attacker cannot enumerate call ids.
+	calls.POST("/:id/hangup",
+		tenantmw.RequireSameTenant(callTenantResolveFn(deps.CallTenantResolver)),
+		h.hangup,
+	)
 
 	// Operator real-time channel — mounted OUTSIDE the JWTMiddleware
 	// chain because browsers cannot easily set Authorization on a
@@ -149,5 +171,25 @@ func mustNotBeNil(d Deps) {
 		panic("dialer/transport/http: RBAC is required")
 	case d.SnapshotPubSub == nil:
 		panic("dialer/transport/http: SnapshotPubSub is required")
+	case d.CallTenantResolver == nil:
+		panic("dialer/transport/http: CallTenantResolver is required")
+	}
+}
+
+// callTenantResolveFn adapts the dialerapi.CallTenantResolver port to
+// the tenant.ResolveTenantFn signature consumed by RequireSameTenant.
+// ErrCallNotFound is folded into the middleware's ErrNotFound sentinel
+// so the wire response is a 404 with no body. Any other error
+// propagates unchanged so the middleware can surface 500.
+func callTenantResolveFn(r dialerapi.CallTenantResolver) tenantmw.ResolveTenantFn {
+	return func(ctx context.Context, id uuid.UUID) (uuid.UUID, error) {
+		t, err := r.LookupCallTenant(ctx, id)
+		if err != nil {
+			if errors.Is(err, dialerapi.ErrCallNotFound) {
+				return uuid.Nil, tenantmw.ErrNotFound
+			}
+			return uuid.Nil, err
+		}
+		return t, nil
 	}
 }

@@ -11,10 +11,43 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/zap/zaptest"
 
+	dialerapi "github.com/sociopulse/platform/internal/dialer/api"
 	"github.com/sociopulse/platform/internal/modules"
 	telephonyapi "github.com/sociopulse/platform/internal/telephony/api"
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
 )
+
+// TestNewPgCallTenantResolver_PanicsOnNilPool surfaces the
+// composition-root misconfiguration at construction (mirrors the
+// canonical NewPgCallOperatorLookup contract). A live Postgres lookup
+// would mask a nil-pool wiring bug behind a delayed panic on first
+// request; failing fast at boot is the right shape.
+func TestNewPgCallTenantResolver_PanicsOnNilPool(t *testing.T) {
+	t.Parallel()
+	assert.PanicsWithValue(t,
+		"dialer.NewPgCallTenantResolver: pool must be non-nil",
+		func() { _ = NewPgCallTenantResolver(nil) },
+		"NewPgCallTenantResolver(nil) must panic with the canonical message",
+	)
+}
+
+// TestPgCallTenantResolver_LookupCallTenant_NilCallID rejects a
+// zero-UUID at the boundary so a misformed handler call cannot fall
+// through to a real BypassRLS scan that would return a misleading
+// "no rows" result.
+func TestPgCallTenantResolver_LookupCallTenant_NilCallID(t *testing.T) {
+	t.Parallel()
+	// We construct against a non-nil but unconnected pool — the nil-id
+	// guard runs BEFORE any pool method, so no live conn is required.
+	r := &PgCallTenantResolver{}
+	_, err := r.LookupCallTenant(t.Context(), uuid.Nil)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "nil callID")
+	// Crucially NOT ErrCallNotFound — a programmer bug (nil id) must
+	// not look like a benign 404 to the upstream middleware.
+	assert.NotErrorIs(t, err, dialerapi.ErrCallNotFound,
+		"nil callID must be a programmer error, not folded to 404")
+}
 
 // fakeSettingsCache is a tiny tenancyapi.SettingsCache fake exposing
 // only the Lookup methods used by settingsLookupAdapter. The other

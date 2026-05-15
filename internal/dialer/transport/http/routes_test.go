@@ -174,6 +174,47 @@ func (fakeRBAC) Check(_ context.Context, _ authapi.Claims, _ authapi.Action, _ a
 	return nil
 }
 
+// fakeCallTenantResolver is the test-side fake for dialerapi.CallTenantResolver.
+// It backs the RequireSameTenant guard on /api/calls/:id/hangup. Tests
+// seed callID → tenantID pairs via set; unseeded ids fall through to
+// dialerapi.ErrCallNotFound (mirrors PG NOT FOUND). setErr overrides
+// with an arbitrary error to exercise the resolver-internal-failure
+// path.
+type fakeCallTenantResolver struct {
+	mu  sync.Mutex
+	m   map[uuid.UUID]uuid.UUID
+	err error
+}
+
+func newFakeCallTenantResolver() *fakeCallTenantResolver {
+	return &fakeCallTenantResolver{m: map[uuid.UUID]uuid.UUID{}}
+}
+
+func (r *fakeCallTenantResolver) set(callID, tenantID uuid.UUID) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.m[callID] = tenantID
+}
+
+func (r *fakeCallTenantResolver) setErr(err error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.err = err
+}
+
+func (r *fakeCallTenantResolver) LookupCallTenant(_ context.Context, callID uuid.UUID) (uuid.UUID, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.err != nil {
+		return uuid.Nil, r.err
+	}
+	t, ok := r.m[callID]
+	if !ok {
+		return uuid.Nil, dialerapi.ErrCallNotFound
+	}
+	return t, nil
+}
+
 // fakeValidator returns canned Claims for any token.
 type fakeValidator struct {
 	claims authapi.Claims
@@ -244,12 +285,13 @@ func (p *fakePubSub) Publish(tenantID, operatorID uuid.UUID, snap dialerapi.Snap
 // =============================================================================
 
 type fixture struct {
-	router    *gin.Engine
-	fsm       *fakeFSM
-	rt        *fakeRouter
-	rbac      fakeRBAC
-	validator *fakeValidator
-	pubsub    *fakePubSub
+	router      *gin.Engine
+	fsm         *fakeFSM
+	rt          *fakeRouter
+	rbac        fakeRBAC
+	validator   *fakeValidator
+	pubsub      *fakePubSub
+	callTenants *fakeCallTenantResolver
 
 	tenantID uuid.UUID
 	userID   uuid.UUID
@@ -276,18 +318,20 @@ func newFixture(t *testing.T) *fixture {
 				Roles:    []authapi.Role{authapi.RoleOperator},
 			},
 		},
-		pubsub:   newFakePubSub(),
-		tenantID: tenantID,
-		userID:   userID,
+		pubsub:      newFakePubSub(),
+		callTenants: newFakeCallTenantResolver(),
+		tenantID:    tenantID,
+		userID:      userID,
 	}
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            f.fsm,
-		Router:         f.rt,
-		Validator:      f.validator,
-		RBAC:           f.rbac,
-		SnapshotPubSub: f.pubsub,
-		Logger:         nil,
+		FSM:                f.fsm,
+		Router:             f.rt,
+		Validator:          f.validator,
+		RBAC:               f.rbac,
+		SnapshotPubSub:     f.pubsub,
+		CallTenantResolver: f.callTenants,
+		Logger:             nil,
 	})
 	return f
 }
@@ -578,6 +622,9 @@ func TestHangup_HappyPath_NoBody(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	callID := uuid.New()
+	// Seed so the cross-tenant guard passes — the call belongs to the
+	// caller's own tenant.
+	f.callTenants.set(callID, f.tenantID)
 	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+callID.String()+"/hangup", nil)
 	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
 	assert.Equal(t, callID, f.rt.hangupCall)
@@ -588,12 +635,15 @@ func TestHangup_HappyPath_WithReason(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
 	callID := uuid.New()
+	f.callTenants.set(callID, f.tenantID)
 	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+callID.String()+"/hangup",
 		transporthttp.HangupDTO{Reason: "supervisor_kick"})
 	require.Equal(t, stdhttp.StatusNoContent, rec.Code)
 	assert.Equal(t, "supervisor_kick", f.rt.hangupRsn)
 }
 
+// TestHangup_BadID covers the RequireSameTenant malformed-:id branch
+// (400 BadRequest) — this gates BEFORE the inner hangup handler runs.
 func TestHangup_BadID(t *testing.T) {
 	t.Parallel()
 	f := newFixture(t)
@@ -606,12 +656,73 @@ func TestHangup_RouterError_500(t *testing.T) {
 	f := newFixture(t)
 	f.rt.hangupErr = errors.New("nats: connection lost")
 	callID := uuid.New()
+	// Seed the resolver so the cross-tenant guard passes for the
+	// caller's own tenant (otherwise the middleware aborts 404 and we
+	// never reach the router error branch).
+	f.callTenants.set(callID, f.tenantID)
 	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+callID.String()+"/hangup", nil)
 	require.Equal(t, stdhttp.StatusInternalServerError, rec.Code)
 	body := decode[transporthttp.ErrorEnvelope](t, rec)
 	assert.Equal(t, "dialer.internal", body.Code)
 	assert.Equal(t, "internal error", body.Message)
 	assert.NotContains(t, rec.Body.String(), "nats: connection lost")
+}
+
+// TestHangup_CrossTenant_Returns404 pins the Plan 21 Task 3 cross-tenant
+// guard (closing the Plan 13.2.5 out-of-scope finding). Tenant A's
+// operator JWT must NOT be able to hang up a call owned by Tenant B —
+// the previous behaviour silently dispatched the Router.Hangup
+// publish, terminating the other tenant's call. The middleware now
+// 404-no-body on tenant mismatch (existence-probe defence) BEFORE the
+// router is invoked.
+func TestHangup_CrossTenant_Returns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+
+	// The caller's JWT lives on f.tenantID (set by newFixture); seed a
+	// DIFFERENT tenant as the call owner so the resolver returns a
+	// mismatch.
+	otherTenant := uuid.New()
+	require.NotEqual(t, f.tenantID, otherTenant, "fixture sanity: tenants must differ")
+	callID := uuid.New()
+	f.callTenants.set(callID, otherTenant)
+
+	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+callID.String()+"/hangup", nil)
+	require.Equal(t, stdhttp.StatusNotFound, rec.Code,
+		"cross-tenant hangup must 404 (no leak of existence)")
+	assert.Empty(t, rec.Body.String(),
+		"404 body must be empty per RequireSameTenant pattern")
+	assert.Equal(t, 0, f.rt.hangupCount,
+		"no hangup should be dispatched cross-tenant")
+}
+
+// TestHangup_UnknownCall_Returns404 covers the "call id has no row"
+// branch — the resolver returns ErrCallNotFound, which the middleware
+// translates to 404 (indistinguishable from "wrong tenant" so the
+// response cannot be used to enumerate call ids).
+func TestHangup_UnknownCall_Returns404(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	// No seed → resolver returns ErrCallNotFound for any callID.
+	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+uuid.New().String()+"/hangup", nil)
+	require.Equal(t, stdhttp.StatusNotFound, rec.Code,
+		"unknown call must 404 (same shape as cross-tenant)")
+	assert.Empty(t, rec.Body.String())
+	assert.Equal(t, 0, f.rt.hangupCount, "no hangup should be dispatched")
+}
+
+// TestHangup_ResolverError_500 covers the resolver-internal-failure
+// branch — anything other than ErrCallNotFound is surfaced as 500 so a
+// transient storage hiccup does not silently downgrade the caller's
+// safety guarantee.
+func TestHangup_ResolverError_500(t *testing.T) {
+	t.Parallel()
+	f := newFixture(t)
+	f.callTenants.setErr(errors.New("storage: timeout"))
+	rec := f.doAuth(t, stdhttp.MethodPost, "/api/calls/"+uuid.New().String()+"/hangup", nil)
+	require.Equal(t, stdhttp.StatusInternalServerError, rec.Code,
+		"resolver-internal error must 500, not 404")
+	assert.Equal(t, 0, f.rt.hangupCount, "no hangup should be dispatched")
 }
 
 // =============================================================================
@@ -779,11 +890,12 @@ func TestMount_PanicsOnNilDeps(t *testing.T) {
 		deps transporthttp.Deps
 	}
 	cases := []tc{
-		{"nil FSM", transporthttp.Deps{Router: &fakeRouter{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub()}},
-		{"nil Router", transporthttp.Deps{FSM: &fakeFSM{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub()}},
-		{"nil Validator", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub()}},
-		{"nil RBAC", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, Validator: &fakeValidator{}, SnapshotPubSub: newFakePubSub()}},
-		{"nil SnapshotPubSub", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}}},
+		{"nil FSM", transporthttp.Deps{Router: &fakeRouter{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub(), CallTenantResolver: newFakeCallTenantResolver()}},
+		{"nil Router", transporthttp.Deps{FSM: &fakeFSM{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub(), CallTenantResolver: newFakeCallTenantResolver()}},
+		{"nil Validator", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub(), CallTenantResolver: newFakeCallTenantResolver()}},
+		{"nil RBAC", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, Validator: &fakeValidator{}, SnapshotPubSub: newFakePubSub(), CallTenantResolver: newFakeCallTenantResolver()}},
+		{"nil SnapshotPubSub", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, CallTenantResolver: newFakeCallTenantResolver()}},
+		{"nil CallTenantResolver", transporthttp.Deps{FSM: &fakeFSM{}, Router: &fakeRouter{}, Validator: &fakeValidator{}, RBAC: fakeRBAC{}, SnapshotPubSub: newFakePubSub()}},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -837,12 +949,13 @@ func TestForce_FSMError_500Logged(t *testing.T) {
 	r := gin.New()
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            fsm,
-		Router:         &fakeRouter{},
-		Validator:      val,
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: newFakePubSub(),
-		Logger:         zap.NewNop(),
+		FSM:                fsm,
+		Router:             &fakeRouter{},
+		Validator:          val,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     newFakePubSub(),
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             zap.NewNop(),
 	})
 	target := uuid.New()
 	body := transporthttp.ForceDTO{

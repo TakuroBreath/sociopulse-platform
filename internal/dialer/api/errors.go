@@ -28,4 +28,11 @@ var (
 	// any state-changing call (StartShift / EndShift / GoPause / ... /
 	// Force) when the hash version has advanced between load and CAS.
 	ErrConflict = errors.New("dialer: optimistic-concurrency conflict")
+	// ErrCallNotFound is returned by CallTenantResolver.LookupCallTenant
+	// when no row in the calls table matches the requested call_id.
+	// The transport-layer adapter for tenant.RequireSameTenant folds
+	// this into pkg/middleware/tenant.ErrNotFound so the wire response
+	// is a 404 with no body, indistinguishable from a "wrong tenant"
+	// mismatch (existence-probe defence). Plan 21 Task 3.
+	ErrCallNotFound = errors.New("dialer: call not found")
 )

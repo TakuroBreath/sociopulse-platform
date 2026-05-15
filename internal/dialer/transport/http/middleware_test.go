@@ -165,10 +165,11 @@ func TestRefreshPresenceMiddleware_FailureIncrementsMetric(t *testing.T) {
 				Roles:    []authapi.Role{authapi.RoleOperator},
 			},
 		},
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: newFakePubSub(),
-		Logger:         zap.NewNop(),
-		Metrics:        metrics,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     newFakePubSub(),
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             zap.NewNop(),
+		Metrics:            metrics,
 		RefreshPresence: func(_ context.Context, _, _ uuid.UUID) error {
 			return errors.New("redis: connection lost")
 		},

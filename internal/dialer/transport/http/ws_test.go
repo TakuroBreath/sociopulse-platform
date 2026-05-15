@@ -60,12 +60,13 @@ func newWSFixture(t *testing.T) *wsFixture {
 	r := gin.New()
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            wf.fsm,
-		Router:         wf.rt,
-		Validator:      wf.val,
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: wf.pub,
-		Logger:         nil,
+		FSM:                wf.fsm,
+		Router:             wf.rt,
+		Validator:          wf.val,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     wf.pub,
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             nil,
 		WSConfig: transporthttp.WSConfig{
 			// Tighten the timings so the test does not take 30s.
 			PingPeriod:     50 * time.Millisecond,
@@ -371,12 +372,13 @@ func TestWSConfig_ResolvedDefaults(t *testing.T) {
 	r := gin.New()
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            &fakeFSM{},
-		Router:         &fakeRouter{},
-		Validator:      val,
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: pub,
-		Logger:         nil,
+		FSM:                &fakeFSM{},
+		Router:             &fakeRouter{},
+		Validator:          val,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     pub,
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             nil,
 		// WSConfig left at zero value to exercise resolved() defaults.
 		// We override AllowedOrigins to "*" so the handshake succeeds
 		// from httptest's host. PingPeriod / PongTimeout / WriteTimeout
@@ -441,12 +443,13 @@ func TestWS_WriteAfterClientDeath_LogsAndExits(t *testing.T) {
 	r := gin.New()
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            &fakeFSM{},
-		Router:         &fakeRouter{},
-		Validator:      val,
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: pub,
-		Logger:         zap.NewNop(), // non-nil to exercise logWSError
+		FSM:                &fakeFSM{},
+		Router:             &fakeRouter{},
+		Validator:          val,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     pub,
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             zap.NewNop(), // non-nil to exercise logWSError
 		WSConfig: transporthttp.WSConfig{
 			PingPeriod:     50 * time.Millisecond,
 			PongTimeout:    500 * time.Millisecond,
@@ -531,12 +534,13 @@ func TestWS_BadOrigin_Rejected(t *testing.T) {
 	r := gin.New()
 	api := r.Group("/api")
 	transporthttp.Mount(api, transporthttp.Deps{
-		FSM:            &fakeFSM{},
-		Router:         &fakeRouter{},
-		Validator:      val,
-		RBAC:           fakeRBAC{},
-		SnapshotPubSub: pub,
-		Logger:         nil,
+		FSM:                &fakeFSM{},
+		Router:             &fakeRouter{},
+		Validator:          val,
+		RBAC:               fakeRBAC{},
+		SnapshotPubSub:     pub,
+		CallTenantResolver: newFakeCallTenantResolver(),
+		Logger:             nil,
 		// No AllowedOrigins → coder/websocket enforces same-origin.
 	})
 	server := httptest.NewServer(r)
