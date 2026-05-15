@@ -26,14 +26,17 @@ import (
 type buildProvidersDeps struct {
 	// Dialer is the *dialer.Module produced at run-time so its
 	// pointer-receiver Stop() can be deferred in the composition
-	// root. Tests pass nil — the registry tolerates nil entries via
-	// registerModules' skip-on-nil check.
+	// root. Tests that only inspect Module.Name() may pass nil;
+	// tests that invoke Register MUST supply a real instance. Note:
+	// registerModules skips interface-nil entries, but a typed-nil
+	// *dialer.Module wrapped in modules.Module is NOT == nil and
+	// would dereference at Register time.
 	Dialer *dialer.Module
 
 	// Recording is the *recording.Module produced via recording.New
 	// against per-boot Config (gRPC listener gating, DEKUnwrapper,
-	// ObjectStore). Tests pass nil — registerModules tolerates nil
-	// entries via its skip-on-nil check.
+	// ObjectStore). Same nil semantics as Dialer above — safe for
+	// Name()-only inspection, unsafe for Register invocation.
 	Recording *recording.Module
 
 	// MetricsRegistry is the *prometheus.Registry that analytics +

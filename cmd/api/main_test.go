@@ -14,6 +14,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
+
+	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
 )
 
 // TestMain ensures cmd/api boot/shutdown does not leak goroutines.
@@ -119,48 +121,40 @@ func TestRunReturnsErrorOnInvalidConfig(t *testing.T) {
 	require.Error(t, err)
 }
 
-// TestRun_TenancyModuleInProvidersList asserts compile-time wiring of the
-// tenancy.Module entry in cmd/api's providers registry.
+// TestBuildProviders_TenancyIsFirstEntry asserts the compile-time wiring of
+// the tenancy.Module entry in cmd/api's providers registry, AND that the
+// blank-import seam from internal/tenancy/service has fired (api.Register
+// non-nil). Together the two assertions cover the FULL regression class
+// the wiring guards against: drop the entry → first assertion fails; drop
+// the blank-import → second assertion fails.
 //
 // Plan 21 Task 1 — tenancy publishes locator entries (TenantService,
 // KMSResolver, PhoneHasher, Tenancy) that auth/crm/surveys consume in
-// later tasks. A regression that drops the providers entry, or the
-// blank-import of internal/tenancy/service (the api.Register seam
-// described in internal/tenancy/module.go:50-52), would silently
-// produce a "registered with no locator entries" boot — this test
-// fails loudly at unit-test time instead.
-//
-// The test uses the buildProviders() helper so the assertion runs
-// without spinning up Postgres / Redis / NATS. The plan's path-of-
-// least-surface choice: a compile-time presence check on the slice.
-// The runtime locator-entries assertion lives in the smoke harness
-// (Plan 21 Task 7) where a real Postgres container backs deps.Pool.
-func TestRun_TenancyModuleInProvidersList(t *testing.T) {
+// later tasks. The runtime locator-entries assertion lives in the smoke
+// harness (Plan 21 Task 7) where a real Postgres container backs deps.Pool.
+func TestBuildProviders_TenancyIsFirstEntry(t *testing.T) {
 	t.Parallel()
 
-	providers := buildProviders(buildProvidersDeps{})
+	// 1. Blank-import seam: api.Register is populated by an init() in
+	//    internal/tenancy/service. Without the blank-import in main.go,
+	//    this var would still be nil and tenancy.Module.Register would
+	//    no-op at runtime (internal/tenancy/module.go:50-52) — boot
+	//    succeeds but ZERO locator entries are published. Asserting
+	//    here makes the silent regression noisy.
+	require.NotNil(t, tenancyapi.Register,
+		"tenancyapi.Register is nil — the blank-import "+
+			"`_ \"github.com/sociopulse/platform/internal/tenancy/service\"` "+
+			"is missing from cmd/api/main.go (see internal/tenancy/module.go:50-52)")
 
-	var hasTenancy bool
-	for _, mod := range providers.Modules {
-		if mod == nil {
-			continue
-		}
-		if mod.Name() == "tenancy" {
-			hasTenancy = true
-			// Per plan: tenancy MUST be the FIRST entry so its
-			// locator publish runs before any consumer's lookup.
-			// Asserting first-position catches a future reorder
-			// that would re-introduce the "tenancy.TenantService
-			// not registered" warning class.
-			require.Same(t, providers.Modules[0], mod,
-				"tenancy.Module must be the FIRST entry in providers; "+
-					"auth/crm/surveys (Plan 21 Tasks 2+) depend on its locator publish")
-			break
-		}
-	}
-	require.True(t, hasTenancy,
-		"providers list missing tenancy.Module — auth/crm/surveys cannot resolve "+
-			"tenancy.TenantService / tenancy.KMSResolver / tenancy.PhoneHasher at Register time")
+	// 2. Providers-list shape: tenancy MUST be present AND first.
+	//    Reordering breaks every downstream consumer silently because
+	//    auth/crm/surveys look up tenancy.* keys at their own Register
+	//    time.
+	providers := buildProviders(buildProvidersDeps{})
+	require.NotEmpty(t, providers.Modules, "providers list is empty")
+	assert.Equal(t, "tenancy", providers.Modules[0].Name(),
+		"tenancy.Module must be the FIRST entry in providers; "+
+			"auth/crm/surveys (Plan 21 Tasks 2+) depend on its locator publish")
 }
 
 // pickFreeAddr asks the kernel for a free TCP port, returns "127.0.0.1:N".
