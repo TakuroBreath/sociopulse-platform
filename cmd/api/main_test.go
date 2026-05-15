@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/goleak"
@@ -47,6 +48,18 @@ func TestRunStartsAndShutsDownCleanly(t *testing.T) {
 	metricsAddr := pickFreeAddr(t)
 	configDir := writeMinimalDevConfig(t, httpAddr, metricsAddr)
 
+	// The realtime dispatcher (errgroup goroutine wired in run() at
+	// main.go:485) Subscribes to "tenant.*.dialer.op.*.state" via the
+	// JetStream-backed eventbus and STRICT-fails on a missing stream —
+	// returning an error to the errgroup which cancels gctx and trips
+	// the shutdown path within milliseconds of boot. The dialer's own
+	// Register treats the same missing-stream as a WARN (Plan 11), but
+	// realtime's dispatcher start does not. Provision a wildcard stream
+	// here so the test environment matches what the nats-bridge would
+	// auto-create in prod.
+	ensureTestStream(t, "TENANT_TEST", []string{"tenant.>"})
+	ensureTestStream(t, "TRUNKS_TEST", []string{"trunks.>"})
+
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -55,8 +68,17 @@ func TestRunStartsAndShutsDownCleanly(t *testing.T) {
 		errCh <- run(ctx, configDir)
 	}()
 
-	// Wait for the HTTP listener to come up before declaring the boot done.
-	requireListenerReady(t, httpAddr, 3*time.Second)
+	// Wait for the HTTP listener to come up. If run() exits with an error
+	// FIRST (e.g. bind failure, module fatal Register), surface it
+	// immediately rather than waiting out the polling deadline with a
+	// useless "listener never came up" — diagnosing the actual cause is
+	// what matters.
+	select {
+	case err := <-errCh:
+		t.Fatalf("run() returned before listener was ready: %v", err)
+	case <-listenerReadyChan(httpAddr, 10*time.Second):
+		// listener accepted a TCP connection — boot succeeded
+	}
 
 	// Hit /healthz to prove the gin engine is wired and serving.
 	healthReq, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+httpAddr+"/healthz", nil)
@@ -109,26 +131,76 @@ func pickFreeAddr(t *testing.T) string {
 	return addr
 }
 
-// requireListenerReady polls the address until something accepts a TCP connection.
-func requireListenerReady(t *testing.T, addr string, timeout time.Duration) {
+// ensureTestStream provisions a JetStream stream for the given subjects on
+// the test NATS server (nats://localhost:4222 per writeMinimalDevConfig).
+// Required because cmd/api boot's realtime dispatcher and dialer pubsub
+// SUBSCRIBE before any module PUBLISHES — the JetStream broker returns
+// "no stream matches subject" if the stream doesn't yet exist, and the
+// realtime dispatcher's Start treats that as a hard error in the errgroup.
+// In production the nats-bridge sidecar auto-creates streams from a config
+// inventory; tests have to recreate that environment here.
+//
+// The stream is created with InterestPolicy retention + memory storage so
+// no on-disk artefacts accumulate; we delete it on cleanup.
+func ensureTestStream(t *testing.T, name string, subjects []string) {
 	t.Helper()
-	deadline := time.Now().Add(timeout)
-	tick := time.NewTicker(25 * time.Millisecond)
-	defer tick.Stop()
-	for {
-		conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
-		if err == nil {
-			_ = conn.Close()
-			return
-		}
-		if !errors.Is(err, context.DeadlineExceeded) && time.Now().After(deadline) {
-			t.Fatalf("listener %s never came up: %v", addr, err)
-		}
-		<-tick.C
-		if time.Now().After(deadline) {
-			t.Fatalf("listener %s never came up", addr)
-		}
+
+	nc, err := nats.Connect("nats://localhost:4222")
+	require.NoError(t, err, "connect NATS (needs `make dev-up` to be running)")
+	t.Cleanup(nc.Close)
+
+	js, err := nc.JetStream()
+	require.NoError(t, err)
+
+	cfg := &nats.StreamConfig{
+		Name:      name,
+		Subjects:  subjects,
+		Retention: nats.InterestPolicy,
+		Storage:   nats.MemoryStorage,
+		MaxAge:    1 * time.Minute,
 	}
+	if _, err := js.AddStream(cfg); err != nil {
+		if errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+			_, err = js.UpdateStream(cfg)
+		}
+		require.NoError(t, err, "ensure stream %q", name)
+	}
+	t.Cleanup(func() {
+		// Best-effort delete — a parallel test holding the same stream
+		// name would have skipped re-creation above, so DeleteStream
+		// might race. We swallow the error rather than fail cleanup.
+		_ = js.DeleteStream(name)
+	})
+}
+
+// listenerReadyChan polls addr in a background goroutine and closes the
+// returned channel as soon as TCP-accept succeeds OR the deadline expires.
+// The caller selects against this channel + the run() errCh so a boot
+// failure surfaces immediately instead of waiting out the polling budget.
+//
+// The returned channel is never sent on — it is closed as a one-shot
+// signal. A nil close after the deadline means "polling gave up"; the
+// caller should still inspect err state to disambiguate.
+func listenerReadyChan(addr string, timeout time.Duration) <-chan struct{} {
+	ch := make(chan struct{})
+	go func() {
+		defer close(ch)
+		deadline := time.Now().Add(timeout)
+		tick := time.NewTicker(25 * time.Millisecond)
+		defer tick.Stop()
+		for {
+			conn, err := net.DialTimeout("tcp", addr, 50*time.Millisecond)
+			if err == nil {
+				_ = conn.Close()
+				return
+			}
+			if time.Now().After(deadline) {
+				return
+			}
+			<-tick.C
+		}
+	}()
+	return ch
 }
 
 // writeMinimalDevConfig writes a config.yaml that boots cmd/api without any
