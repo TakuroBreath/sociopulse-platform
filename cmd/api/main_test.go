@@ -119,6 +119,50 @@ func TestRunReturnsErrorOnInvalidConfig(t *testing.T) {
 	require.Error(t, err)
 }
 
+// TestRun_TenancyModuleInProvidersList asserts compile-time wiring of the
+// tenancy.Module entry in cmd/api's providers registry.
+//
+// Plan 21 Task 1 — tenancy publishes locator entries (TenantService,
+// KMSResolver, PhoneHasher, Tenancy) that auth/crm/surveys consume in
+// later tasks. A regression that drops the providers entry, or the
+// blank-import of internal/tenancy/service (the api.Register seam
+// described in internal/tenancy/module.go:50-52), would silently
+// produce a "registered with no locator entries" boot — this test
+// fails loudly at unit-test time instead.
+//
+// The test uses the buildProviders() helper so the assertion runs
+// without spinning up Postgres / Redis / NATS. The plan's path-of-
+// least-surface choice: a compile-time presence check on the slice.
+// The runtime locator-entries assertion lives in the smoke harness
+// (Plan 21 Task 7) where a real Postgres container backs deps.Pool.
+func TestRun_TenancyModuleInProvidersList(t *testing.T) {
+	t.Parallel()
+
+	providers := buildProviders(buildProvidersDeps{})
+
+	var hasTenancy bool
+	for _, mod := range providers.Modules {
+		if mod == nil {
+			continue
+		}
+		if mod.Name() == "tenancy" {
+			hasTenancy = true
+			// Per plan: tenancy MUST be the FIRST entry so its
+			// locator publish runs before any consumer's lookup.
+			// Asserting first-position catches a future reorder
+			// that would re-introduce the "tenancy.TenantService
+			// not registered" warning class.
+			require.Same(t, providers.Modules[0], mod,
+				"tenancy.Module must be the FIRST entry in providers; "+
+					"auth/crm/surveys (Plan 21 Tasks 2+) depend on its locator publish")
+			break
+		}
+	}
+	require.True(t, hasTenancy,
+		"providers list missing tenancy.Module — auth/crm/surveys cannot resolve "+
+			"tenancy.TenantService / tenancy.KMSResolver / tenancy.PhoneHasher at Register time")
+}
+
 // pickFreeAddr asks the kernel for a free TCP port, returns "127.0.0.1:N".
 // The listener is closed immediately; race-prone in theory, fine in practice
 // for serial test boots a few seconds apart.

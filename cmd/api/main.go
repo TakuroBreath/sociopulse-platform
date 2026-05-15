@@ -30,8 +30,6 @@ import (
 	"go.uber.org/zap"
 	"golang.org/x/sync/errgroup"
 
-	"github.com/sociopulse/platform/internal/analytics"
-	"github.com/sociopulse/platform/internal/billing"
 	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
@@ -43,8 +41,15 @@ import (
 	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/storage"
 	recwire "github.com/sociopulse/platform/internal/recording/wire"
-	"github.com/sociopulse/platform/internal/reports"
-	"github.com/sociopulse/platform/internal/telephony"
+
+	// Wire the tenancy api.Register seam (init() side-effect). The
+	// concrete registerModule lives in internal/tenancy/service so
+	// internal/tenancy/api stays free of any service/ or store/ import.
+	// Without this blank import, tenancy.Module.Register is a no-op
+	// (see internal/tenancy/module.go:50-52) and no locator entries get
+	// published — auth/crm/surveys then fail to register with the
+	// misleading "tenancy.TenantService not registered" message.
+	_ "github.com/sociopulse/platform/internal/tenancy/service"
 	"github.com/sociopulse/platform/pkg/config"
 	"github.com/sociopulse/platform/pkg/eventbus"
 	"github.com/sociopulse/platform/pkg/observability"
@@ -336,14 +341,20 @@ func run(ctx context.Context, configDir string) error {
 	// authenticated non-admin. NATS subscriber wires on dialer.call.
 	// finalized events; idempotent (ON CONFLICT (call_id)) so redelivery
 	// is harmless.
-	providers := modules.Registry{Modules: []modules.Module{
-		telephony.Module{},
-		dialerModule,
-		recordingModule,
-		analytics.New(analytics.Config{Registerer: metrics.Registry}),
-		reports.New(reports.Config{ObjectStore: recordingObjects}),
-		billing.Module{},
-	}}
+	//
+	// Plan 21 Task 1 — tenancy.Module is wired FIRST so its
+	// Register publishes tenancy.TenantService / KMSResolver /
+	// PhoneHasher / Tenancy into the locator before any consumer
+	// (auth/crm/surveys, landing in Plan 21 Task 2) tries to look
+	// them up. The pointer receiver mirrors tenancy.Module itself
+	// (carries a Stop()); the other modules in the list use value
+	// receivers and self-contain Stop semantics differently.
+	providers := buildProviders(buildProvidersDeps{
+		Dialer:           dialerModule,
+		Recording:        recordingModule,
+		MetricsRegistry:  metrics.Registry,
+		RecordingObjects: recordingObjects,
+	})
 	if err := registerModules(providers, deps, logger, redisErr); err != nil {
 		return err
 	}
