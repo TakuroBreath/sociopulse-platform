@@ -48,6 +48,13 @@ type AuditWriter interface {
 	Append(ctx context.Context, tx postgres.Tx, ev outbox.Event) error
 }
 
+// tenantTxRunner is the narrow pool surface AuditEmitter needs. *postgres.Pool
+// implements it; tests pass a recording fake to exercise the emit-path
+// without a testcontainer Postgres.
+type tenantTxRunner interface {
+	WithTenant(ctx context.Context, tenantID uuid.UUID, fn func(postgres.Tx) error) error
+}
+
 // AuditEmitter publishes billing-related audit events to the outbox.
 // Mirrors internal/reports/service.AuditEmitter. The audit module is still
 // a stub (Plan 03 Task 7); events sit durably in event_outbox until that
@@ -62,7 +69,7 @@ type AuditWriter interface {
 // does NOT roll back the tariff change. At-most-once audit on tariff
 // changes is the explicit trade-off.
 type AuditEmitter struct {
-	pool *postgres.Pool
+	pool tenantTxRunner
 	ob   AuditWriter
 	log  *zap.Logger
 }
