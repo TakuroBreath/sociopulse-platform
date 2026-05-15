@@ -31,6 +31,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/sociopulse/platform/internal/analytics"
+	"github.com/sociopulse/platform/internal/billing"
 	"github.com/sociopulse/platform/internal/dialer"
 	"github.com/sociopulse/platform/internal/healthz"
 	healthchecks "github.com/sociopulse/platform/internal/healthz/checks"
@@ -325,12 +326,23 @@ func run(ctx context.Context, configDir string) error {
 	// ObjectStore wired here is the same instance recording uses; nil
 	// (e.g. dev env without local_keks) falls through to a WARN inside
 	// reports.Register and the async Queue stays disabled.
+	//
+	// Plan 14 Step I — billing.Module. Independent of reports; would
+	// IDEALLY come AFTER any module that publishes auth.RBACChecker to
+	// the locator (auth module — not currently on cmd/api's registry),
+	// so billing.Register's RBAC lookup succeeds. Today auth is absent;
+	// billing.Register's role-fast-path still permits admin+supervisor
+	// view actions and admin tariff PATCH, fail-closed 403 for
+	// authenticated non-admin. NATS subscriber wires on dialer.call.
+	// finalized events; idempotent (ON CONFLICT (call_id)) so redelivery
+	// is harmless.
 	providers := modules.Registry{Modules: []modules.Module{
 		telephony.Module{},
 		dialerModule,
 		recordingModule,
 		analytics.New(analytics.Config{Registerer: metrics.Registry}),
 		reports.New(reports.Config{ObjectStore: recordingObjects}),
+		billing.Module{},
 	}}
 	if err := registerModules(providers, deps, logger, redisErr); err != nil {
 		return err
