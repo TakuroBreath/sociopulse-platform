@@ -11,16 +11,33 @@ type AuthConfig struct {
 	TOTP      TOTPConfig     `mapstructure:"totp"`
 }
 
-// JWTConfig governs JSON Web Token issuance and verification. The signing
-// secret itself is fetched from Lockbox at runtime — never read from YAML.
+// JWTConfig governs JSON Web Token issuance and verification.
+//
+// Secret is the live signing key. Two binding paths are allowed:
+//
+//   - Production: the env var SOCIOPULSE_AUTH_JWT_SECRET is populated by
+//     Kubernetes from a Lockbox-backed Secret resource (SecretLockboxKey
+//     above names the Lockbox entry that the deployment binds). viper's
+//     AutomaticEnv (pkg/config/load.go:126) reads it. Production
+//     discipline says NEVER commit a real Secret to a checked-in YAML;
+//     this is enforced by cfg.Validate() at config.go:96 which requires
+//     SecretLockboxKey in env=production.
+//   - Dev / smoke / unit-test: the YAML key `auth.jwt.secret` is the
+//     bridge so cmd/api boots without external dependencies.
+//
+// Plan 21 Task 6 removed the previous `mapstructure:"-"` tag on Secret.
+// The original intent ("populated at runtime from Lockbox") was correct
+// in spirit but blocked auth.Module.Register under every in-process boot
+// path because the field then had no way to acquire a non-empty value
+// short of a hand-rolled post-unmarshal hook. Production hygiene is now
+// enforced by Validate, not by the tag.
 type JWTConfig struct {
 	Issuer           string        `mapstructure:"issuer"`
 	AccessTTL        time.Duration `mapstructure:"access_ttl"`
 	RefreshTTL       time.Duration `mapstructure:"refresh_ttl"`
 	Algorithm        string        `mapstructure:"algorithm"`
 	SecretLockboxKey string        `mapstructure:"secret_lockbox_key"`
-	// Secret is populated at runtime from Lockbox. Never read from YAML directly.
-	Secret string `mapstructure:"-"`
+	Secret           string        `mapstructure:"secret"`
 }
 
 // PasswordConfig holds Argon2id tuning parameters for password hashing.

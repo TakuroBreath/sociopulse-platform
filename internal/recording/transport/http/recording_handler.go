@@ -10,7 +10,7 @@ import (
 	"go.uber.org/zap"
 )
 
-// streamRecording handles GET /api/calls/:call_id/recording.
+// streamRecording handles GET /api/calls/:id/recording.
 // Streams the decrypted plaintext audio to the response body.
 //
 // v1 trade-off: Accept-Ranges: none. Plan 12.2's OpenAudioStream buffers
@@ -26,7 +26,7 @@ func (h *handlers) streamRecording(c *gin.Context) {
 		return
 	}
 
-	callID, err := uuid.Parse(c.Param("call_id"))
+	callID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ErrorEnvelope{
 			Code:    "recording.invalid_input",

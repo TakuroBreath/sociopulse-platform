@@ -117,7 +117,7 @@ func operatorClaims() authapi.Claims {
 }
 
 // =============================================================================
-// streamRecording — GET /api/calls/:call_id/recording
+// streamRecording — GET /api/calls/:id/recording
 // =============================================================================
 
 func TestStreamRecording_OK(t *testing.T) {
@@ -336,7 +336,7 @@ func TestSearch_RBACForbidden(t *testing.T) {
 }
 
 // =============================================================================
-// verifyChecksum — POST /api/calls/:call_id/recording/verify
+// verifyChecksum — POST /api/calls/:id/recording/verify
 // =============================================================================
 
 func TestVerify_OK(t *testing.T) {

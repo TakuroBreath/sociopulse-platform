@@ -1,9 +1,9 @@
 // Package http exposes internal/recording over HTTP. The transport mounts
 // three endpoints under /api:
 //
-//	GET  /api/calls/:call_id/recording          — admin/supervisor; streams audio.
+//	GET  /api/calls/:id/recording          — admin/supervisor; streams audio.
 //	GET  /api/recordings/search                 — admin/supervisor; cursor-paginated.
-//	POST /api/calls/:call_id/recording/verify   — admin only; manual sha256 verify.
+//	POST /api/calls/:id/recording/verify   — admin only; manual sha256 verify.
 //
 // All endpoints require an authenticated JWT (via pkg/middleware/auth.JWTMiddleware)
 // and enforce role-based access via the requireRole middleware. Tenant
@@ -38,9 +38,9 @@ type Deps struct {
 // Mount attaches recording HTTP routes to group. group is the API root
 // (typically /api), so the final paths are:
 //
-//	GET  /api/calls/:call_id/recording
+//	GET  /api/calls/:id/recording
 //	GET  /api/recordings/search
-//	POST /api/calls/:call_id/recording/verify
+//	POST /api/calls/:id/recording/verify
 //
 // All three require an authenticated JWT and either admin or supervisor
 // role; verify additionally requires admin (an audit-grade action).
@@ -61,7 +61,7 @@ func Mount(group *gin.RouterGroup, d Deps) {
 	rb := newHandlers(d)
 
 	// admin / supervisor reads
-	authed.GET("/calls/:call_id/recording",
+	authed.GET("/calls/:id/recording",
 		requireRole(authapi.RoleAdmin, authapi.RoleSupervisor),
 		rb.streamRecording)
 	authed.GET("/recordings/search",
@@ -69,7 +69,7 @@ func Mount(group *gin.RouterGroup, d Deps) {
 		rb.searchRecordings)
 
 	// admin-only on verify (writes audit, may incur cost via ObjectStore.Get)
-	authed.POST("/calls/:call_id/recording/verify",
+	authed.POST("/calls/:id/recording/verify",
 		requireRole(authapi.RoleAdmin),
 		rb.verifyChecksum)
 }

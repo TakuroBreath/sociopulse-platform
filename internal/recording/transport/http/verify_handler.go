@@ -7,7 +7,7 @@ import (
 	"github.com/google/uuid"
 )
 
-// verifyChecksum handles POST /api/calls/:call_id/recording/verify.
+// verifyChecksum handles POST /api/calls/:id/recording/verify.
 // Synchronously fetches the ciphertext and recomputes its sha256.
 // 200 OK with VerifyResponse on success (OK=true if matches; OK=false
 // if doesn't — both are 200 because the verify itself succeeded).
@@ -22,7 +22,7 @@ func (h *handlers) verifyChecksum(c *gin.Context) {
 		return
 	}
 
-	callID, err := uuid.Parse(c.Param("call_id"))
+	callID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
 		c.JSON(http.StatusBadRequest, ErrorEnvelope{
 			Code:    "recording.invalid_input",
