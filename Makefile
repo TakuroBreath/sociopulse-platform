@@ -43,6 +43,10 @@ vet: ## Run go vet
 test: ## Run all Go tests
 	$(GO) test -race -count=1 ./...
 
+.PHONY: test-smoke
+test-smoke: ## Run end-to-end smoke tests (requires Docker; see tests/smoke/README.md)
+	$(GO) test -tags=smoke -race -count=1 -timeout=15m ./tests/smoke/... ./cmd/api/...
+
 .PHONY: test-cover
 test-cover: ## Run tests with coverage report
 	$(GO) test -race -count=1 -coverprofile=coverage.txt -covermode=atomic ./...
