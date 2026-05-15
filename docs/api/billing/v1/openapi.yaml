@@ -244,7 +244,12 @@ components:
       properties:
         label:
           type: string
-          description: Component label (e.g. "telecom", "wages", "respondent_bases", "storage", "fixed_fee").
+          description: |
+            Russian display label emitted verbatim by the server: one of
+            "Связь" | "Зарплата" | "Базы" | "Хранение" | "Постоянные".
+            Display-only — do NOT use as a stable identifier. Slice order
+            in the response is the canonical mapping (index 0 → Связь,
+            1 → Зарплата, 2 → Базы, 3 → Хранение, 4 → Постоянные).
         value_minor:
           type: integer
           format: int64
@@ -262,7 +267,11 @@ components:
           maximum: 12
         label:
           type: string
-          description: Localised string (e.g. "май 2026"). UI may display verbatim.
+          description: |
+            Russian 3-letter month abbreviation emitted verbatim by the
+            server: "Янв" | "Фев" | "Мар" | "Апр" | "Май" | "Июн" | "Июл"
+            | "Авг" | "Сен" | "Окт" | "Ноя" | "Дек". Display-only — use
+            (year, month) for date logic.
         value_minor:
           type: integer
           format: int64
