@@ -1,0 +1,557 @@
+openapi: 3.1.0
+info:
+  title: СоциоПульс Billing API
+  version: 0.1.0
+  description: |
+    Billing module HTTP API (Plan 14). Consumed by sociopulse-web Plan 19
+    (AdminFinance page) to drive the admin finance dashboard and the
+    per-tenant tariff editor.
+
+    Six endpoints under two prefixes:
+
+      - GET   /api/finance/dashboard  — KPI tiles + breakdown + by-month + top projects.
+      - GET   /api/finance/projects   — per-project margin table.
+      - GET   /api/finance/breakdown  — pie-chart slice projection of the current period.
+      - GET   /api/finance/byMonth    — trailing-N-months bar series.
+      - GET   /api/billing/tariffs    — current tariff snapshot (admin + supervisor).
+      - PATCH /api/billing/tariffs    — partial tariff update (admin only).
+
+    Tenancy: every endpoint derives tenantID from the JWT claims
+    (claims.TenantID). No path-:id is exposed, so the project-wide
+    RequireSameTenant middleware does not apply — see
+    docs/references/plan-14-billing.md §2.11.
+
+    RBAC: view actions (GET /api/finance/*, GET /api/billing/tariffs)
+    permit admin + supervisor; PATCH /api/billing/tariffs is admin only.
+    Both layers use the canonical requireAdmin / requireRBAC middleware
+    (fast-path role check + RBACChecker matrix fallback).
+
+    Money: every *_minor field is an int64 minor-unit value (Russian
+    rouble kopecks; 100 kopecks = 1 RUB). There is no float anywhere on
+    the cost path. delta_pct and margin_pct are float64 ratios.
+
+    Error envelope is the canonical {code, message} shape (matches
+    pkg/httputil and the reports + recording module precedent). Code
+    strings are stable low-cardinality identifiers suitable for logs and
+    metrics.
+servers:
+  - url: https://api.sociopulse.local
+    description: Production
+  - url: http://localhost:8080
+    description: Local dev (make dev-up)
+tags:
+  - name: finance
+    description: Finance dashboard and aggregate reports.
+  - name: billing
+    description: Per-tenant tariff configuration.
+paths:
+  /api/finance/dashboard:
+    get:
+      tags: [finance]
+      operationId: getFinanceDashboard
+      summary: Finance dashboard composite payload.
+      description: |
+        Returns the four KPI tiles, the breakdown pie chart, the trailing
+        six-month bar series, and the top-five projects (sorted by total
+        spend desc). The "vs previous" deltas use a previous period of
+        the same length.
+
+        Defaults to the current calendar month when ?period is omitted.
+        All periods are anchored to UTC and half-open ([from, to)).
+      parameters:
+        - $ref: "#/components/parameters/Period"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DashboardResponse"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/NoTariffs" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/finance/projects:
+    get:
+      tags: [finance]
+      operationId: getFinanceProjects
+      summary: Per-project margin table.
+      description: |
+        Returns the per-project margin slice for the requested period,
+        sorted by total spend desc. The frontend slices to top-N on its
+        side; this endpoint returns the full set.
+      parameters:
+        - $ref: "#/components/parameters/Period"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ProjectMargin"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/NoTariffs" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/finance/breakdown:
+    get:
+      tags: [finance]
+      operationId: getFinanceBreakdown
+      summary: Pie-chart slice projection.
+      description: |
+        Returns the five-component pie-chart projection of the current
+        period's MonthBreakdown (telecom / wages / respondent_bases /
+        storage / fixed_fee). Period parsing is identical to
+        /api/finance/dashboard.
+      parameters:
+        - $ref: "#/components/parameters/Period"
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/BreakdownItem"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/NoTariffs" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/finance/byMonth:
+    get:
+      tags: [finance]
+      operationId: getFinanceByMonth
+      summary: Trailing-N-months bar series.
+      description: |
+        Returns the trailing-N-months spend series (oldest first). count
+        defaults to 6 and is clamped to [1, 24] — out-of-range values
+        yield 400 billing.invalid_period.
+      parameters:
+        - name: count
+          in: query
+          description: Number of trailing months to include. Range [1, 24].
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 24
+            default: 6
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ByMonthItem"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+  /api/billing/tariffs:
+    get:
+      tags: [billing]
+      operationId: getBillingTariffs
+      summary: Get the tenant's tariff snapshot.
+      description: |
+        Returns the tenant's current tariff snapshot. RBAC: admin or
+        supervisor.
+
+        When the tenant has not yet PATCHed any tariffs, the response
+        falls back to the platform defaults with is_default=true so the
+        admin UI can flag "still on defaults" to the user. In that case
+        the body still validates against the schema; only the version
+        and updated_at fields are derived from the defaults.
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TariffsResponse"
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "500": { $ref: "#/components/responses/Internal" }
+    patch:
+      tags: [billing]
+      operationId: patchBillingTariffs
+      summary: Partially update the tenant's tariffs (admin only).
+      description: |
+        Admin-only partial update of the tenant's tariff snapshot.
+        Pointer-typed scalars are optional patches (omitted = leave
+        unchanged); trunk_costs_minor, when present, replaces the entire
+        map. Successful update bumps the Tariffs.version counter and
+        appends a billing.tariff_updated event to the audit outbox.
+
+        Validation: negative scalars and empty trunk_id keys are
+        rejected with 400 billing.invalid_tariff.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TariffsPatchRequest"
+      responses:
+        "200":
+          description: OK — updated snapshot.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TariffsResponse"
+        "400": { $ref: "#/components/responses/BadRequest" }
+        "401": { $ref: "#/components/responses/Unauthorized" }
+        "403": { $ref: "#/components/responses/Forbidden" }
+        "409": { $ref: "#/components/responses/NoTariffs" }
+        "500": { $ref: "#/components/responses/Internal" }
+components:
+  parameters:
+    Period:
+      name: period
+      in: query
+      description: |
+        Period selector. Defaults to "month" when omitted. All periods are
+        anchored to UTC and half-open. Week is ISO 8601 (Monday-anchored);
+        quarter is the calendar quarter containing now.Month(); year is
+        the calendar year.
+      required: false
+      schema:
+        type: string
+        enum: [week, month, quarter, year]
+        default: month
+  schemas:
+    Period:
+      type: object
+      description: Half-open [from, to) UTC time range.
+      required: [from, to]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+    BreakdownItem:
+      type: object
+      description: One slice of the dashboard pie chart.
+      required: [label, value_minor]
+      properties:
+        label:
+          type: string
+          description: Component label (e.g. "telecom", "wages", "respondent_bases", "storage", "fixed_fee").
+        value_minor:
+          type: integer
+          format: int64
+          description: Component spend in kopecks (minor units).
+    ByMonthItem:
+      type: object
+      description: One bar of the dashboard byMonth chart.
+      required: [year, month, label, value_minor]
+      properties:
+        year:
+          type: integer
+        month:
+          type: integer
+          minimum: 1
+          maximum: 12
+        label:
+          type: string
+          description: Localised string (e.g. "май 2026"). UI may display verbatim.
+        value_minor:
+          type: integer
+          format: int64
+          description: Month spend in kopecks (minor units).
+    ProjectMargin:
+      type: object
+      description: One row of the per-project margin report.
+      required:
+        - project_id
+        - project_code
+        - project_name
+        - surveys
+        - telecom_minor
+        - wages_minor
+        - respondent_bases_minor
+        - storage_minor
+        - total_minor
+        - revenue_minor
+        - margin_minor
+        - cost_per_survey_minor
+      properties:
+        project_id:
+          type: string
+          format: uuid
+        project_code:
+          type: string
+        project_name:
+          type: string
+        surveys:
+          type: integer
+          format: int64
+          description: Count of completed surveys in the period.
+        telecom_minor:
+          type: integer
+          format: int64
+          description: Telecom (per-minute trunk) spend in kopecks (minor units).
+        wages_minor:
+          type: integer
+          format: int64
+          description: Operator wages spend in kopecks (minor units).
+        respondent_bases_minor:
+          type: integer
+          format: int64
+          description: Respondent-bases purchase spend in kopecks (minor units).
+        storage_minor:
+          type: integer
+          format: int64
+          description: Recording storage spend in kopecks (minor units).
+        total_minor:
+          type: integer
+          format: int64
+          description: Sum of all spend components in kopecks (minor units).
+        revenue_minor:
+          type: integer
+          format: int64
+          description: Contract revenue in kopecks (minor units).
+        margin_minor:
+          type: integer
+          format: int64
+          description: revenue_minor − total_minor in kopecks (minor units).
+        cost_per_survey_minor:
+          type: integer
+          format: int64
+          description: total_minor ÷ surveys in kopecks (minor units); 0 when surveys=0.
+    DashboardResponse:
+      type: object
+      description: |
+        Composite finance dashboard payload (Plan 14 §FR-H). Mirrors the
+        prototype admin-pages-2.jsx::AdminFinance visual contract.
+      required:
+        - tenant_id
+        - period
+        - month_spend_minor
+        - prev_spend_minor
+        - delta_pct
+        - cost_per_survey_minor
+        - prev_cost_per_survey_minor
+        - avg_cost_per_minute_minor
+        - revenue_minor
+        - margin_minor
+        - margin_pct
+        - breakdown
+        - by_month
+        - top_projects
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        period:
+          $ref: "#/components/schemas/Period"
+        month_spend_minor:
+          type: integer
+          format: int64
+          description: Current-period total spend in kopecks (minor units).
+        prev_spend_minor:
+          type: integer
+          format: int64
+          description: Previous same-length-period total spend in kopecks (minor units).
+        delta_pct:
+          type: number
+          format: double
+          description: (month_spend − prev_spend) / prev_spend × 100. 0.0 when prev_spend=0.
+        cost_per_survey_minor:
+          type: integer
+          format: int64
+          description: Current-period cost per completed survey in kopecks (minor units).
+        prev_cost_per_survey_minor:
+          type: integer
+          format: int64
+          description: Previous-period cost per completed survey in kopecks (minor units).
+        avg_cost_per_minute_minor:
+          type: integer
+          format: int64
+          description: Current-period average cost per minute of call time in kopecks (minor units).
+        revenue_minor:
+          type: integer
+          format: int64
+          description: Sum of contract revenue across all projects in the current period, in kopecks (minor units).
+        margin_minor:
+          type: integer
+          format: int64
+          description: revenue_minor − month_spend_minor in kopecks (minor units).
+        margin_pct:
+          type: number
+          format: double
+          description: margin_minor / revenue_minor × 100. 0.0 when revenue=0.
+        breakdown:
+          type: array
+          items:
+            $ref: "#/components/schemas/BreakdownItem"
+        by_month:
+          type: array
+          items:
+            $ref: "#/components/schemas/ByMonthItem"
+        top_projects:
+          type: array
+          description: Top 5 projects by total_minor desc.
+          items:
+            $ref: "#/components/schemas/ProjectMargin"
+    Tariffs:
+      type: object
+      description: |
+        Per-tenant tariff snapshot. Version monotonically increases on
+        every Update; consumers can detect staleness by comparing.
+      required:
+        - tenant_id
+        - version
+        - updated_at
+        - wage_per_survey_minor
+        - storage_minor_per_gb_mo
+        - respondent_bases_minor
+        - fixed_fees_minor
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        version:
+          type: integer
+          description: Monotonic counter (NOT a uuid). Bumped on every Update.
+        updated_at:
+          type: string
+          format: date-time
+        trunk_costs_minor:
+          type: object
+          description: |
+            Map keyed by FreeSWITCH trunk_id (open enumeration — no
+            hardcoded server-side allow-list). Values are per-minute
+            cost in kopecks (minor units). Unknown trunk_id at calculator
+            time is defensively mapped to 0.
+          additionalProperties:
+            type: integer
+            format: int64
+        wage_per_survey_minor:
+          type: integer
+          format: int64
+          description: Operator wage per completed survey in kopecks (minor units).
+        storage_minor_per_gb_mo:
+          type: integer
+          format: int64
+          description: S3 storage rate in kopecks per GB-month (minor units).
+        respondent_bases_minor:
+          type: integer
+          format: int64
+          description: Per-imported-record rate for respondent bases in kopecks (minor units).
+        fixed_fees_minor:
+          type: integer
+          format: int64
+          description: Constant monthly overhead in kopecks (minor units).
+    TariffsResponse:
+      type: object
+      description: HTTP wrapper around Tariffs.
+      required: [tenant_id, tariffs, is_default]
+      properties:
+        tenant_id:
+          type: string
+          format: uuid
+        tariffs:
+          $ref: "#/components/schemas/Tariffs"
+        is_default:
+          type: boolean
+          description: |
+            True when the tenant has not yet PATCHed its own tariffs and
+            the returned snapshot is the platform BillingConfig.Defaults
+            fallback. The admin UI uses this flag to badge "still on
+            defaults".
+    TariffsPatchRequest:
+      type: object
+      description: |
+        Partial tariff update. Pointer-typed scalars denote optional
+        patches: omitted means "leave unchanged". trunk_costs_minor is
+        replace-all when present (the admin UI always submits the full
+        map). At least one field must be present for the update to be
+        non-trivial.
+      properties:
+        trunk_costs_minor:
+          type: object
+          description: When present, replaces the entire per-trunk map.
+          additionalProperties:
+            type: integer
+            format: int64
+        wage_per_survey_minor:
+          type: integer
+          format: int64
+          description: Operator wage per completed survey in kopecks (minor units).
+        storage_minor_per_gb_mo:
+          type: integer
+          format: int64
+          description: S3 storage rate in kopecks per GB-month (minor units).
+        respondent_bases_minor:
+          type: integer
+          format: int64
+          description: Per-imported-record rate for respondent bases in kopecks (minor units).
+        fixed_fees_minor:
+          type: integer
+          format: int64
+          description: Constant monthly overhead in kopecks (minor units).
+    ErrorEnvelope:
+      type: object
+      required: [code, message]
+      properties:
+        code:
+          type: string
+          description: |
+            Stable low-cardinality string suitable for logs and metrics:
+            billing.invalid_period, billing.invalid_tariff,
+            billing.no_tariffs, billing.forbidden,
+            billing.unauthenticated, billing.internal.
+        message:
+          type: string
+          description: Human-readable detail. NEVER assert against this — assert against `code`.
+  responses:
+    BadRequest:
+      description: |
+        400 — invalid period selector (billing.invalid_period) or
+        malformed / negative-value tariff patch (billing.invalid_tariff).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Unauthorized:
+      description: 401 — missing or invalid JWT (billing.unauthenticated).
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Forbidden:
+      description: |
+        403 — caller lacks the required RBAC (billing.forbidden). View
+        endpoints require admin or supervisor; PATCH /api/billing/tariffs
+        requires admin.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    NoTariffs:
+      description: |
+        409 — tenant has no tariffs configured and no platform defaults
+        are available to fall back on (billing.no_tariffs). Operationally
+        rare: GetTariffs ordinarily falls back to defaults with
+        is_default=true.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+    Internal:
+      description: 500 — unexpected server error (billing.internal). Message is scrubbed.
+      content:
+        application/json:
+          schema: { $ref: "#/components/schemas/ErrorEnvelope" }
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+security:
+  - BearerAuth: []
