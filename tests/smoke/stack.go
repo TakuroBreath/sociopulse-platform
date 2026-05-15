@@ -30,6 +30,26 @@ import (
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// init disables the testcontainers-go "ryuk" reaper before any
+// container starts. Plan 21 references § 4.1: on macOS Docker the
+// reaper spawns a goroutine (Reaper.connect.func1) that does NOT
+// terminate within goleak.VerifyTestMain's window — every smoke test
+// run would then false-positive a goroutine leak in cmd/api's TestMain.
+//
+// Trade-off: a test panic mid-run leaves orphan containers. Cleanup:
+// `docker ps -a --filter label=org.testcontainers=true -q | xargs
+// docker rm -f`. The smoke suite's t.Cleanup ordering covers the
+// graceful path; the orphan-on-panic case is an operator-friendly
+// trade for green CI.
+//
+// LookupEnv check honours an explicit user override (e.g. operator
+// debugging container cleanup behaviour locally sets ryuk=false).
+func init() {
+	if _, set := os.LookupEnv("TESTCONTAINERS_RYUK_DISABLED"); !set {
+		_ = os.Setenv("TESTCONTAINERS_RYUK_DISABLED", "true")
+	}
+}
+
 // Stack carries the connection coordinates of the smoke testcontainer
 // stack. Smoke tests treat it as read-only after NewSharedStack returns.
 // The Reset method is the only mutator and is documented separately.
