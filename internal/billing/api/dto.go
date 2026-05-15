@@ -13,7 +13,6 @@
 package api
 
 import (
-	"errors"
 	"fmt"
 	"time"
 
@@ -42,26 +41,28 @@ type Tariffs struct {
 // Validate enforces non-negative invariants and non-empty trunk-ids.
 // Returns nil for the zero value (a tenant with no tariffs at all is a
 // legitimate state — TariffStore.Get returns ErrNoTariffs for that case
-// before Validate is ever reached).
-func (t *Tariffs) Validate() error {
+// before Validate is ever reached). All failure paths wrap ErrInvalidTariff
+// so upstream callers can branch via errors.Is (canonical pkg/config
+// pattern, mirrors pkg/config/analytics.go).
+func (t Tariffs) Validate() error {
 	if t.WagePerSurveyMinor < 0 {
-		return fmt.Errorf("billing.tariffs: wage_per_survey_minor < 0")
+		return fmt.Errorf("%w: wage_per_survey_minor < 0", ErrInvalidTariff)
 	}
 	if t.RespondentBasesMinor < 0 {
-		return fmt.Errorf("billing.tariffs: respondent_bases_minor < 0")
+		return fmt.Errorf("%w: respondent_bases_minor < 0", ErrInvalidTariff)
 	}
 	if t.StorageMinorPerGBMo < 0 {
-		return fmt.Errorf("billing.tariffs: storage_minor_per_gb_mo < 0")
+		return fmt.Errorf("%w: storage_minor_per_gb_mo < 0", ErrInvalidTariff)
 	}
 	if t.FixedFeesMinor < 0 {
-		return fmt.Errorf("billing.tariffs: fixed_fees_minor < 0")
+		return fmt.Errorf("%w: fixed_fees_minor < 0", ErrInvalidTariff)
 	}
 	for trunkID, cost := range t.TrunkCostsMinor {
 		if trunkID == "" {
-			return errors.New("billing.tariffs: empty trunk_id in trunk_costs_minor")
+			return fmt.Errorf("%w: empty trunk_id in trunk_costs_minor", ErrInvalidTariff)
 		}
 		if cost < 0 {
-			return fmt.Errorf("billing.tariffs: trunk_costs_minor[%q] < 0", trunkID)
+			return fmt.Errorf("%w: trunk_costs_minor[%q] < 0", ErrInvalidTariff, trunkID)
 		}
 	}
 	return nil
@@ -71,7 +72,7 @@ func (t *Tariffs) Validate() error {
 // is not configured (defensive — unknown trunk_used must NOT crash the
 // calculator). Also returns 0 for an empty trunkID, which can occur when a
 // call ends before the dialer selected a trunk (very short failure path).
-func (t *Tariffs) TrunkCostMinor(trunkID string) int64 {
+func (t Tariffs) TrunkCostMinor(trunkID string) int64 {
 	if trunkID == "" {
 		return 0
 	}

@@ -26,6 +26,7 @@ func TestTariffs_Validate(t *testing.T) {
 				WagePerSurveyMinor: 12000,
 			},
 		},
+		{name: "zero value", in: billingapi.Tariffs{}},
 		{name: "negative trunk cost", in: billingapi.Tariffs{TrunkCostsMinor: map[string]int64{"x": -1}}, wantErr: true},
 		{name: "negative wage", in: billingapi.Tariffs{WagePerSurveyMinor: -1}, wantErr: true},
 		{name: "negative bases", in: billingapi.Tariffs{RespondentBasesMinor: -1}, wantErr: true},
@@ -39,7 +40,7 @@ func TestTariffs_Validate(t *testing.T) {
 
 			err := tc.in.Validate()
 			if tc.wantErr {
-				require.Error(t, err)
+				require.ErrorIs(t, err, billingapi.ErrInvalidTariff)
 				return
 			}
 			require.NoError(t, err)
