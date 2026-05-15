@@ -3314,3 +3314,45 @@ Plan 14 verified.
 ---
 
 **Plan complete and saved to `docs/superpowers/plans/2026-05-06-14-billing-module.md`.** After this plan executes, the admin Finance page renders real KPI tiles, the byMonth bar chart, the breakdown pie, and the per-project margin table — sourced from `call_costs` denormalisation written every time the dialer finalises a call.
+
+---
+
+## Amendments (post-execution 2026-05-15)
+
+These deviations from the plan text emerged during execution. `docs/references/plan-14-billing.md` § 2 documents the rationale before the first subagent runs; this section records what actually shipped.
+
+- **2026-05-15 — Field renames vs. plan abstract.** `internal/billing/api/dto.go` was pre-built during Plan 00 with different field names than the plan text (`WagePerSurveyMinor` vs plan's `CostPerCompletedSurveyMin`, `RespondentBasesMinor` vs `CostPerImportedRecordMin`, `StorageMinorPerGBMo` vs `StorageCostPerGBMonthMin`, `FixedFeesMinor` vs `FixedMonthlyFeesMin`, `MonthBreakdown.RespondentBasesMin` vs `BasesMin`, `ProjectMargin.CostPerSrvMn` vs `CostPerSurveyMinor`, `Tariffs.Version int` vs plan's `uuid.UUID`). All implementer subagents were instructed via `docs/references/plan-14-billing.md` §2.2 to translate plan→reality at every paste site. Migration column names (`call_costs.*_minor`) match the plan's SQL.
+
+- **2026-05-15 — Migration 000013 combines both.** Plan Task 1 + Task 7 prescribed two separate migrations (`call_costs` table + `projects.contract_fee_per_completed_minor` ALTER). The repo's migration sequence is integer-monotonic (000001…000012), not date-stamped. Both changes shipped as one pair `000013_billing.{up,down}.sql`.
+
+- **2026-05-15 — slog → zap, net/http → gin everywhere.** The plan's code samples used `*slog.Logger` and `net/http.HandlerFunc`. The project uses zap (ADR-0012) and gin (ADR-0014) exclusively. Step G's 6 handlers, the AuditEmitter, the NATS subscriber, and module.go all consume `*zap.Logger`; HTTP handlers are `func(c *gin.Context)`.
+
+- **2026-05-15 — `internal/testpg.New(t)` does not exist.** Plan referenced this helper across Tasks 5-8. The repo uses `testcontainers-go/modules/postgres` directly inside `//go:build integration` files, mirroring `internal/recording/store/recording_pg_test.go`. Integration tests for billing follow that pattern.
+
+- **2026-05-15 — `tariff_version` in `call_costs` is `integer`, not `uuid`.** Tracks `api.Tariffs.Version int`. Migration declares it nullable so a legacy/seed insert without a snapshot is permitted; production hooks always provide a value (when ≥1).
+
+- **2026-05-15 — `call_recordings.bytes_size` vs plan's `storage_size_bytes`.** Plan referenced a non-existent column. Billing reads `StorageBytes` from the dialer's NATS event payload (already populated from `bytes_size` at finalize time), never JOINs `call_recordings`. Reference §2.6.
+
+- **2026-05-15 — `eventbus.Subscriber` abstraction (NOT raw nats.go).** Plan Task 9 used `nats.go/jetstream` directly. Project uses `pkg/eventbus.Subscriber.Subscribe(ctx, subject, queue, handler)`; the billing subscriber mirrors `internal/dialer/transport/nats/call_event_subscriber.go`. Reference §2.14.
+
+- **2026-05-15 — `FinalizedAt` is `int64` unix seconds on the wire.** Plan example showed an ISO-8601 string. `internal/dialer/api/events.go:88` declares `int64`; billing converts via `time.Unix(raw, 0).UTC()`. Reference §2.3.
+
+- **2026-05-15 — Audit-via-outbox is best-effort post-Update, NOT atomic.** Plan §audit-on-PATCH implied tariff write + audit emit run in one Tx. `TariffStore.Update` opens its own Tx via `UpsertSettings` — no external-Tx injection path without a Step C-level refactor. `AuditEmitter.EmitTariffUpdated` runs in its own `pool.WithTenant` Tx after the tariff write commits; failure logs WARN and returns. At-most-once audit on tariff change is the explicit trade-off. Reference §2.13 + Step G architectural decision. Track in PROJECT_STATUS for future hardening.
+
+- **2026-05-15 — No audit per `call_costs` INSERT.** Plan Task 5 emitted an audit row for every `OnCallFinalized` invocation. Reference §4.11 supersedes: at hundreds of calls/minute the audit volume would dwarf real audit events. Audit only the human-driven tariff PATCH.
+
+- **2026-05-15 — `SpendByMonth` anchor must be day-1-of-month.** Plan's loop used `now.AddDate(0, -i, 0)` which on day 29/30/31 silently skips February. Step E review caught this; the fix snaps the anchor to `time.Date(year, month, 1, ...)` before iterating. Regression test pinned at Jan 31 + Mar 31.
+
+- **2026-05-15 — `MarginReport` uses `sort.SliceStable`.** Plan used `sort.Slice` (unstable). Step F review noted that the SQL pre-sorts by `p.name`; unstable sort discards the secondary key on equal `TotalMin`. Swapped to `SliceStable` so equal-spend rows remain alphabetically ordered for the UI.
+
+- **2026-05-15 — `?from=&to=` ad-hoc period parser DEFERRED.** Plan Task 8 hinted at explicit date-range support. Reference §4.6 + open-questions § resolved: v1 supports only `?period=week|month|quarter|year`. Documented in `docs/api/billing/v1/openapi.yaml`.
+
+- **2026-05-15 — `RequireSameTenant` middleware NOT applied to billing routes.** Billing endpoints derive `tenantID` from `claims.TenantID` only (no path-`:id` parameter). RequireSameTenant defends against path-id cross-tenant attacks and is unnecessary here. Reference §2.11.
+
+- **2026-05-15 — `auth` module not in cmd/api registry.** A wider-environmental gap discovered during Step I: `cmd/api/main.go` does not register the auth module, so `auth.RBACChecker` is never published to the locator. Billing's `requireRBAC` correctly degrades to role-fast-path-only (admin/supervisor JWT roles short-circuit; the fallback `RBACChecker.Check` is skipped with `rbac_wired=false`). Tracked as a separate follow-up — NOT a billing concern.
+
+- **2026-05-15 — `BreakdownItem.label` and `ByMonthItem.label` emit Russian display strings.** OpenAPI initially documented English examples; the wire emits "Связь"/"Зарплата"/... and "Май"/"Июн"/... Step J review fix-up commit `8319197` updated the spec to reflect reality and instruct integrators to use the stable handles (slice-index for Breakdown, `(year, month)` for ByMonth).
+
+- **2026-05-15 — Plan Task 12 `cmd/worker billing.recompute` is a true stub.** `cmd/worker/main.go` is an errgroup-orchestrated long-running process, NOT a switch-based subcommand dispatcher. The stub lives at `cmd/worker/billing_recompute.go` and is plumbed as a private function — covered by 2 unit tests — that a future CLI dispatch layer can plug in. No `main.go` integration required today.
+
+- **2026-05-15 — `cmd/api/TestRunStartsAndShutsDownCleanly` is pre-existing flake.** Verified by reverting billing.Module wiring on a clean tree — the test fails identically. Environment-specific (macOS port-binding timing); CI on Linux is consistently green. Tracked as standing-rule gap, NOT a Plan 14 regression.

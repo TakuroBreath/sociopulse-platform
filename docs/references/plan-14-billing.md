@@ -489,8 +489,65 @@ The plan's 90% target is aspirational. Reality: `service/` should be ≥ 85% (ca
 | `cmd/worker billing.recompute` — Task 12 stub? | **YES** — keep the stub as a future-extension marker. |
 | Coverage gate? | ≥ 80% target; 90% aspirational. No fake-it-to-hit-the-number. |
 
-## 6. Production lessons (post-execution YYYY-MM-DD)
+## 6. Production lessons (post-execution 2026-05-15)
 
-> Filled in during Phase 4 close-out. Document the gotchas that *actually* bit us, NOT the ones we anticipated above. Future agents reading this section save real time.
+What ACTUALLY bit us during the 9-step execution + 9 review rounds. Future agents touching billing — read this first.
 
-(empty — populate post-implementation)
+### Library / language quirks
+
+- **`shopspring/decimal.Round(0)` is "half away from zero", not strictly "half-up".** For non-negative inputs (the calculator's guards `perMin > 0 / dur > 0 / bytes > 0` enforce non-negative) the two are arithmetically identical. Verified via `context7` during Step B. Documented in `calculator.go` package comment.
+- **`time.AddDate(0, -1, 0)` calendar-normalises overflow days.** On day 29/30/31, subtracting a month can skip February (Jan 31 → Mar 3, not Feb 28). Caught by Step E review. Fix: snap the anchor to `time.Date(year, month, 1, ...)` BEFORE iterating. Add a regression test that pins the clock to day 31.
+- **`sort.Slice` is unstable.** When two projects share `TotalMin`, the SQL ORDER BY p.name secondary key is silently discarded. Use `sort.SliceStable` (Step F review).
+- **`postgres.Tx` is a `struct`, NOT an interface.** Cannot pass `nil` as a `Tx` argument. For unit-test fakes that need to satisfy an interface accepting `postgres.Tx`, pass `postgres.Tx{}` zero-value (Step G AuditEmitter test).
+- **gopls cache pollution is constant.** After every subagent dispatch, LSP reports false "undefined: X" / "unused" warnings while go test + golangci-lint are green. Always re-verify directly via `make ci` + `go test -race`. Pattern documented in `CLAUDE.md` workflow rule #5.
+- **`unconvert` linter is picky.** `require.Equal(t, billingapi.AuditActionTariffUpdated, string(ev.Action))` failed — use `require.EqualValues` instead, or remove the conversion if types match. Caught by Step G audit-test fix-up.
+- **`float-compare` testifylint rule fires on JSON-decoded numbers.** `require.Equal(t, float64(3), ev.Payload["version_before"])` is rejected. Use `require.InEpsilon(t, 3.0, ev.Payload[...], 0.0001)`.
+
+### Project-specific patterns
+
+- **Foundation api/ may pre-exist with different names than the plan abstract.** Plan 14's `Tariffs` struct field names (`CostPerCompletedSurveyMin` etc.) differed from `internal/billing/api/dto.go` Plan 00 foundation (`WagePerSurveyMinor` etc.). Reference §2.2 documents the full mapping; every implementer subagent prompt included it. **Lesson**: future plans should grep the existing `internal/<mod>/api/` BEFORE the first dispatch.
+- **Migration sequence is integer-monotonic.** Plan 14 prescribed date-stamped names (`20260506000000_*.sql`); reality is `000001…000013`. Step A combined plan's two migrations into one pair.
+- **Audit-via-outbox best-effort policy is the v1 default.** TariffStore.Update opens its own Tx via UpsertSettings — there's no path to inject an external Tx for an atomic audit emit without a Step C-level refactor. Audit emits after the Update commits, in its own Tx; failure logs WARN, returns nil. At-most-once audit on the human-driven event. If a future audit consumer needs strict at-least-once, refactor TariffStore to take `*postgres.Tx`.
+- **`changedKeys` audit payload, not numeric values.** Per `docs/references/plan-14-billing.md §4.11`, audit payload includes `version_before`, `version_after`, `changed_keys []string` — NOT the new tariff values themselves. Those live in `tenant_settings.billing.*` queryable separately. Keeps audit row low-cardinality and avoids re-publishing PII-adjacent numbers.
+- **`requireRBAC` mirrors reports' `requireAdmin`**: fast-path admin/supervisor short-circuit, fallback `RBACChecker.Check`, nil-checker degrades to 403. Tolerates `auth.RBACChecker` not in locator (current cmd/api state) — `rbac_wired=false` on boot, role-fast-path-only.
+- **Locator key naming: `<module>.<TypeName>`.** Mirrors reports (`reports.Service`, `reports.JobQueue`). Billing publishes 7: `billing.{Service,TariffStore,SpendReport,MarginReport,RevenueCalculator,CostCalculator,CallFinalizedHook}`. Resolved by cmd/worker (future) and downstream consumers.
+- **`eventbus.Subscriber` is the canonical NATS abstraction.** Never use raw nats.go / jetstream directly in modules. Pattern: `bus.Subscribe(ctx, wildcardSubject, queueGroup, handler)`. Handler returns error → redelivery; idempotent INSERT carries the contract.
+
+### Performance / scale
+
+- **`call_costs` indexes**: `(tenant_id, finalized_at desc)` + `(project_id, finalized_at desc)` cover the dashboard query patterns. SumCallCosts EXPLAINs cleanly on a seeded test set. Re-verify when row count crosses 10M.
+- **Pre-aggregation via SQL `count(*) FILTER (where status='success')`** is faster than a second query — Surveys + Telecom + Wages + Storage + TotalSeconds all in one scan.
+- **`HAVING SUM(total_minor) > 0`** filters projects with no spend AFTER the GROUP BY. WHERE would not work — per-row filter only.
+- **`tenant_id` on BOTH sides of the LEFT JOIN** (cc.tenant_id = p.tenant_id AND p.tenant_id = $1) is defence-in-depth even with RLS active. Caught by Step F review.
+
+### Boot-time / wiring
+
+- **Degraded boot matrix is essential.** Module.Register handles 6 nil-tolerance paths: nil Logger/Config → return error; nil Pool/HTTPRouter → log INFO + return nil; nil Locator/Subscriber → log WARN + continue. cmd/api boots even when NATS streams aren't provisioned (Subscribe returns error, log WARN, HTTP routes remain mounted).
+- **AuditEmitter is wired at Module.Register**: `outbox.NewPostgresWriter()` → `service.NewAuditEmitter(d.Pool, writer, logger)` → passed to `httptransport.NewHandlers(svc, audit, nil)`. PATCH tariff handlers consume it; the rest of the HTTP surface ignores it.
+- **`d.Ctx` (boot lifetime), NOT `context.Background()`** passed to `subscriber.Subscribe(ctx, bus)`. Step I caught this in review.
+- **`cmd/api/TestRunStartsAndShutsDownCleanly` is pre-existing flake on macOS** (verified by reverting Plan 14 — same failure on `2a33ea7`). CI on Linux is green. Documented as standing rule; do NOT attempt to fix in a billing-scoped PR.
+
+### Test infrastructure
+
+- **`service/main_test.go` with `goleak.VerifyTestMain(m)` is mandatory** once a package has any goroutine-spawning tests (e.g. NATS subscriber). Step D omitted it (sync at that time); Step H added it. Use the canonical pattern from `pkg/postgres/main_test.go` for ignore-funcs if needed.
+- **Test seam via `export_test.go`** is the way to expose unexported interfaces (`tenantTxRunner`) to in-memory fakes without leaking the interface to production callers. AuditEmitter test uses `NewAuditEmitterForTest(any, AuditWriter)` defined in `_test.go`.
+- **testcontainers Postgres**: ~5–12s per integration test fixture boot. The 6 billing-store integration tests average 12s combined (one fixture, ~70 inserts). Coverage on `internal/billing/store/pgx` integration-tagged: 86.6% (`go test -tags=integration -cover`).
+
+### Coverage final state
+
+| Package | Coverage | Notes |
+|---|---|---|
+| `internal/billing/api` | 76.9% | DTOs have no logic; Validate/TrunkCostMinor/Month covered |
+| `internal/billing/service` | 89.4% | Calculator 100%; AuditEmitter via test seam; degraded paths |
+| `internal/billing/store/pgx` (unit) | 0% | No unit-only path; integration covers it |
+| `internal/billing/store/pgx` (integration) | 86.6% | testcontainers cover all 5 store methods |
+| `internal/billing/transport/http` | 82.7% | Above 80% target; error branches sometimes skipped |
+| `internal/billing/transport/nats` | 100% | Wildcard + handler + decode + dispatch all hit |
+| `internal/billing` (module.go) | 15.5% | Smoke tests only (degraded-boot paths). Happy path is exercised end-to-end via cmd/api + per-component integration tests. |
+
+### Open follow-ups (for future plans)
+
+1. **`auth` module needs to be in `cmd/api/main.go` providers registry.** Today billing's `requireRBAC` always degrades to role-fast-path (admin/supervisor short-circuit). Reaching the matrix-checker fallback requires auth module to publish `auth.RBACChecker` to the locator. Tracked outside Plan 14 scope.
+2. **`POST /api/calls/:id/hangup` cross-tenant scope** — flagged by Plan 13.2.5, deferred to v0.0.26 follow-up. Independent of billing.
+3. **Audit chain-of-custody on tariff PATCH**: today best-effort, post-Update. If 152-ФЗ auditor scope materialises, refactor TariffStore to take `*postgres.Tx` and run audit emit + tariff update in one Tx.
+4. **`PATCH /api/billing/tariffs` with empty body** still calls TariffStore.Update (bumps version, writes audit-skip). Could short-circuit `if len(changedKeys) == 0 { return current, nil }`. Inefficiency, not bug.
