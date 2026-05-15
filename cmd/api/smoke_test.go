@@ -4,7 +4,10 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"io"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -116,4 +119,93 @@ func bootAPI(t *testing.T, stack *smoke.Stack) (httpAddr, metricsAddr string) {
 		// listener accepted a TCP connection — boot succeeded
 	}
 	return httpAddr, metricsAddr
+}
+
+// TestSmoke_HealthAndReadiness — Plan 21 Task 5.
+//
+// Asserts the gateway exposes a sanity surface on a full-stack boot:
+//
+//   - /healthz returns 200 unconditionally (liveness, pre-startup-done).
+//   - /readyz returns 200 + JSON with status="ok" AND the postgres + nats
+//     checks both ok=true. The Redis check is module-owned (auth/dialer)
+//     and need not surface here.
+//   - /metrics (on the separate listener) returns 200 + at least one
+//     well-known process metric (catches a future refactor that drops
+//     the Prometheus collector registry from cmd/api boot).
+//
+// This is the regression net for the Plan 02 gateway middleware path —
+// a class of failure where /readyz logic is moved but the underlying
+// checker chain is not re-wired.
+func TestSmoke_HealthAndReadiness(t *testing.T) {
+	t.Parallel()
+
+	stack := smoke.GetSharedStack(t)
+	httpAddr, metricsAddr := bootAPI(t, stack)
+
+	cli := &http.Client{Timeout: 5 * time.Second}
+	ctx := t.Context()
+
+	// /healthz — liveness, always 200 once the listener is up.
+	healthResp := mustSmokeGet(ctx, t, cli, "http://"+httpAddr+"/healthz")
+	assert.Equal(t, http.StatusOK, healthResp.StatusCode, "healthz must be 200")
+	_ = healthResp.Body.Close()
+
+	// /readyz — must report postgres + nats checks ok against a fully-up
+	// testcontainer stack. The Redis check sits inside auth/dialer modules
+	// (when they register a check) so we don't assert on its presence.
+	readyResp := mustSmokeGet(ctx, t, cli, "http://"+httpAddr+"/readyz")
+	require.Equal(t, http.StatusOK, readyResp.StatusCode,
+		"readyz must be 200 when Postgres + NATS are reachable")
+	body, err := io.ReadAll(readyResp.Body)
+	require.NoError(t, err)
+	_ = readyResp.Body.Close()
+
+	// Response shape per internal/healthz/readiness.go:
+	//   {"status":"ok","checks":{"postgres":{"ok":true,...},"nats":{"ok":true,...}}}
+	var ready struct {
+		Status string `json:"status"`
+		Checks map[string]struct {
+			OK         bool   `json:"ok"`
+			Error      string `json:"error,omitempty"`
+			DurationMS int64  `json:"duration_ms"`
+		} `json:"checks"`
+	}
+	require.NoError(t, json.Unmarshal(body, &ready),
+		"readyz body must be parseable JSON")
+	assert.Equal(t, "ok", ready.Status, "readyz top-level status must be ok")
+	require.Contains(t, ready.Checks, "postgres",
+		"readyz must include a postgres check (built from healthchecks.PostgresCheck at boot)")
+	require.Contains(t, ready.Checks, "nats",
+		"readyz must include a nats check (built from healthchecks.NATSCheck at boot)")
+	assert.True(t, ready.Checks["postgres"].OK,
+		"postgres check must be ok on the smoke testcontainer stack")
+	assert.True(t, ready.Checks["nats"].OK,
+		"nats check must be ok on the smoke testcontainer stack")
+
+	// /metrics — on the separate listener. Must emit at least one
+	// canonical Go-runtime metric, proving the Prometheus registry is
+	// wired into the metrics server.
+	metricsResp := mustSmokeGet(ctx, t, cli, "http://"+metricsAddr+"/metrics")
+	require.Equal(t, http.StatusOK, metricsResp.StatusCode, "metrics must be 200")
+	mbody, err := io.ReadAll(metricsResp.Body)
+	require.NoError(t, err)
+	_ = metricsResp.Body.Close()
+	mtext := string(mbody)
+	assert.True(t,
+		strings.Contains(mtext, "go_goroutines") ||
+			strings.Contains(mtext, "process_cpu_seconds_total") ||
+			strings.Contains(mtext, "go_info"),
+		"metrics body must expose at least one well-known process metric; got %d bytes", len(mtext))
+}
+
+// mustSmokeGet issues a GET with caller-supplied ctx + http.Client and
+// surfaces transport errors via require.NoError so the test fails loudly
+// rather than dereferencing a nil response on the next line.
+func mustSmokeGet(ctx context.Context, t *testing.T, cli *http.Client, url string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err)
+	resp, err := cli.Do(req)
+	require.NoError(t, err, "GET %s", url)
+	return resp
 }
