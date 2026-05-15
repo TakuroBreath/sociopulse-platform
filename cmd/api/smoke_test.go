@@ -306,3 +306,175 @@ func postJSONAndRead(ctx context.Context, t *testing.T, cli *http.Client, url, b
 	require.NoError(t, err, "read body for POST %s", url)
 	return resp.StatusCode, buf
 }
+
+// TestSmoke_RbacEnforcement — Plan 21 Task 7.
+//
+// Asserts the RBAC matrix is wired end-to-end: an operator JWT against
+// an admin-only write endpoint returns 403; the same endpoint with an
+// admin JWT returns 201. The regression class — a future refactor
+// breaks the RBAC fast-path OR the matrix-checker fallback — surfaces
+// here even though per-handler tests mock the checker.
+//
+// Chosen endpoint: POST /api/projects.
+// Body shape: {"code","name"} (both required, max 64 / 200 chars).
+// Route mounted with requireAdminRole() in
+// internal/crm/transport/http/routes.go::Mount; the matrix entry that
+// supports it is authapi.ActionProjectCreate, granted only to
+// authapi.RoleAdmin (see internal/auth/service/rbac.go). Operator is
+// excluded by the matrix; the transport guard rejects with 403 before
+// the service is reached.
+//
+// Both accounts live under the SAME tenant: the test is about role
+// gating, not cross-tenant boundary (which is covered separately by
+// TestSmoke_TenantIsolation). Reusing SeedTenantAndAdmin + SeedOperator
+// against the same TenantID keeps the surface minimal.
+func TestSmoke_RbacEnforcement(t *testing.T) {
+	t.Parallel()
+
+	stack := smoke.GetSharedStack(t)
+	httpAddr, _ := bootAPI(t, stack)
+
+	admin := smoke.SeedTenantAndAdmin(t, stack, "SMOKE-RBAC", "rbac-admin", "AdminPass123!")
+	operator := smoke.SeedOperator(t, stack, admin.TenantID, "rbac-operator", "OperatorPass123!")
+
+	ctx := t.Context()
+	cli := &http.Client{Timeout: 10 * time.Second}
+
+	adminJWT := loginAndAccessToken(ctx, t, cli, httpAddr, admin)
+	operatorJWT := loginAndAccessToken(ctx, t, cli, httpAddr, operator)
+
+	// Project codes are tenant-unique; use distinct codes so the operator
+	// 403 path and the admin 201 path don't collide on the unique index.
+	operatorPayload := `{"code":"rbac-operator-proj","name":"Operator forbidden project"}`
+	adminPayload := `{"code":"rbac-admin-proj","name":"Admin allowed project"}`
+
+	// Operator → 403. The requireAdminRole gate in
+	// internal/crm/transport/http/routes.go aborts before the handler;
+	// the matrix-layer Check would also reject (ActionProjectCreate is
+	// admin-only) — either failure path surfaces as 403.
+	operStatus, operBody := postWithJWT(ctx, t, cli,
+		"http://"+httpAddr+"/api/projects", operatorJWT, operatorPayload)
+	assert.Equalf(t, http.StatusForbidden, operStatus,
+		"operator must not be authorised for POST /api/projects; got %d body=%s",
+		operStatus, string(operBody))
+
+	// Admin → 201 (createProject returns http.StatusCreated on success).
+	adminStatus, adminBody := postWithJWT(ctx, t, cli,
+		"http://"+httpAddr+"/api/projects", adminJWT, adminPayload)
+	assert.Equalf(t, http.StatusCreated, adminStatus,
+		"admin must be authorised for POST /api/projects; got %d body=%s",
+		adminStatus, string(adminBody))
+}
+
+// TestSmoke_TenantIsolation — Plan 21 Task 7.
+//
+// Asserts the cross-tenant boundary across two paths:
+//
+//   - GET /api/projects/<A.id> with tenant-B JWT → 404 (RLS swallows
+//   - RequireSameTenant middleware)
+//   - POST /api/calls/<A.id>/hangup with tenant-B JWT → 404 (Plan 21
+//     Task 3 regression net via the dialer's CallTenantResolver)
+//
+// The two assertions cover the two known classes of cross-tenant leak
+// the platform defends against today. A future regression where either
+// the projectTenantResolver or callTenantResolveFn loses its
+// RequireSameTenant wrapper surfaces here.
+func TestSmoke_TenantIsolation(t *testing.T) {
+	t.Parallel()
+
+	stack := smoke.GetSharedStack(t)
+	httpAddr, _ := bootAPI(t, stack)
+
+	tenantA := smoke.SeedTenantAndAdmin(t, stack, "SMOKE-ISO-A", "iso-admin-a", "PassA123!")
+	tenantB := smoke.SeedTenantAndAdmin(t, stack, "SMOKE-ISO-B", "iso-admin-b", "PassB123!")
+
+	projectA := smoke.SeedProject(t, stack, tenantA.TenantID, "iso-proj-a", "Project A")
+	callA := smoke.SeedCall(t, stack, tenantA.TenantID, projectA)
+
+	ctx := t.Context()
+	cli := &http.Client{Timeout: 10 * time.Second}
+	jwtB := loginAndAccessToken(ctx, t, cli, httpAddr, tenantB)
+
+	// 1. Tenant B reads Tenant A's project → 404.
+	getStatus, getBody := getWithJWT(ctx, t, cli,
+		"http://"+httpAddr+"/api/projects/"+projectA.String(), jwtB)
+	assert.Equalf(t, http.StatusNotFound, getStatus,
+		"cross-tenant project read must 404 (RLS + RequireSameTenant); got %d body=%s",
+		getStatus, string(getBody))
+
+	// 2. Tenant B attempts to hangup Tenant A's call → 404
+	// (Plan 21 Task 3 regression net via dialer.CallTenantResolver).
+	// Body is `{}` because hangup has no required input — the URL :id
+	// is the sole identifier.
+	hangupStatus, hangupBody := postWithJWT(ctx, t, cli,
+		"http://"+httpAddr+"/api/calls/"+callA.String()+"/hangup", jwtB, `{}`)
+	assert.Equalf(t, http.StatusNotFound, hangupStatus,
+		"cross-tenant hangup must 404 (Plan 21 Task 3 regression net); got %d body=%s",
+		hangupStatus, string(hangupBody))
+}
+
+// loginAndAccessToken issues POST /api/auth/login with acc's seeded
+// credentials and returns the freshly-minted access_token. Failures at
+// any step (build / transport / non-200 / decode / empty token) fail
+// the test via require — the helper is for the happy path where login
+// is a prerequisite, not the assertion under test.
+//
+// Extracted from TestSmoke_AuthFullFlow's inline login step so the
+// Plan 21 Task 7 scenarios (which need the JWT but don't re-assert the
+// auth flow) stay readable.
+func loginAndAccessToken(ctx context.Context, t *testing.T, cli *http.Client, addr string, acc smoke.SeededAccount) string {
+	t.Helper()
+	loginBody := fmt.Sprintf(`{"org_id":%q,"login":%q,"password":%q}`,
+		acc.OrgCode, acc.Login, acc.Password)
+	status, body := postJSONAndRead(ctx, t, cli,
+		"http://"+addr+"/api/auth/login", loginBody)
+	require.Equalf(t, http.StatusOK, status,
+		"login must 200 for seeded account %s/%s; got %d body=%s",
+		acc.OrgCode, acc.Login, status, string(body))
+
+	var login struct {
+		AccessToken string `json:"access_token"`
+	}
+	require.NoError(t, json.Unmarshal(body, &login),
+		"decode login response for %s/%s: %s", acc.OrgCode, acc.Login, string(body))
+	require.NotEmptyf(t, login.AccessToken,
+		"access_token must be present in login response for %s/%s", acc.OrgCode, acc.Login)
+	return login.AccessToken
+}
+
+// postWithJWT issues a POST against url with body, attaching the
+// supplied JWT as a Bearer token. Mirrors postJSONAndRead's contract
+// — body is always closed, status + bytes are returned for the caller
+// to assert. Content-Type is set to application/json so handlers that
+// gate on it (ShouldBindJSON) parse the body.
+//
+// JWT is sent verbatim in the Authorization header; we do NOT log it
+// per CLAUDE.md golang-security guidance (tokens are credentials).
+func postWithJWT(ctx context.Context, t *testing.T, cli *http.Client, url, jwt, body string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, strings.NewReader(body))
+	require.NoError(t, err, "build POST %s", url)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := cli.Do(req)
+	require.NoError(t, err, "POST %s", url)
+	defer func() { _ = resp.Body.Close() }()
+	buf, err := io.ReadAll(resp.Body)
+	require.NoError(t, err, "read body for POST %s", url)
+	return resp.StatusCode, buf
+}
+
+// getWithJWT issues a GET against url, attaching the supplied JWT as a
+// Bearer token. Mirrors postWithJWT for read paths.
+func getWithJWT(ctx context.Context, t *testing.T, cli *http.Client, url, jwt string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	require.NoError(t, err, "build GET %s", url)
+	req.Header.Set("Authorization", "Bearer "+jwt)
+	resp, err := cli.Do(req)
+	require.NoError(t, err, "GET %s", url)
+	defer func() { _ = resp.Body.Close() }()
+	buf, err := io.ReadAll(resp.Body)
+	require.NoError(t, err, "read body for GET %s", url)
+	return resp.StatusCode, buf
+}
