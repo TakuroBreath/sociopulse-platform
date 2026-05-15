@@ -222,14 +222,52 @@ If `dialer.CallResolver` already exists (Plan 11.4 wired `realtime.CallResolver`
 3. **What's the cmd/api binary doing in CI smoke?** It runs as a goroutine in the same process as the test, NOT as a separate binary. This matches `cmd/api/main_test.go::TestRunStartsAndShutsDownCleanly` and avoids the `os/exec` complexity of attaching to a child process.
 4. **Should TestSmoke_TenantIsolation also exercise `:id/hangup`?** Yes — that's the regression net for the Task 3 fix. The scenario tests at minimum: GET `/api/projects/:id` (covered by Plan 13.2.5), POST `/api/calls/:id/hangup` (new, this plan).
 
-## 6. Production lessons (post-execution YYYY-MM-DD — fill at close-out)
+## 6. Production lessons (post-execution 2026-05-15)
 
-<!-- Filled at close-out per CLAUDE.md rule #8. Examples of what to capture:
-- Container startup timing on CI vs local
-- Any module-wiring gotchas that surfaced during Task 1/2
-- Any test flakes and what fixed them (port-bind races, JetStream stream lag, etc.)
-- testcontainers-go API quirks discovered via context7
-- Whether the per-`TestMain` shared-stack decision held up
--->
+### Architecture / wiring
 
-(Filled at close-out.)
+1. **`tenancy.Module.Register` is nil-no-op without the blank-import.** `internal/tenancy/module.go:50-52` checks `if api.Register == nil { return nil }`. The slot is filled by `init()` in `internal/tenancy/service/register.go`. cmd/api MUST blank-import the service package (`_ "github.com/sociopulse/platform/internal/tenancy/service"`); without it the module reports `"registered"` in logs but publishes zero locator entries, and auth/crm/surveys downstream consumers fail with `auth: tenancy.TenantService not registered`. The unit-test `TestBuildProviders_TenancyIsFirstEntry` pins both presence AND the blank-import effect (`require.NotNil(t, tenancyapi.Register, ...)`).
+
+2. **`auth.Module.Register` requires `Config.Auth.JWT.Secret` non-empty + `mapstructure` binding active.** The original Plan 04 / 05 design left `JWTConfig.Secret` with `mapstructure:"-"` because "production loads from Lockbox at runtime". In practice, this blocked auth.Register from EVER succeeding in any in-process boot path (dev / smoke / unit-test) because the field had no other write path. Plan 21 Task 6 removed the tag; production hygiene is enforced by `cfg.Validate()` (config.go:96 requires `SecretLockboxKey` when env=production). The env var `SOCIOPULSE_AUTH_JWT_SECRET` is the canonical prod path via Kubernetes Secret → viper AutomaticEnv → `pkg/config`. This unblocks Plan 14's open follow-up #1 ("auth not in cmd/api registry").
+
+3. **gin's URL wildcard names must agree across modules sharing a path-position.** dialer mounted `/api/calls/:id/{status,hangup}` (Plan 10); recording mounted `/api/calls/:call_id/recording{,/verify}` (Plan 12.3) — both into the same gin engine. When auth WARN-skipped (Plan 14 era), some module-ordering edge cases masked the conflict; Plan 21 Task 2 stabilised the providers walk, and the full registration triggered `panic: ':call_id' conflicts with existing wildcard ':id'`. Fix: rename URL wildcards to a project-wide convention (`:id` won). The structured-log field names + JSON tags (`json:"call_id"`) are INDEPENDENT of URL routing — those stayed `call_id` because they're wire/storage contracts.
+
+4. **asynq's `*FromRedisClient` constructors are mandatory when multiple asynq components share a Redis client.** `crm.Module.Register` originally used `asynq.NewServer/NewClient/NewScheduler` with `RedisConnOpt`. Each component then independently calls `broker.Close()` (which closes the underlying client) at Shutdown. With the providers walk activating multiple asynq users in the same cmd/api process, the first Shutdown closes the client, and sibling subscribers' next pubsub read panics on a nil message (`subscriber.go:83` in asynq@v0.26.0). Plan 21 Task 2 switched all three constructors to `*FromRedisClient` (sharedConnection=true), and `Stop()` now drops the client reference rather than calling `Close` (which would return a non-fatal but useless "redis connection is shared" error).
+
+5. **`tenancy_admin` SELECT grants on tenant-scoped tables are required for any new `BypassRLS` read path.** Plan 12.4 added grant migration `000011` for `call_recordings`; Plan 21 Task 3 added `000014` for `calls`. Without the grant, `pool.BypassRLS` (which `SET LOCAL ROLE tenancy_admin`) fails with `42501 permission_denied`. Pattern: any new `*Resolver` adapter that uses `BypassRLS` requires a parallel grant migration. Writes stay under `pool.WithTenant`, so no INSERT/UPDATE grants on the same migration — read-only.
+
+### Testing harness
+
+6. **`TESTCONTAINERS_RYUK_DISABLED=true` is mandatory on macOS Docker.** testcontainers-go's "ryuk" reaper container spawns a goroutine `(*Reaper).connect.func1` in `reaper.go:535` that does NOT terminate within `goleak.VerifyTestMain`'s window. `tests/smoke/stack.go::init()` sets the env var before any container starts; the CI job sets it at the job level too. Trade-off: a test panic mid-run leaves orphan containers; clean with `docker ps -a --filter label=org.testcontainers=true -q | xargs docker rm -f`. The references file flagged this in § 4.1 before execution; the implementer's first Task 4 commit (`76a77a8`) shipped a README mention but didn't APPLY the workaround — the test was red until `fbe9fad` fixup. Lesson: an env-var workaround documented in README is not the same as an env-var workaround applied in code.
+
+7. **golang-migrate inline is simpler than refactoring cmd/migrator.** The plan offered three migration-runner options for the smoke harness: (i) os/exec the binary, (ii) refactor cmd/migrator's main() to expose a Go entry, (iii) call golang-migrate/migrate/v4 directly. Option (iii) won because golang-migrate was already in go.mod; the harness imports `"github.com/golang-migrate/migrate/v4"` + the postgres+file driver blank-imports, then `migrate.New("file://"+repoRoot+"/migrations", dsn).Up()` against the testcontainer DSN. Zero cmd/migrator changes. ~10 LoC.
+
+8. **Per-`TestMain` shared stack is the right granularity for smoke.** One PG + Redis + NATS set, all smoke tests in the package reuse. Per-test isolation via `t.Cleanup` row-deletion in seed helpers. Cold container pulls ~90 s (first test); warm steady-state ~6–9 s per scenario. Per-test container teardown would multiply the cost 5× without a real benefit (the harness is fast enough that scenarios serialise the boot via `sync.Once` on the shared stack initialiser).
+
+9. **`cmd/api/main.run()` stays unexported.** The plan offered two paths for exposing the composition root to smoke: (a) extract `run` into a public `cmd/api/internal/runner` package, or (b) place smoke tests INSIDE `cmd/api/` so they can call `run()` directly. (b) won — the extract would cascade ~1700 LoC across 12 helper files (postgres.go / redis.go / eventbus.go / server.go / providers.go / modules.go / realtime.go / recording.go / recording_resolver.go all transitively reference `run()`'s locals). Path-of-least-surface: reusable harness LIBRARY in `tests/smoke/` (Stack, helpers, seeds), one smoke TEST file `cmd/api/smoke_test.go` that calls `run()`. The pattern matches the pre-existing `cmd/api/main_test.go::TestRunStartsAndShutsDownCleanly`.
+
+10. **JetStream wildcard streams must be pre-provisioned BEFORE cmd/api boot.** `cmd/api/main.go:485` — the realtime dispatcher's subscriber treats "no stream matches subject" as a hard error. The smoke harness mirrors `cmd/api/main_test.go::ensureTestStream`: connect to NATS, `AddStream(InterestPolicy + MemoryStorage)` for `tenant.>` and `trunks.>`. Memory storage so containers don't accumulate state. Pre-provisioning is in `bootAPI` (not `newSmokeStack`) so each test re-arms streams in case a previous scenario consumed messages.
+
+### Auth / RBAC
+
+11. **The login DTO uses `org_id` not `org_code` — verified, not assumed.** `internal/auth/transport/http/dto.go:23` — `OrgID string \`json:"org_id" binding:"required,min=1,max=64"\``. The plan's example used `org_code` (matching the DB column `tenants.org_code`); the wire path uses `org_id`. The plan's references file should have caught this; future plans must verify both DB column AND HTTP DTO when writing scenarios. (`SeededAccount` carries `OrgCode` semantically — the value passed to login is the same string regardless of the field-name spelling on either side.)
+
+12. **`users.roles` is `text[]` not `text`** (per `migrations/000005_auth.up.sql` — verify before seeding). The original Plan 05 design had `role text` single-valued; Plan 13.2.5 expanded to multi-role via `roles []string` in JWT claims. The seed `INSERT INTO users ... VALUES (..., ARRAY['admin']::text[], ...)` for admin and `ARRAY['operator']::text[]` for operator.
+
+13. **`projects.customer` reads as `string` not `*string` in `ProjectStore.scanRow`.** A NULL value in this column makes `pgx.Scan` fail, and the BypassRLS resolver in `RequireSameTenant` returns a generic error which the middleware downgrades to **500** (not 404). The seed MUST set `customer=''` (empty string) explicitly. This is a latent bug in `crm/store/project_store.go` (the type should be `*string` or `sql.NullString`) — out of scope for Plan 21, but the seed comment flags it for future cleanup.
+
+### Operational
+
+14. **POST /api/calls/:id/hangup cross-tenant smoke regression net.** The Plan 13.2.5 audit found this gap and deferred to "Plan 14". Plan 21 actually closed it with `RequireSameTenant` + new `CallTenantResolver` port. The smoke-level regression net is `TestSmoke_TenantIsolation` which exercises both the existing `GET /api/projects/:id` cross-tenant path (RLS + middleware) AND the new `POST /api/calls/:id/hangup` path. Future cross-tenant fixes should follow the same pattern: middleware FRONT (`RequireSameTenant(resolveFn)`) + explicit-`callerTenantID`-param BACK + smoke regression test.
+
+15. **CI smoke job runtime ~3–5 min on cold cache, ~1 min on warm.** Pre-pull `postgres:16 / redis:7 / nats:2.10` in the workflow step before `make test-smoke` to keep first-pull tail latency out of the timeout budget. 20-minute job timeout is conservative; in practice the run completes in 2–3 minutes warm. The `build` job's `needs: [lint, test, smoke]` gates v* tag pushes on smoke green, so a flaky smoke is a production block — the per-`TestMain` shared-stack pattern is critical to keep flakes near-zero (per-test fresh containers would 5× the duration AND multiply Docker daemon races by 5).
+
+### Phase-1b (deferred, captured here so future agents know what's left)
+
+16. **The remaining 4 Phase-1 scenarios** (project import / operator WS / surveys CRUD / recording stream / 152-FZ purge) need:
+    - MinIO testcontainer (recording stream, project import async result)
+    - asynq Worker harness for cmd/worker integration (project import, 152-FZ purge)
+    - `coder/websocket` client wrapper (operator WS pipeline)
+    - Injectable clock (152-FZ purge — fast-forward 30 days)
+    - Survey schema fixtures (surveys CRUD)
+    Each is a logical Phase-1b task. The Plan 21 harness shape extends naturally; no rewrites needed.

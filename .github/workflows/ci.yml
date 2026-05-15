@@ -71,11 +71,41 @@ jobs:
           path: coverage.html
           retention-days: 7
 
+  smoke:
+    name: Smoke (e2e)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # Parallel to test/lint — needs nothing else; Docker is provided by the
+    # GitHub Actions ubuntu runner image. Tag-push deploy gates on this
+    # via the `build` job's needs list below.
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+      - name: Pre-pull testcontainer base images
+        # Warms the daemon cache so the first test doesn't time-pull. The
+        # smoke harness uses postgres:16 / redis:7 / nats:2.10 — pin via
+        # tests/smoke/stack.go if these drift.
+        run: |
+          docker pull postgres:16
+          docker pull redis:7
+          docker pull nats:2.10
+      - name: Run smoke suite
+        env:
+          # Plan 21 references § 4.1 — disable ryuk reaper to avoid
+          # goleak's false-positive on the reaper's connect goroutine.
+          # tests/smoke/stack.go::init() also sets this; double-set is
+          # idempotent.
+          TESTCONTAINERS_RYUK_DISABLED: "true"
+        run: make test-smoke
+
   build:
     name: Build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    needs: [lint, test]
+    needs: [lint, test, smoke]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-go@v5
