@@ -68,10 +68,13 @@ const minimalValidSurveySchemaJSON = `{
 // row. The bytes are returned as a fresh slice on each call —
 // callers may safely mutate them (e.g. to inject a deliberate failure
 // for negative scenarios) without affecting subsequent calls.
+//
+// The []byte(string) conversion is the idiomatic Go way to obtain an
+// independently-mutable copy of an immutable string constant; the
+// compiler emits the same memcpy as a hand-written make+copy without
+// the extra source-line noise.
 func MinimalValidSurveySchema() []byte {
-	out := make([]byte, len(minimalValidSurveySchemaJSON))
-	copy(out, minimalValidSurveySchemaJSON)
-	return out
+	return []byte(minimalValidSurveySchemaJSON)
 }
 
 // SeedSurvey inserts ONE surveys row directly via pgx and returns the

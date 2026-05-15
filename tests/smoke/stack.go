@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -23,7 +24,6 @@ import (
 	// pointing at the repo's migrations/ directory are handled by this
 	// driver.
 	_ "github.com/golang-migrate/migrate/v4/source/file"
-	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcnats "github.com/testcontainers/testcontainers-go/modules/nats"
@@ -137,12 +137,24 @@ var resetTables = []string{
 }
 
 // Reset truncates the per-tenant tables Phase-1b scenarios mutate so a
-// fresh test starts from a clean slate. Runs as the testcontainer's
-// superuser (which carries BYPASSRLS via the 000001 grants), so RLS is
-// not consulted — every tenant's rows fall in one statement.
+// fresh test starts from a clean slate. Runs via postgres.Pool.RawExec
+// (documented as "for migrations and for testing only"), which executes
+// as the underlying pool user — the testcontainer's smoke superuser —
+// not as tenancy_admin. We need superuser because tenancy_admin
+// deliberately lacks TRUNCATE / DELETE grants on call_recordings (see
+// migration 000011_admin_grants_call_recordings: only SELECT, UPDATE
+// are granted to keep the retention-pipeline blast radius small).
+// BypassRLS would route through tenancy_admin and fail 42501 on
+// call_recordings, so we use RawExec instead.
 //
 // Plan 21 Task 4 left this as a no-op stub; Plan 21b Task 1 fills it
 // in with the canonical TRUNCATE list.
+//
+// Reuses the cached *postgres.Pool (Stack.PgPool) so Reset costs one
+// pool-Acquire instead of a fresh pgx.Connect + Close round-trip per
+// call. The previous revision opened a brand-new TCP connection on
+// every invocation, which is wasteful and dropped a pgx.Connect call
+// site into stack.go that the project's canonical surface now subsumes.
 //
 // Reset is safe to call from t.Cleanup or at the top of a test. It
 // holds no state across calls. A failing TRUNCATE is fatal to the
@@ -151,31 +163,19 @@ var resetTables = []string{
 func (s *Stack) Reset(t *testing.T) {
 	t.Helper()
 	ctx := t.Context()
-
-	conn, err := pgx.Connect(ctx, s.PostgresDSN)
-	require.NoError(t, err, "smoke reset: connect to %s", s.PostgresDSN)
-	defer func() { _ = conn.Close(context.Background()) }()
+	pool := s.PgPool(t)
 
 	// Single TRUNCATE statement with CASCADE so FK dependencies between
 	// the listed tables are followed automatically (e.g. operator_state_log
 	// → operator_sessions). RESTART IDENTITY resets serial sequences so
 	// scenario assertions against monotonic ids stay stable across reruns.
-	stmt := "TRUNCATE " + commaJoin(resetTables) + " RESTART IDENTITY CASCADE"
-	_, err = conn.Exec(ctx, stmt)
+	// resetTables is a package-level constant slice, so the SQL string is
+	// effectively a compile-time literal — there is no user-supplied
+	// input that could inject SQL here.
+	// #nosec G201 -- resetTables is a package-level constant literal slice; no user input
+	stmt := "TRUNCATE " + strings.Join(resetTables, ", ") + " RESTART IDENTITY CASCADE"
+	_, err := pool.RawExec(ctx, stmt)
 	require.NoError(t, err, "smoke reset: %s", stmt)
-}
-
-// commaJoin renders a comma-separated SQL identifier list. Implemented
-// inline to avoid a strings import drag on stack.go for one call site.
-func commaJoin(items []string) string {
-	out := make([]byte, 0, 128)
-	for i, it := range items {
-		if i > 0 {
-			out = append(out, ", "...)
-		}
-		out = append(out, it...)
-	}
-	return string(out)
 }
 
 // PgPool returns a lazily-built *postgres.Pool against the smoke
@@ -190,12 +190,19 @@ func commaJoin(items []string) string {
 // the testcontainer Postgres has the connection budget for one extra
 // concurrent pool.
 //
+// The constructor uses context.Background() (NOT t.Context()) because
+// the pool outlives the test that triggered the sync.Once initialiser.
+// If we passed t.Context() into postgres.Open, a sibling test running
+// in parallel that observed a Done t.Context could see Pool methods
+// returning context-cancelled errors. ConnectTimeout already bounds
+// the open attempt, so the unbounded parent is benign.
+//
 // Returns nil + fatal-fails the test on first-call failure. Subsequent
 // calls return the cached pool (or re-fail with the same error).
 func (s *Stack) PgPool(t *testing.T) *postgres.Pool {
 	t.Helper()
 	s.pgPoolOnce.Do(func() {
-		pool, err := postgres.Open(t.Context(), postgres.Config{
+		pool, err := postgres.Open(context.Background(), postgres.Config{
 			DSN:            s.PostgresDSN,
 			MaxConns:       4,
 			ConnectTimeout: 10 * time.Second,

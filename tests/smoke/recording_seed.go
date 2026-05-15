@@ -49,6 +49,15 @@ var smokeRecordingPlaintext = bytes.Repeat([]byte("OpusFakeAudio16!"), 256)
 // (0xab/0xcd × 16) in any hex-dump diagnostic.
 var smokeRecordingDEK = bytes.Repeat([]byte{0xCC}, encryption.KeyLen)
 
+// syntheticRecordingDurationMS is the arbitrary duration_ms value the
+// smoke fixture writes onto the call_recordings row. The column is
+// NOT NULL in migration 000010, so the harness needs to supply a
+// plausible non-zero integer; the value is otherwise unused by any
+// scenario assertion and is NOT derived from the ciphertext byte count.
+// 32_000 ms (~32 s) sits in the plausible range for a short opinion
+// poll call without implying any real audio duration.
+const syntheticRecordingDurationMS int64 = 32_000
+
 // RecordingFixture bundles every byte / hex string a recording-stream
 // scenario needs to seed the call_recordings row + the LocalObjectStore
 // blob. Constructed by BuildRecordingFixture; consumed by SeedRecording
@@ -208,7 +217,7 @@ func SeedRecording(
 		recordingID, callID, tenantID,
 		fixture.Bucket, fixture.Key,
 		fixture.KMSKeyID, wrappedDEK,
-		int64(len(fixture.Ciphertext)), int64(len(fixture.Plaintext))*8, fixture.SHA256Hex, // duration_ms — synthetic but non-zero
+		int64(len(fixture.Ciphertext)), syntheticRecordingDurationMS, fixture.SHA256Hex,
 		"opus", int32(48000), "stored",
 		now, deleteAt, coldAt, now, "smoke-test-ingest",
 	)

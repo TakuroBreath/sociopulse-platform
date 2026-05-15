@@ -2,12 +2,16 @@
 
 package main
 
-import recwire "github.com/sociopulse/platform/internal/recording/wire"
+import (
+	"sync/atomic"
+
+	recwire "github.com/sociopulse/platform/internal/recording/wire"
+)
 
 // smokeOverrideRecordingPorts is consulted by buildRecordingPorts (in
 // recording.go) BEFORE calling recwire.LocalPorts. The smoke build tag
 // activates this file; production builds get the !smoke variant from
-// smoke_overrides_prod.go which always returns nil.
+// smoke_overrides_prod.go which leaves the atomic empty (Load returns nil).
 //
 // Smoke tests populate this seam via SetSmokeRecordingPorts BEFORE
 // invoking bootAPI so the cmd/api process and the test share ONE
@@ -19,11 +23,19 @@ import recwire "github.com/sociopulse/platform/internal/recording/wire"
 // a fresh empty LocalObjectStore at boot and ErrObjectNotFound the
 // scenario.
 //
+// Stored as atomic.Pointer (Plan 21b Task 1 review fix-up): the
+// previous plain *recwire.Ports field was written by the test goroutine
+// (SetSmokeRecordingPorts) and read by the cmd/api boot goroutine
+// (buildRecordingPorts) with no synchronisation. Even though canonical
+// usage publishes BEFORE bootAPI starts the goroutine, `-race` would
+// flag any future test that reused the seam from a different
+// goroutine. atomic.Pointer is one line and removes the foot-gun.
+//
 // Build-tag isolation: production binaries (no smoke tag) compile the
 // !smoke twin file in this package; the smoke tag swaps it with this
 // one. Either way, the symbol exists with the same package-private
 // scope, so buildRecordingPorts has a single uniform call site.
-var smokeOverrideRecordingPorts *recwire.Ports
+var smokeOverrideRecordingPorts atomic.Pointer[recwire.Ports]
 
 // SetSmokeRecordingPorts injects the smoke test's *recwire.Ports so the
 // next buildRecordingPorts call returns it instead of building a fresh
@@ -33,7 +45,7 @@ var smokeOverrideRecordingPorts *recwire.Ports
 // Idempotent — overwriting with a fresh value is fine; passing nil
 // reverts to the LocalPorts fall-through.
 func SetSmokeRecordingPorts(p *recwire.Ports) {
-	smokeOverrideRecordingPorts = p
+	smokeOverrideRecordingPorts.Store(p)
 }
 
 // GetSmokeRecordingPorts returns the currently-installed override (or
@@ -42,5 +54,5 @@ func SetSmokeRecordingPorts(p *recwire.Ports) {
 // the same store the handler reads from is the entire point of the
 // override seam.
 func GetSmokeRecordingPorts() *recwire.Ports {
-	return smokeOverrideRecordingPorts
+	return smokeOverrideRecordingPorts.Load()
 }

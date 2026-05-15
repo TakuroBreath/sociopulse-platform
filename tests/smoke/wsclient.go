@@ -4,8 +4,10 @@ package smoke
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
+	"sync"
 	"testing"
 	"time"
 
@@ -22,8 +24,14 @@ import (
 // because the dialer's WS handler does not consume client frames as
 // data (only control frames drive ping/pong). Future scenarios that
 // need to send data add a Write* method here.
+//
+// closeOnce gates Close so callers that invoke it from a defer AND
+// from a test failure path do not race on the underlying conn — the
+// second call is a no-op (returns the cached err from the first call).
 type OperatorWS struct {
-	conn *websocket.Conn
+	conn      *websocket.Conn
+	closeOnce sync.Once
+	closeErr  error
 }
 
 // DialOperator opens a WebSocket connection to /api/operator/ws on
@@ -119,7 +127,7 @@ func buildOperatorWSURL(addr, jwt string) string {
 //     malformed JSON).
 func (w *OperatorWS) ReadEvent(ctx context.Context, timeout time.Duration) (map[string]any, error) {
 	if w == nil || w.conn == nil {
-		return nil, fmt.Errorf("smoke: OperatorWS.ReadEvent on nil/closed connection")
+		return nil, errors.New("smoke: OperatorWS.ReadEvent on nil/closed connection")
 	}
 	rctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
@@ -131,9 +139,16 @@ func (w *OperatorWS) ReadEvent(ctx context.Context, timeout time.Duration) (map[
 }
 
 // Close issues a normal-closure WebSocket frame and returns. Idempotent
-// + nil-safe so deferred cleanups don't double-close. Errors are
-// returned to the caller for telemetry; Plan-21-style t.Cleanup
-// invocations typically discard them.
+// + nil-safe so deferred cleanups don't double-close. Errors from the
+// first call are returned to the caller for telemetry; subsequent calls
+// return the cached error from the first close. Plan-21-style t.Cleanup
+// invocations typically discard the return value.
+//
+// Order matters: we Close the conn FIRST, cache the err, and only THEN
+// observably "null" the receiver state via sync.Once. The previous
+// revision nulled `conn` BEFORE the close call returned, so a caller
+// that wanted to retry on a transient close error had no conn left to
+// retry against. sync.Once also makes the close-twice case explicit.
 //
 // The "graceful close" frame mirrors the dialer's own
 // closeGracefully(websocket.StatusNormalClosure, "") in
@@ -143,7 +158,8 @@ func (w *OperatorWS) Close() error {
 	if w == nil || w.conn == nil {
 		return nil
 	}
-	err := w.conn.Close(websocket.StatusNormalClosure, "smoke test done")
-	w.conn = nil
-	return err
+	w.closeOnce.Do(func() {
+		w.closeErr = w.conn.Close(websocket.StatusNormalClosure, "smoke test done")
+	})
+	return w.closeErr
 }

@@ -23,17 +23,20 @@ import (
 	"github.com/sociopulse/platform/tests/smoke"
 )
 
-// TestHarness_DialOperator_WrongTokenRejected exercises smoke.DialOperator
-// against an unreachable endpoint to assert the helper surfaces a
-// dial / handshake failure as a non-nil error rather than panicking on a
-// nil conn. Plan 21b Task 1 ships the helper; the substantive
-// scenario 3 lands in Plan 21b Task 3 against a live cmd/api boot.
+// TestHarness_DialOperator_DialFailureSurfacesError exercises
+// smoke.DialOperator against an unreachable endpoint to assert the
+// helper surfaces a dial / handshake failure as a non-nil error rather
+// than panicking on a nil conn. Plan 21b Task 1 ships the helper; the
+// substantive scenario 3 lands in Plan 21b Task 3 against a live cmd/api
+// boot.
 //
 // The point of this self-test is the contract: DialOperator MUST return
-// a non-nil error when the WS upgrade fails. We aim it at a port nobody
-// is listening on so the kernel sends ECONNREFUSED — exercising the
-// error-return path without standing up cmd/api.
-func TestHarness_DialOperator_WrongTokenRejected(t *testing.T) {
+// a non-nil error when the TCP dial fails. We aim it at a free port
+// nobody is listening on so the kernel sends ECONNREFUSED — exercising
+// the error-return path without standing up cmd/api. (Despite the
+// "bogus-token" string, no token-validation logic runs here; the dial
+// never reaches a WS handler.)
+func TestHarness_DialOperator_DialFailureSurfacesError(t *testing.T) {
 	t.Parallel()
 
 	addr := smoke.PickFreeAddr(t)
@@ -153,6 +156,17 @@ func TestHarness_BuildCSVImport_FormatMatches(t *testing.T) {
 // returned by smoke.FutureClock advances time forward by the supplied
 // duration. Scenario 8 uses this with 31 days to fast-forward past the
 // 30-day soft-delete grace window.
+//
+// We snapshot time.Now() BOTH before AND after the clock() call and
+// assert two-sided bounds:
+//
+//	nowBefore + offset  <=  got  <=  nowAfter + offset + 1ms
+//
+// The 1ms upper tolerance covers the gap between the time.Now() call
+// inside clock() and the third one we take here for nowAfter. Without
+// the two-sided check, a previous revision compared (now+offset) against
+// (now+offset-1s) — a tautology that would pass even if FutureClock
+// ignored its argument entirely.
 func TestHarness_FutureClock_Returns_AddedDuration(t *testing.T) {
 	t.Parallel()
 
@@ -160,13 +174,14 @@ func TestHarness_FutureClock_Returns_AddedDuration(t *testing.T) {
 	clock := smoke.FutureClock(offset)
 	require.NotNil(t, clock, "FutureClock must return a non-nil closure")
 
-	// Take the lower-bound BEFORE invoking the clock so a slow goroutine
-	// schedule does not mask a buggy implementation that returns a stale
-	// time.
-	lower := time.Now().Add(offset - time.Second)
+	nowBefore := time.Now()
 	got := clock()
-	assert.True(t, got.After(lower),
-		"FutureClock() = %v, want >= now+offset - 1s (%v)", got, lower)
+	nowAfter := time.Now()
+
+	require.GreaterOrEqual(t, got, nowBefore.Add(offset),
+		"FutureClock returned %v < nowBefore+offset %v — offset not applied", got, nowBefore.Add(offset))
+	require.LessOrEqual(t, got, nowAfter.Add(offset).Add(time.Millisecond),
+		"FutureClock returned %v > nowAfter+offset+1ms %v — offset over-applied", got, nowAfter.Add(offset))
 }
 
 // TestHarness_Stack_Reset_TruncatesSeededRow seeds one respondent under
@@ -176,9 +191,20 @@ func TestHarness_FutureClock_Returns_AddedDuration(t *testing.T) {
 // behaviour at the harness boundary so a future regression in the
 // TRUNCATE list surfaces here, not at the first scenario that fails to
 // observe a clean slate.
-func TestHarness_Stack_Reset_TruncatesSeededRow(t *testing.T) {
-	t.Parallel()
-
+//
+// TestHarness_Stack_Reset_TruncatesSeededRow does NOT run t.Parallel().
+// Stack.Reset TRUNCATEs container-global tables (respondents, calls,
+// surveys, call_recordings, etc.) shared across the whole TestMain
+// process. A parallel sibling test that inserts into any of those
+// tables would lose its rows mid-execution.
+//
+// All sibling tests in this binary either do NOT touch tables in the
+// reset list (PgPool/FutureClock/MinimalValidSurveySchema/DialOperator)
+// or consume their rows synchronously in-memory before yielding control
+// (BuildRecordingFixture). When ADDING new harness self-tests to this
+// binary, mark them sequential (no t.Parallel) if they insert into any
+// of the tables enumerated in resetTables in stack.go.
+func TestHarness_Stack_Reset_TruncatesSeededRow(t *testing.T) { //nolint:paralleltest // TRUNCATE is container-global; parallel siblings would lose rows mid-execution
 	stack := smoke.GetSharedStack(t)
 
 	acc := smoke.SeedTenantAndAdmin(t, stack, "SMOKE-RESET", "reset-admin", "ResetPass123!")

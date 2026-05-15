@@ -38,21 +38,26 @@ func recordingGRPCConfig(c config.RecordingConfig) *grpcserver.Config {
 // buildRecordingPorts is the indirection the smoke build tag uses to
 // inject a pre-populated *recwire.Ports into cmd/api boot. Production
 // builds (no smoke tag) compile smoke_overrides_prod.go which leaves
-// smokeOverrideRecordingPorts nil — this function then falls through to
-// recwire.LocalPorts unchanged.
+// the atomic empty — Load returns nil — so this function falls through
+// to recwire.LocalPorts unchanged.
 //
 // Smoke builds (//go:build smoke) compile smoke_overrides.go which
-// declares the same package-private symbol mutable; smoke tests call
-// SetSmokeRecordingPorts BEFORE bootAPI to install a shared instance.
-// At boot, this function returns the override and the recording handler
-// reads back the same in-memory blob the test pre-Put.
+// exposes SetSmokeRecordingPorts; smoke tests call it BEFORE bootAPI
+// to install a shared instance. At boot, this function returns the
+// override and the recording handler reads back the same in-memory blob
+// the test pre-Put.
+//
+// The override is consulted via atomic.Pointer.Load so a future caller
+// of SetSmokeRecordingPorts from a different goroutine doesn't trip
+// `-race` (Plan 21b Task 1 review fix-up — the previous plain pointer
+// raced even though canonical usage publishes before bootAPI starts).
 //
 // Plan 21b § 2.6 references this seam by name; the alternative would be
 // to scatter `if smokeOverrideRecordingPorts != nil` checks at every
 // recwire.LocalPorts call site.
 func buildRecordingPorts(cfg config.RecordingConfig, logger *zap.Logger) (*recwire.Ports, error) {
-	if smokeOverrideRecordingPorts != nil {
-		return smokeOverrideRecordingPorts, nil
+	if p := smokeOverrideRecordingPorts.Load(); p != nil {
+		return p, nil
 	}
 	return recwire.LocalPorts(cfg, logger)
 }

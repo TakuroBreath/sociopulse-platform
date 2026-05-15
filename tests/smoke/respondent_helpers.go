@@ -7,7 +7,7 @@ import (
 	"context"
 	"encoding/csv"
 	"encoding/json"
-	"fmt"
+	"io"
 	"net/http"
 	"testing"
 	"time"
@@ -101,9 +101,16 @@ const importPollInterval = 250 * time.Millisecond
 // admin's access_token (operator role does NOT have access to the
 // import status endpoint per the RBAC matrix).
 //
+// Timeout policy: if t.Context() already carries a deadline, the helper
+// honours it as-is. Otherwise the helper wraps the supplied context
+// with a 30s default timeout — sufficient for the happy-path import
+// which processes in well under 1s on a warm container. Callers that
+// want a different deadline should pre-wrap t.Context() with
+// context.WithTimeout BEFORE the test invokes a helper that calls into
+// this function.
+//
 // Failure modes (all surface via t.Fatalf):
-//   - Polling deadline reached — defaults to 30 s, overridable in a
-//     future variant by extending t.Context()'s timeout before calling.
+//   - Polling deadline reached.
 //   - Non-2xx response that is also non-404 — a 404 is treated as
 //     "not yet visible to the gateway" and retried; everything else
 //     fails fast with the body for diagnostics.
@@ -115,8 +122,12 @@ const importPollInterval = 250 * time.Millisecond
 func WaitForImportStatus(t *testing.T, addr, jwt, jobID, target string) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
-	defer cancel()
+	ctx := t.Context()
+	if _, hasDeadline := ctx.Deadline(); !hasDeadline {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 30*time.Second)
+		t.Cleanup(cancel)
+	}
 
 	url := "http://" + addr + "/api/imports/" + jobID
 	cli := &http.Client{Timeout: 5 * time.Second}
@@ -191,9 +202,20 @@ func isTerminal(state, target string) bool {
 // readBodyForError reads up to 4 KiB of resp.Body for a diagnostic.
 // The body is otherwise discarded — the t.Fatalf consumer gets a short
 // hint without paging in megabytes of accidental dump.
+//
+// Uses io.ReadAll(io.LimitReader(_, maxBody)) so a body delivered in
+// multiple Read chunks (chunked transfer-encoding, or simply a server
+// flushing in pieces) is fully captured up to the cap. A single Read
+// call returns only one chunk on the wire and would truncate the
+// diagnostic to whatever fits in the first frame.
 func readBodyForError(resp *http.Response) string {
-	const cap = 4096
-	buf := make([]byte, cap)
-	n, _ := resp.Body.Read(buf)
-	return fmt.Sprintf("%s", buf[:n])
+	const maxBody = 4096
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxBody))
+	if err != nil {
+		return ""
+	}
+	return string(body)
 }
