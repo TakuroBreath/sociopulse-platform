@@ -202,6 +202,52 @@ func TestStreamRecording_RBACForbidden(t *testing.T) {
 	require.Equal(t, "auth.insufficient_role", env.Code)
 }
 
+// TestStreamRecording_RangeRejected pins ADR-0005 §15.4: the handler must
+// reject Range requests with 416 + Content-Range "bytes */*" + the
+// canonical recording.range_not_satisfiable envelope. AES-256-GCM
+// authenticates the full ciphertext, so a partial-content reply cannot
+// safely satisfy the chain-of-custody guarantee — clients have to
+// download the whole plaintext or nothing.
+//
+// The service is wired with a streamFn that would 200 + write payload if
+// the handler reached it; the test asserts the Range guard short-circuits
+// BEFORE that path runs, so we expect 416 (not 200 with truncated bytes).
+func TestStreamRecording_RangeRejected(t *testing.T) {
+	t.Parallel()
+
+	payload := []byte("hello world audio bytes")
+	streamCalled := false
+	svc := &fakeRecordingService{
+		streamFn: func(_ context.Context, _, _ uuid.UUID, _ *rapi.ByteRange) (rapi.AudioStream, error) {
+			streamCalled = true
+			return rapi.AudioStream{
+				Reader:        io.NopCloser(bytes.NewReader(payload)),
+				ContentType:   "audio/ogg",
+				ContentLength: int64(len(payload)),
+			}, nil
+		},
+	}
+	r := newRouterWithClaims(svc, adminClaims())
+
+	callID := uuid.New()
+	req := httptest.NewRequest(stdhttp.MethodGet, "/api/calls/"+callID.String()+"/recording", nil)
+	req.Header.Set("Range", "bytes=0-1023")
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	require.Equal(t, stdhttp.StatusRequestedRangeNotSatisfiable, w.Code, "body=%s", w.Body.String())
+	require.Equal(t, "none", w.Header().Get("Accept-Ranges"),
+		"Accept-Ranges: none must remain on the 416 response")
+	require.Equal(t, "bytes */*", w.Header().Get("Content-Range"),
+		"Content-Range hint per RFC 7233 §4.4 ('*' size — we did not look up the row)")
+	require.False(t, streamCalled,
+		"service.OpenAudioStream must NOT be invoked when Range was rejected")
+
+	var env transporthttp.ErrorEnvelope
+	require.NoError(t, json.Unmarshal(w.Body.Bytes(), &env))
+	require.Equal(t, "recording.range_not_satisfiable", env.Code)
+}
+
 // =============================================================================
 // searchRecordings — GET /api/recordings/search
 // =============================================================================
