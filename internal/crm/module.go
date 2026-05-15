@@ -210,12 +210,13 @@ func (m *Module) wireImportPath(d modules.Deps, svc *crmservice.RespondentServic
 }
 
 // Stop releases resources held by the module. Safe to call multiple
-// times — second invocation is a no-op.
+// times — second invocation is a no-op. Returns nil today; the
+// signature keeps `error` so future error-bearing close paths can
+// surface without breaking callers.
 func (m *Module) Stop() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	var errs []error
 	if m.asynqScheduler != nil {
 		m.asynqScheduler.Shutdown()
 		m.asynqScheduler = nil
@@ -236,17 +237,12 @@ func (m *Module) Stop() error {
 		m.asynqServer.Shutdown()
 		m.asynqServer = nil
 	}
-	if m.asynqClient != nil {
-		// Plan 21 Task 2 — the client was built via
-		// asynq.NewClientFromRedisClient (shared-connection mode), so
-		// asynq.Client.Close returns "redis connection is shared so
-		// the Client can't be closed through asynq" — cmd/api owns
-		// rdb.Close. Drop the reference rather than calling Close.
-		m.asynqClient = nil
-	}
-	if len(errs) > 0 {
-		return errors.Join(errs...)
-	}
+	// asynqClient is intentionally NOT closed — Plan 21 Task 2 switched
+	// crm to asynq.NewClientFromRedisClient (shared-connection mode);
+	// the *redis.UniversalClient lifecycle is owned by cmd/api via
+	// rdb.Close. Drop the reference; cmd/api closes the underlying
+	// pool exactly once.
+	m.asynqClient = nil
 	return nil
 }
 

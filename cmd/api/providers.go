@@ -48,7 +48,11 @@ type buildProvidersDeps struct {
 	// a deferred Stop the asynq subscriber races rdb.Close at
 	// shutdown and panics on a nil pubsub message (asynq@v0.26.0
 	// subscriber.go:83). Tests that only inspect Module.Name() may
-	// pass nil; the providers walk skips a nil-Crm entry.
+	// pass the zero value — Name() doesn't dereference its receiver,
+	// so a typed-nil *crm.Module wrapped in modules.Module is safe
+	// to walk. Tests that invoke Register MUST supply a real instance:
+	// registerModules' `mod == nil` guard catches interface-nil but
+	// NOT typed-nil pointers (Go interface-nil-vs-typed-nil gotcha).
 	Crm *crm.Module
 
 	// MetricsRegistry is the *prometheus.Registry that analytics +

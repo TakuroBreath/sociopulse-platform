@@ -387,11 +387,13 @@ func run(ctx context.Context, configDir string) error {
 		}
 	}()
 	// Plan 21 Task 2 — crm.Module owns an asynq.Server goroutine
-	// (Plan 06 Task 5). Stop drains the queue and closes the asynq
-	// client; deferring it AFTER the modules above (LIFO → executes
-	// FIRST when run() returns) keeps it ahead of the rdb.Close defer
-	// set early in run(), so asynq's pubsub channel is shut down
-	// cleanly before the underlying Redis client disappears.
+	// (Plan 06 Task 5). Stop drains the queue and DROPS the asynq
+	// client reference (cmd/api owns rdb.Close via shared-connection
+	// mode — see internal/crm/module.go::Stop). Deferring this AFTER
+	// the modules above (LIFO → executes FIRST when run() returns)
+	// keeps the asynq pubsub teardown ahead of the rdb.Close defer
+	// set early in run(), so subscribers exit cleanly before the
+	// underlying Redis client disappears.
 	defer func() {
 		if err := crmModule.Stop(); err != nil {
 			logger.Warn("crm module Stop failed", zap.Error(err))
