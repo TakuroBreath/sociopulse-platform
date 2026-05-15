@@ -56,6 +56,31 @@ const localKEKVersion = "local-v1"
 // `kms.local_key_hex`; in tests, the caller passes a freshly generated
 // value via genHexKey(t).
 func NewLocalKMSClient(masterKeyHex string) (api.KMSClient, error) {
+	return NewLocalKMSClientWithKEKs(masterKeyHex, nil)
+}
+
+// NewLocalKMSClientWithKEKs is NewLocalKMSClient extended with a map of
+// pre-registered KEKs. preKEKs maps `kek_id → 64-hex-char (32-byte) KEK
+// plaintext`; each entry is decoded and inserted into the keychain at
+// construction so subsequent Encrypt(keyID, ...) calls find the key
+// without a prior CreateKey roundtrip.
+//
+// Production composition (tenancy/module.go::buildKMSClient) passes nil
+// — KEKs are minted via TenantService.Create at tenant-onboarding time.
+// The smoke harness passes a fixture map so the asynq import handler's
+// KMS.Encrypt path finds the deterministic "smoke-kek-default" id that
+// SeedTenantAndAdmin writes into tenants.kms_kek_id; without this seam
+// the import job stalls at the first Encrypt with ErrKEKNotFound.
+//
+// Mirrors the shape of recording/wire's LocalPorts(cfg.Recording.LocalKEKs)
+// pre-registration path — both seams enable Encrypt-without-CreateKey
+// ergonomics under deterministic dev/test KEK ids.
+//
+// Errors:
+//   - masterKeyHex empty / non-hex / wrong length: per NewLocalKMSClient
+//   - any preKEKs value empty / non-hex / wrong length: returns an error
+//     identifying the offending kek_id so a malformed yaml fails fast.
+func NewLocalKMSClientWithKEKs(masterKeyHex string, preKEKs map[string]string) (api.KMSClient, error) {
 	if masterKeyHex == "" {
 		return nil, errors.New("local kms: master key hex is required")
 	}
@@ -67,9 +92,27 @@ func NewLocalKMSClient(masterKeyHex string) (api.KMSClient, error) {
 		return nil, fmt.Errorf("local kms: master key must be %d bytes (got %d)",
 			encryption.KeyLen, len(master))
 	}
+	keys := make(map[string][]byte, len(preKEKs))
+	for kekID, kekHex := range preKEKs {
+		if kekID == "" {
+			return nil, errors.New("local kms: pre-registered kek id must be non-empty")
+		}
+		if kekHex == "" {
+			return nil, fmt.Errorf("local kms: pre-registered kek %q has empty hex", kekID)
+		}
+		kekBytes, err := hex.DecodeString(kekHex)
+		if err != nil {
+			return nil, fmt.Errorf("local kms: pre-registered kek %q: decode hex: %w", kekID, err)
+		}
+		if len(kekBytes) != encryption.KeyLen {
+			return nil, fmt.Errorf("local kms: pre-registered kek %q must be %d bytes (got %d)",
+				kekID, encryption.KeyLen, len(kekBytes))
+		}
+		keys[kekID] = kekBytes
+	}
 	return &localKMSClient{
 		masterKey: master,
-		keys:      make(map[string][]byte),
+		keys:      keys,
 	}, nil
 }
 

@@ -93,6 +93,20 @@ auth:
 kms:
   provider: local
   local_key_hex: "4242424242424242424242424242424242424242424242424242424242424242"
+  # Plan 21b Task 3 — pre-register the deterministic smoke KEK that
+  # SeedTenantAndAdmin writes into tenants.kms_kek_id ("smoke-kek-default")
+  # so tenancy.KMSResolver.Encrypt finds the key without first calling
+  # KMSClient.CreateKey (the smoke seed bypasses TenantService.Create
+  # via direct SQL inserts). Without this, the crm import handler stalls
+  # at the first phone-encrypt with ErrKEKNotFound and the job never
+  # reaches the "succeeded" terminal state.
+  #
+  # The hex value is "abcd" repeated 16 times = 32 bytes after decode,
+  # deterministic across smoke runs. Mirrors the existing
+  # recording.local_keks shape (same kek_id, same hex) so a single id
+  # works for both the crm import path AND the recording-stream path.
+  local_keks:
+    smoke-kek-default: "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd"
 s3:
   provider: local
   bucket_prefix: sociopulse-smoke-recordings-

@@ -39,6 +39,25 @@ type KMSConfig struct {
 	// is "local". Ignored otherwise.
 	LocalKeyHex string `mapstructure:"local_key_hex"`
 
+	// LocalKEKs pre-registers KEKs in the in-process keychain at boot.
+	// Map shape is `kek_id → 32-byte hex-encoded KEK plaintext`. Only
+	// consulted when Provider is "local". Production builds leave this
+	// empty — KEKs are minted via TenantService.Create which calls
+	// KMSClient.CreateKey at provisioning time.
+	//
+	// Intended use is the smoke harness (tests/smoke/config.go), where
+	// seeded tenants carry a deterministic kms_kek_id like
+	// "smoke-kek-default" so the asynq import handler's KMS.Encrypt
+	// path resolves without the harness having to drive the full
+	// TenantService.Create flow. Mirrors the existing
+	// `recording.local_keks` map in shape and semantics — both are
+	// build-time KEK pre-registration seams for dev/test ergonomics.
+	//
+	// Empty values, malformed hex, or wrong-length payloads cause
+	// Validate to return an error so a misconfigured yaml fails the
+	// boot fast (rather than at first Encrypt call).
+	LocalKEKs map[string]string `mapstructure:"local_keks"`
+
 	// Endpoint is the Yandex KMS gRPC endpoint
 	// ("kms.api.cloud.yandex.net:443"). Required when Provider is
 	// "yandex".

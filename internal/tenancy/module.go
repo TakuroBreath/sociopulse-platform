@@ -131,7 +131,12 @@ func buildDeps(d modules.Deps) (api.Deps, error) {
 func buildKMSClient(cfg config.KMSConfig) (api.KMSClient, error) {
 	switch cfg.Provider {
 	case "", config.KMSProviderLocal:
-		return store.NewLocalKMSClient(cfg.LocalKeyHex)
+		// LocalKEKs is the pre-registration seam used by the smoke
+		// harness (kms.local_keks in tests/smoke/config.go) so seeded
+		// tenants whose kms_kek_id was written by direct SQL still find
+		// a KEK at Encrypt time. Production yaml leaves the map empty —
+		// KEKs are minted via TenantService.Create at provisioning.
+		return store.NewLocalKMSClientWithKEKs(cfg.LocalKeyHex, cfg.LocalKEKs)
 	case config.KMSProviderYandex:
 		// Yandex SDK is gated behind the `yandex_kms` build tag. The
 		// default-build stub returns a clear error pointing operators at
