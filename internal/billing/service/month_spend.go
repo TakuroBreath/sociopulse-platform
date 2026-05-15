@@ -159,10 +159,15 @@ func (r *spendReport) SpendByMonth(ctx context.Context, tenantID uuid.UUID, coun
 		return nil, billingapi.ErrInvalidPeriod
 	}
 	out := make([]billingapi.MonthBreakdown, 0, count)
-	// Anchor to UTC so AddDate's month arithmetic is timezone-independent.
-	now := r.now().UTC()
+	// Anchor to the first day of the current UTC month BEFORE iterating —
+	// Go's time.AddDate normalises overflowing days (e.g. Jan 31 minus 1
+	// month → Mar 3, not Feb 28), so iterating from time.Now() on day 31
+	// would skip or duplicate months. Snapping to day-1 makes each step
+	// a clean calendar-month subtraction. Caught in Step E review.
+	nowUTC := r.now().UTC()
+	anchor := time.Date(nowUTC.Year(), nowUTC.Month(), 1, 0, 0, 0, 0, time.UTC)
 	for i := count - 1; i >= 0; i-- {
-		m := now.AddDate(0, -i, 0)
+		m := anchor.AddDate(0, -i, 0)
 		p := billingapi.Month(m.Year(), m.Month())
 		bd, err := r.MonthSpend(ctx, tenantID, nil, p)
 		if err != nil {

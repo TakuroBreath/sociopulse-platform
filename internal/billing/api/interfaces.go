@@ -43,7 +43,9 @@ type SpendReport interface {
 	// MonthSpend returns the breakdown for a single month. projectID may be
 	// nil for the tenant-wide total.
 	MonthSpend(ctx context.Context, tenantID uuid.UUID, projectID *uuid.UUID, p Period) (MonthBreakdown, error)
-	// SpendByMonth returns the trailing-`count`-months history (newest first).
+	// SpendByMonth returns the trailing-`count`-months history (oldest first).
+	// Ending month is the current calendar month in UTC; the slice is
+	// chronologically ordered to mirror the dashboard ByMonth chart left-to-right.
 	SpendByMonth(ctx context.Context, tenantID uuid.UUID, count int) ([]MonthBreakdown, error)
 }
 

@@ -147,6 +147,39 @@ func TestSpendByMonth_TrailingCount(t *testing.T) {
 	require.Equal(t, time.May, series[2].Period.From.Month())
 }
 
+// TestSpendByMonth_Day31_NoMonthSkip is a regression test for the calendar-
+// normalisation gotcha caught in Step E review: time.AddDate(0,-1,0) on
+// March 31 normalises to March 3 (since Feb only has 28 days), which would
+// have skipped February and double-counted March. The implementation snaps
+// the anchor to day-1-of-month before iterating, so this test asserts
+// trailing 3 months ending January 31 == Nov + Dec + Jan and trailing 3
+// months ending March 31 == Jan + Feb + Mar.
+func TestSpendByMonth_Day31_NoMonthSkip(t *testing.T) {
+	t.Parallel()
+	pg := &fakeAggregator{}
+	tariffs := service.NewTariffStore(newFakeBackend(), billingapi.Tariffs{})
+
+	// Day-31 in January (Feb has 28/29 days — naive AddDate would land in
+	// March, skipping February).
+	jan31 := time.Date(2026, 1, 31, 12, 0, 0, 0, time.UTC)
+	s := service.NewSpendReportWithClock(pg, tariffs, billingapi.Tariffs{}, func() time.Time { return jan31 })
+	series, err := s.SpendByMonth(t.Context(), uuid.New(), 3)
+	require.NoError(t, err)
+	require.Len(t, series, 3)
+	require.Equal(t, time.November, series[0].Period.From.Month())
+	require.Equal(t, time.December, series[1].Period.From.Month())
+	require.Equal(t, time.January, series[2].Period.From.Month())
+
+	// Day-31 in March — naive AddDate would skip February.
+	mar31 := time.Date(2026, 3, 31, 12, 0, 0, 0, time.UTC)
+	s = service.NewSpendReportWithClock(pg, tariffs, billingapi.Tariffs{}, func() time.Time { return mar31 })
+	series, err = s.SpendByMonth(t.Context(), uuid.New(), 3)
+	require.NoError(t, err)
+	require.Equal(t, time.January, series[0].Period.From.Month())
+	require.Equal(t, time.February, series[1].Period.From.Month())
+	require.Equal(t, time.March, series[2].Period.From.Month())
+}
+
 // TestSpendByMonth_InvalidCount verifies the count-range guard: 0, negative,
 // and > 24 all map to ErrInvalidPeriod (the HTTP boundary returns 400).
 func TestSpendByMonth_InvalidCount(t *testing.T) {
