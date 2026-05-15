@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"time"
 
 	"github.com/google/uuid"
@@ -205,9 +206,7 @@ func cloneMap(m map[string]int64) map[string]int64 {
 		return nil
 	}
 	out := make(map[string]int64, len(m))
-	for k, v := range m {
-		out[k] = v
-	}
+	maps.Copy(out, m)
 	return out
 }
 

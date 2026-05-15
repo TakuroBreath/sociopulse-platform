@@ -3,6 +3,7 @@ package service_test
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"testing"
 
 	"github.com/google/uuid"
@@ -45,9 +46,7 @@ func (f *fakeSettingsBackend) UpsertSettings(_ context.Context, tid uuid.UUID, k
 	if _, ok := f.kv[tid.String()]; !ok {
 		f.kv[tid.String()] = map[string][]byte{}
 	}
-	for k, v := range kv {
-		f.kv[tid.String()][k] = v
-	}
+	maps.Copy(f.kv[tid.String()], kv)
 	return nil
 }
 
