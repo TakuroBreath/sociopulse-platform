@@ -121,9 +121,10 @@ func (r *spendReport) MonthSpend(
 		// Tenant has not configured tariffs — use the platform defaults.
 		// Mirrors the NewCallFinalizedHandler ErrNoTariffs fallback so the
 		// two billing surfaces (per-call ingestion and monthly rollup)
-		// agree on what an un-configured tenant pays.
+		// agree on what an un-configured tenant pays. We only read
+		// RespondentBasesMinor + FixedFeesMinor below, so TenantID on the
+		// local snapshot is intentionally left unset.
 		tariffs = r.defTariffs
-		tariffs.TenantID = tenantID
 	case err != nil:
 		return billingapi.MonthBreakdown{}, fmt.Errorf("billing/spend: load tariffs: %w", err)
 	}
