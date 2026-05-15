@@ -23,11 +23,15 @@ import (
 	// pointing at the repo's migrations/ directory are handled by this
 	// driver.
 	_ "github.com/golang-migrate/migrate/v4/source/file"
+	"github.com/jackc/pgx/v5"
+	"github.com/stretchr/testify/require"
 	"github.com/testcontainers/testcontainers-go"
 	tcnats "github.com/testcontainers/testcontainers-go/modules/nats"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	tcredis "github.com/testcontainers/testcontainers-go/modules/redis"
 	"github.com/testcontainers/testcontainers-go/wait"
+
+	"github.com/sociopulse/platform/pkg/postgres"
 )
 
 // init disables the testcontainers-go "ryuk" reaper before any
@@ -50,6 +54,19 @@ func init() {
 	}
 }
 
+// smokeKEKID is the deterministic id every smoke tenant uses for its
+// kms_kek_id column. WriteSmokeConfig publishes the matching 32-byte
+// KEK under recording.local_keks; SeedTenantAndAdmin sets this id on
+// every tenant. The recording-stream scenario (Plan 21b Task 5) reuses
+// the same id via BuildRecordingFixture so cmd/api's
+// LocalDEKUnwrapper round-trips the wrapped DEK without a second
+// registration step.
+//
+// Exported as a package var (not a const) so future tests can override
+// it for negative scenarios — but production callers should treat it
+// as immutable.
+var smokeKEKID = "smoke-kek-default"
+
 // Stack carries the connection coordinates of the smoke testcontainer
 // stack. Smoke tests treat it as read-only after NewSharedStack returns.
 // The Reset method is the only mutator and is documented separately.
@@ -70,6 +87,15 @@ type Stack struct {
 	// expects. Smoke harness helpers (EnsureSmokeStreams) also use this
 	// form to dial nats.Connect.
 	NATSURL string
+
+	// pgPoolOnce + pgPool cache a *postgres.Pool built lazily by PgPool.
+	// Scenario 8 (152-ФЗ purge) needs a direct pool to construct an
+	// in-test PurgeWorker without an asynq cron. The pool is closed
+	// at process exit via addProcessTeardown so sibling tests share
+	// the same instance without paying the open-cost more than once.
+	pgPoolOnce sync.Once
+	pgPool     *postgres.Pool
+	pgPoolErr  error
 }
 
 // NewRedisURL returns the redis://host:port form of Stack.RedisAddr.
@@ -80,20 +106,115 @@ func (s *Stack) NewRedisURL() string {
 	return "redis://" + s.RedisAddr
 }
 
-// Reset truncates per-tenant tables on the Postgres container so a
-// scenario starts from a clean slate. Today (Plan 21 Task 4) Reset is a
-// no-op; subsequent tasks (5-7) layer real scenarios that need it,
-// and the seam is established here so the call site is stable across
-// the plan.
+// resetTables is the canonical TRUNCATE list per Plan 21b references
+// § 4.8. Order is irrelevant under CASCADE but listing leaves first
+// reduces FK-cascade noise in pg_stat. tenants + users survive Reset —
+// they are owned by SeedTenantAndAdmin's t.Cleanup chain.
+//
+// We OMIT respondent_imports because the import job state lives
+// entirely in Redis (verified — no respondent_imports table in any
+// migration); a Reset that flushed Redis would be a separate concern.
+// The scenarios that exercise the import path must clear their own
+// Redis state via job-id rotation, which the harness already does
+// implicitly by minting a fresh uuid per test.
+//
+// audit_log is left intact too — Plan 21b's scenarios don't assert
+// audit row counts, and a TRUNCATE of audit_log requires
+// tenancy_admin's DELETE grant which the smoke testcontainer
+// superuser has, but burning it on every Reset would mask a real
+// audit-write regression in scenario 8.
+var resetTables = []string{
+	"call_recordings",
+	"call_answers",
+	"call_events",
+	"calls",
+	"operator_state_log",
+	"operator_sessions",
+	"survey_versions",
+	"surveys",
+	"respondents",
+	"project_dnc",
+}
+
+// Reset truncates the per-tenant tables Phase-1b scenarios mutate so a
+// fresh test starts from a clean slate. Runs as the testcontainer's
+// superuser (which carries BYPASSRLS via the 000001 grants), so RLS is
+// not consulted — every tenant's rows fall in one statement.
+//
+// Plan 21 Task 4 left this as a no-op stub; Plan 21b Task 1 fills it
+// in with the canonical TRUNCATE list.
 //
 // Reset is safe to call from t.Cleanup or at the top of a test. It
-// holds no state across calls.
+// holds no state across calls. A failing TRUNCATE is fatal to the
+// caller because subsequent assertions would see stale rows from a
+// prior test — silent degradation here is much worse than a loud fail.
 func (s *Stack) Reset(t *testing.T) {
 	t.Helper()
-	// No-op for Task 4 — establishes the seam for Tasks 5-7. When a
-	// scenario needs DB cleanup, this method will run a transactional
-	// TRUNCATE across the per-tenant tables (calls, projects, surveys,
-	// audit_log, etc.) BypassRLS via the tenancy_admin role.
+	ctx := t.Context()
+
+	conn, err := pgx.Connect(ctx, s.PostgresDSN)
+	require.NoError(t, err, "smoke reset: connect to %s", s.PostgresDSN)
+	defer func() { _ = conn.Close(context.Background()) }()
+
+	// Single TRUNCATE statement with CASCADE so FK dependencies between
+	// the listed tables are followed automatically (e.g. operator_state_log
+	// → operator_sessions). RESTART IDENTITY resets serial sequences so
+	// scenario assertions against monotonic ids stay stable across reruns.
+	stmt := "TRUNCATE " + commaJoin(resetTables) + " RESTART IDENTITY CASCADE"
+	_, err = conn.Exec(ctx, stmt)
+	require.NoError(t, err, "smoke reset: %s", stmt)
+}
+
+// commaJoin renders a comma-separated SQL identifier list. Implemented
+// inline to avoid a strings import drag on stack.go for one call site.
+func commaJoin(items []string) string {
+	out := make([]byte, 0, 128)
+	for i, it := range items {
+		if i > 0 {
+			out = append(out, ", "...)
+		}
+		out = append(out, it...)
+	}
+	return string(out)
+}
+
+// PgPool returns a lazily-built *postgres.Pool against the smoke
+// PostgresDSN. The pool is shared across the process: cmd/api boot
+// builds its own pool from the same DSN; this accessor exists so a
+// scenario that needs to construct an in-test domain object (e.g.
+// scenario 8's PurgeWorker) gets a project-canonical *postgres.Pool
+// without having to wire the cmd/api locator path.
+//
+// The pool is closed at process exit via addProcessTeardown so sibling
+// tests reuse the same instance — Open() pays a few ms per call and
+// the testcontainer Postgres has the connection budget for one extra
+// concurrent pool.
+//
+// Returns nil + fatal-fails the test on first-call failure. Subsequent
+// calls return the cached pool (or re-fail with the same error).
+func (s *Stack) PgPool(t *testing.T) *postgres.Pool {
+	t.Helper()
+	s.pgPoolOnce.Do(func() {
+		pool, err := postgres.Open(t.Context(), postgres.Config{
+			DSN:            s.PostgresDSN,
+			MaxConns:       4,
+			ConnectTimeout: 10 * time.Second,
+		})
+		if err != nil {
+			s.pgPoolErr = fmt.Errorf("smoke: open pg pool: %w", err)
+			return
+		}
+		s.pgPool = pool
+		// Close the pool at process exit so sibling tests share it
+		// without leaking the underlying pgxpool. The teardown fires
+		// after every test's t.Cleanup so the shared pool stays alive
+		// for the whole TestMain.
+		addProcessTeardown(func() { pool.Close() })
+	})
+	if s.pgPoolErr != nil {
+		t.Fatalf("%v", s.pgPoolErr)
+	}
+	return s.pgPool
 }
 
 // sharedStack carries the singleton testcontainer stack used by every

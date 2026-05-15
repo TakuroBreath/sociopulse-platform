@@ -96,6 +96,16 @@ kms:
 s3:
   provider: local
   bucket_prefix: sociopulse-smoke-recordings-
+recording:
+  # Plan 21b Task 1 — register the deterministic smoke KEK that
+  # SeedTenantAndAdmin assigns to every tenant ("smoke-kek-default")
+  # so cmd/api's recwire.LocalPorts builds a LocalDEKUnwrapper that
+  # recognises the id. The hex value is "abcd" repeated 16 times = 32
+  # bytes after decode, matching tests/smoke/recording_seed.go's
+  # smokeKEKHex. A drift here breaks the recording-stream scenario
+  # with "unknown KMS key" before any HTTP roundtrip.
+  local_keks:
+    smoke-kek-default: "abcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcdabcd"
 observability:
   otel:
     endpoint: localhost:4317

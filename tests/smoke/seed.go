@@ -46,17 +46,23 @@ type SeededAccount struct {
 // needed: the connection identity already carries BYPASSRLS so the
 // inserts succeed without an explicit policy context.
 //
-// KMS path note (Plan 21 Task 6): tenants.kms_kek_id is set to the
-// arbitrary "smoke-kek-<org_code>" string. The local KMS client does
-// NOT pre-register this id — it only knows keys it minted via
-// CreateKey. The auth flow exercised by TestSmoke_AuthFullFlow does
+// KMS path note (Plan 21b Task 1): tenants.kms_kek_id is set to the
+// deterministic "smoke-kek-default" id. WriteSmokeConfig publishes the
+// matching 32-byte KEK under recording.local_keks, so cmd/api's
+// recwire.LocalPorts builds a LocalDEKUnwrapper that recognises the id.
+// Recording-touching scenarios (Plan 21b Task 5) reuse the same id via
+// BuildRecordingFixture; tenancy-touching scenarios are unaffected
+// (the KMSResolver path goes through pkg/encryption, not the recording
+// LocalDEKUnwrapper).
+//
+// Earlier (Plan 21 Task 6) the value was the per-tenant
+// "smoke-kek-<org_code>" string; the LocalDEKUnwrapper did NOT know
+// that id, but the auth flow exercised by TestSmoke_AuthFullFlow does
 // not decrypt anything keyed off the tenant KEK (login → user lookup
-// → argon2id verify is KMS-free), so the dangling kek_id is fine.
-// Future smoke scenarios that exercise envelope encryption (recording,
-// phone-hash, DEK lifecycle) MUST migrate this helper to either
-// (a) generate a real KEK via the smoke-config's LocalKMSClient and
-// store the returned id, or (b) extend WriteSmokeConfig to register
-// a known-id key. Not in scope for Task 6.
+// → argon2id verify is KMS-free), so the dangling kek_id was fine.
+// Plan 21b's recording-stream scenario forces the harness to register
+// a known KEK; standardising on one id across every tenant keeps the
+// smoke config minimal.
 func SeedTenantAndAdmin(t *testing.T, stack *Stack, orgCode, login, plainPwd string) SeededAccount {
 	t.Helper()
 	ctx := t.Context()
@@ -74,7 +80,7 @@ func SeedTenantAndAdmin(t *testing.T, stack *Stack, orgCode, login, plainPwd str
 	pwdHash, err := passwords.Default().Hash(ctx, plainPwd)
 	require.NoError(t, err, "smoke seed: hash password")
 
-	kekID := "smoke-kek-" + orgCode
+	kekID := smokeKEKID
 
 	// tenants — status='active' is the only value the production code
 	// path accepts for login; suspended/archived tenants would refuse to

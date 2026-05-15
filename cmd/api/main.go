@@ -41,7 +41,6 @@ import (
 	"github.com/sociopulse/platform/internal/recording"
 	"github.com/sociopulse/platform/internal/recording/crypto"
 	"github.com/sociopulse/platform/internal/recording/storage"
-	recwire "github.com/sociopulse/platform/internal/recording/wire"
 
 	// Wire the tenancy api.Register seam (init() side-effect). The
 	// concrete registerModule lives in internal/tenancy/service so
@@ -309,7 +308,12 @@ func run(ctx context.Context, configDir string) error {
 	//
 	// Plan 12.4 Task 5: helper relocated to internal/recording/wire so
 	// cmd/worker can share the same construction path.
-	recordingPorts, err := recwire.LocalPorts(cfg.Recording, logger.Named("recording"))
+	//
+	// Plan 21b Task 1: the call goes through buildRecordingPorts (defined
+	// in recording.go) so the build-tagged smoke override seam can inject
+	// a pre-populated *recwire.Ports for scenario 5. Production builds
+	// (no smoke tag) fall straight through to recwire.LocalPorts.
+	recordingPorts, err := buildRecordingPorts(cfg.Recording, logger.Named("recording"))
 	if err != nil {
 		return fmt.Errorf("recording ports: %w", err)
 	}
