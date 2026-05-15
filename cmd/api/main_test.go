@@ -13,27 +13,26 @@ import (
 	"github.com/nats-io/nats.go"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/goleak"
 
 	tenancyapi "github.com/sociopulse/platform/internal/tenancy/api"
 )
 
-// TestMain ensures cmd/api boot/shutdown does not leak goroutines.
+// TestMain for the cmd/api test binary lives in build-tag-split files:
 //
-// Tests boot a real *trace.TracerProvider whose OTLP exporter retries
-// indefinitely against a missing collector at localhost:4317. On shutdown
-// the batchSpanProcessor's drain blocks in the retry's wait() until the
-// shutdown context expires, leaving short-lived OTel goroutines around when
-// goleak inspects the runtime. We ignore those — they exit on their own
-// once the retry's context deadline fires; in production with a reachable
-// collector they exit promptly.
-func TestMain(m *testing.M) {
-	goleak.VerifyTestMain(m,
-		goleak.IgnoreAnyFunction("go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc/internal/retry.wait"),
-		goleak.IgnoreAnyFunction("go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc.(*client).exportContext.func1"),
-		goleak.IgnoreAnyFunction("go.opentelemetry.io/otel/sdk/trace.(*batchSpanProcessor).Shutdown.func1.1"),
-	)
-}
+//   - cmd/api/testmain_default_test.go (//go:build !smoke) — uses
+//     goleak.VerifyTestMain directly, matching the original cmd/api
+//     unit-test contract.
+//   - cmd/api/testmain_smoke_test.go (//go:build smoke) — runs m.Run
+//     manually, then drains tests/smoke's TerminateOnTestMainCleanup
+//     (closing the cached *postgres.Pool + tearing testcontainers down)
+//     BEFORE goleak.Find, so a smoke scenario that consumes Stack.PgPool
+//     does NOT trip the leak guard on pgxpool's backgroundHealthCheck
+//     goroutine. Plan 21b Task 6 wired this — earlier scenarios (Task 4
+//     in particular) worked around it by using pgx.Connect from inside
+//     the test body.
+//
+// Keeping TestMain out of this file lets the per-build setup own the
+// goroutine-leak gate without touching the unit-test surface.
 
 // TestRunStartsAndShutsDownCleanly drives the composition root through a full
 // boot/shutdown cycle and asserts a clean exit. It picks free ports for HTTP
