@@ -132,21 +132,41 @@ func pickFreeAddr(t *testing.T) string {
 }
 
 // ensureTestStream provisions a JetStream stream for the given subjects on
-// the test NATS server (nats://localhost:4222 per writeMinimalDevConfig).
-// Required because cmd/api boot's realtime dispatcher and dialer pubsub
+// the test NATS server (nats://localhost:4222 per writeMinimalDevConfig)
+// IF a NATS server is reachable.
+//
+// Why we provision: cmd/api boot's realtime dispatcher and dialer pubsub
 // SUBSCRIBE before any module PUBLISHES — the JetStream broker returns
 // "no stream matches subject" if the stream doesn't yet exist, and the
 // realtime dispatcher's Start treats that as a hard error in the errgroup.
 // In production the nats-bridge sidecar auto-creates streams from a config
-// inventory; tests have to recreate that environment here.
+// inventory; macOS dev-up environments have NATS running but no streams,
+// so this helper bridges the gap.
 //
-// The stream is created with InterestPolicy retention + memory storage so
-// no on-disk artefacts accumulate; we delete it on cleanup.
+// Why skip-on-failure: GitHub Actions CI runs `make test` WITHOUT a NATS
+// service. cmd/api's pkg/eventbus.NATSPublisher tolerates a missing server
+// at boot (the connection retries lazily), so the boot path proceeds far
+// enough for the listener check to succeed even without streams. The
+// realtime dispatcher's Start under those conditions returns immediately
+// because the underlying subscriber recognises the disconnected client and
+// short-circuits. Locally with NATS UP and no streams, the dispatcher
+// instead hits the "no stream matches subject" error path — which is what
+// THIS helper fixes. Skipping on no-NATS leaves the CI behaviour
+// unchanged.
+//
+// The stream uses InterestPolicy retention + memory storage so no on-disk
+// artefacts accumulate; cleanup deletes it.
 func ensureTestStream(t *testing.T, name string, subjects []string) {
 	t.Helper()
 
-	nc, err := nats.Connect("nats://localhost:4222")
-	require.NoError(t, err, "connect NATS (needs `make dev-up` to be running)")
+	nc, err := nats.Connect("nats://localhost:4222",
+		nats.Timeout(500*time.Millisecond),
+		nats.RetryOnFailedConnect(false),
+	)
+	if err != nil {
+		t.Logf("ensureTestStream: NATS unreachable at localhost:4222, skipping stream %q provisioning: %v", name, err)
+		return
+	}
 	t.Cleanup(nc.Close)
 
 	js, err := nc.JetStream()
@@ -168,7 +188,7 @@ func ensureTestStream(t *testing.T, name string, subjects []string) {
 	t.Cleanup(func() {
 		// Best-effort delete — a parallel test holding the same stream
 		// name would have skipped re-creation above, so DeleteStream
-		// might race. We swallow the error rather than fail cleanup.
+		// might race. Swallow the error rather than fail cleanup.
 		_ = js.DeleteStream(name)
 	})
 }
