@@ -3,7 +3,9 @@
 package smoke
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -11,22 +13,98 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// ensureStream provisions a JetStream stream for the given subjects on
-// natsURL.
+// provisionSharedStreams creates the wildcard JetStream streams cmd/api boot
+// expects (tenant.> + trunks.>) ONCE per TestMain. Called from newSharedStack
+// after the NATS testcontainer comes up. Returns a teardown closure registered
+// via addProcessTeardown so the streams die with the container at process exit.
 //
-// Why we provision: cmd/api's realtime dispatcher SUBSCRIBES to
-// "tenant.*.dialer.op.*.state" via the JetStream-backed eventbus before
-// any module PUBLISHES — the JetStream broker returns "no stream matches
-// subject" if the stream doesn't yet exist, and the realtime
-// dispatcher's Start treats that as a hard error in the errgroup. In
-// production the nats-bridge sidecar auto-creates streams from a
-// config inventory; the smoke testcontainer has NATS up but no streams,
-// so this helper bridges the gap. Mirrors cmd/api/main_test.go::ensureTestStream
-// minus the skip-on-no-NATS branch (smoke ALWAYS has NATS).
+// Why one-shot at Stack construction (not per-bootAPI):
 //
-// The stream uses InterestPolicy retention + memory storage so no
-// on-disk artefacts accumulate; cleanup deletes it.
-func ensureStream(t *testing.T, natsURL, name string, subjects []string) {
+// Pre-Plan-22-fix, EnsureSmokeStreams ran per-bootAPI and registered
+// t.Cleanup(DeleteStream) per call. Under Go's t.Parallel() — every smoke
+// scenario opts in — scenario A's cleanup deleted the streams while scenario
+// B's cmd/api was still subscribed, and B's realtime dispatcher errored with
+// "nats: stream not found on connection [N] for subscription on tenant.*.X".
+// CI failed deterministically on TestSmoke_OperatorReadyAndStateBroadcast on
+// the v0.0.28 docs-only commit (run 25958460992) — Plan 21b had captured this
+// as a "Phase-1c follow-up" but Plan 22's CI surfaced it as an actual blocker.
+//
+// Lift to once-per-TestMain via Stack: the streams persist for the entire
+// test binary; per-test cleanup is unnecessary because the NATS container
+// teardown drops them at process exit (handled by addProcessTeardown).
+//
+// Why the teardown is registered against addProcessTeardown (not testing.T):
+//
+// The Stack instance has no *testing.T to register against — it's a
+// process-scoped singleton built via sync.Once. addProcessTeardown is the
+// existing Stack mechanism for "tear down at process exit", used by every
+// testcontainer terminate call.
+func provisionSharedStreams(ctx context.Context, natsURL string) error {
+	nc, err := nats.Connect(natsURL,
+		nats.Timeout(5*time.Second),
+		nats.RetryOnFailedConnect(false),
+	)
+	if err != nil {
+		return fmt.Errorf("provisionSharedStreams: connect to NATS at %s: %w", natsURL, err)
+	}
+	// Drop the connection at process exit, AFTER the streams + container teardown.
+	addProcessTeardown(nc.Close)
+
+	js, err := nc.JetStream()
+	if err != nil {
+		return fmt.Errorf("provisionSharedStreams: open JetStream context: %w", err)
+	}
+
+	for _, spec := range sharedStreamSpecs() {
+		if _, err := js.AddStream(spec); err != nil {
+			if !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+				return fmt.Errorf("provisionSharedStreams: ensure stream %q: %w", spec.Name, err)
+			}
+			// Idempotent: re-create with potentially-updated config (no-op if identical).
+			if _, err := js.UpdateStream(spec); err != nil {
+				return fmt.Errorf("provisionSharedStreams: update stream %q: %w", spec.Name, err)
+			}
+		}
+	}
+
+	_ = ctx // reserved for future deadline-bound provision; today the calls are sub-second.
+	return nil
+}
+
+// sharedStreamSpecs is the canonical set of JetStream streams the smoke
+// harness pre-provisions. Today: tenant.> (realtime + dialer + auth +
+// recording + analytics + billing fan-out) + trunks.> (telephony health).
+// InterestPolicy retention + MemoryStorage so containers don't accumulate
+// state across runs.
+func sharedStreamSpecs() []*nats.StreamConfig {
+	return []*nats.StreamConfig{
+		{
+			Name:      "TENANT_SMOKE",
+			Subjects:  []string{"tenant.>"},
+			Retention: nats.InterestPolicy,
+			Storage:   nats.MemoryStorage,
+			MaxAge:    5 * time.Minute,
+		},
+		{
+			Name:      "TRUNKS_SMOKE",
+			Subjects:  []string{"trunks.>"},
+			Retention: nats.InterestPolicy,
+			Storage:   nats.MemoryStorage,
+			MaxAge:    5 * time.Minute,
+		},
+	}
+}
+
+// EnsureSmokeStreams is the Plan-21-era per-bootAPI verify-only shim, retained
+// for backwards compatibility with the existing cmd/api/smoke_test.go::bootAPI
+// call site (Plan-22 close-out leaves bootAPI's signature untouched).
+//
+// Today it asserts the shared streams (provisioned by Stack at TestMain)
+// exist — a sanity check that the Stack initialiser completed before any test
+// reached bootAPI. It does NOT create or delete; that ownership has moved to
+// Stack per the Plan-22 fix above. Future callers should drop this call
+// entirely once a few more plans have shipped against the new model.
+func EnsureSmokeStreams(t *testing.T, natsURL string) {
 	t.Helper()
 
 	nc, err := nats.Connect(natsURL,
@@ -39,38 +117,11 @@ func ensureStream(t *testing.T, natsURL, name string, subjects []string) {
 	js, err := nc.JetStream()
 	require.NoError(t, err, "smoke: open JetStream context")
 
-	cfg := &nats.StreamConfig{
-		Name:      name,
-		Subjects:  subjects,
-		Retention: nats.InterestPolicy,
-		Storage:   nats.MemoryStorage,
-		MaxAge:    5 * time.Minute,
+	for _, spec := range sharedStreamSpecs() {
+		info, err := js.StreamInfo(spec.Name)
+		require.NoErrorf(t, err,
+			"smoke: stream %q must be provisioned by Stack at TestMain (not by bootAPI)", spec.Name)
+		require.NotNil(t, info,
+			"smoke: stream %q info is nil", spec.Name)
 	}
-	if _, err := js.AddStream(cfg); err != nil {
-		if errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-			_, err = js.UpdateStream(cfg)
-		}
-		require.NoError(t, err, "smoke: ensure stream %q", name)
-	}
-	t.Cleanup(func() {
-		// Best-effort delete — a parallel test holding the same stream
-		// name would have skipped re-creation above, so DeleteStream
-		// might race. Swallow the error rather than fail cleanup.
-		_ = js.DeleteStream(name)
-	})
-}
-
-// EnsureSmokeStreams pre-provisions the wildcard streams cmd/api boot
-// expects: tenant.> (the realtime dispatcher's "tenant.*.dialer.op.*.state"
-// + dialer pubsub subjects) and trunks.> (the trunks replicator's
-// "trunks.health" cross-tenant fan-out). Call this AFTER NATS is up
-// (Stack.NATSURL is set) and BEFORE the cmd/api goroutine starts.
-//
-// Mirrors PROJECT_STATUS.md:342's lesson from Plan 14:
-// "cmd/api/main_test.go::ensureTestStream provisions a `tenant.>` +
-// `trunks.>` JetStream stream pair BEFORE run() starts".
-func EnsureSmokeStreams(t *testing.T, natsURL string) {
-	t.Helper()
-	ensureStream(t, natsURL, "TENANT_SMOKE", []string{"tenant.>"})
-	ensureStream(t, natsURL, "TRUNKS_SMOKE", []string{"trunks.>"})
 }

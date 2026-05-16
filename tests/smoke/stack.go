@@ -355,6 +355,18 @@ func newSharedStack() (*Stack, error) {
 		return nil, fmt.Errorf("smoke: apply migrations: %w", err)
 	}
 
+	// Provision the wildcard JetStream streams ONCE per TestMain. Pre-fix,
+	// EnsureSmokeStreams ran per-bootAPI with per-call t.Cleanup(DeleteStream)
+	// — under t.Parallel(), scenario A's cleanup deleted the streams while
+	// scenario B was still subscribed. Plan-22 CI run 25958460992 deterministically
+	// failed TestSmoke_OperatorReadyAndStateBroadcast with "nats: stream not
+	// found on connection [N] for subscription on tenant.*.X". Lifting to
+	// Stack construction means the streams live for the whole TestMain;
+	// teardown is registered via addProcessTeardown inside provisionSharedStreams.
+	if err := provisionSharedStreams(ctx, natsURL); err != nil {
+		return nil, fmt.Errorf("smoke: provision shared streams: %w", err)
+	}
+
 	return &Stack{
 		PostgresDSN: pgDSN,
 		RedisAddr:   redisAddr,
