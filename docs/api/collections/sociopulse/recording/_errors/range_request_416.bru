@@ -1,0 +1,72 @@
+meta {
+  name: Range request rejected (416 recording.range_not_satisfiable)
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{base_url}}/api/calls/{{recording_call_id}}/recording
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  range: bytes=0-1023
+}
+
+tests {
+  test("416 Range Not Satisfiable on any Range header", function() {
+    expect(res.status).to.equal(416);
+  });
+  test("Content-Range advertises 'bytes */*' per RFC 7233 §4.4", function() {
+    expect(res.headers["content-range"]).to.equal("bytes */*");
+  });
+  test("Accept-Ranges advertises 'none'", function() {
+    expect(res.headers["accept-ranges"]).to.equal("none");
+  });
+  test("response carries the recording error envelope", function() {
+    // Recording's ErrorEnvelope uses `code` (NOT `error`) — verified
+    // at internal/recording/transport/http/dto.go:10. Same shape as
+    // the dialer envelope.
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("recording.range_not_satisfiable");
+  });
+  test("message hints at the 'retry without Range' resolution", function() {
+    expect(res.body).to.have.property("message");
+    expect(res.body.message).to.match(/Range/);
+  });
+}
+
+docs {
+  Negative regression for Plan 21b Task 5 — the hardened Range
+  rejection on GET /api/calls/:id/recording. Any non-empty Range
+  header (even bytes=0- or a malformed unit) is rejected; the
+  handler does NOT try to honour partial content.
+
+  Rationale (ADR-0005 §15.4): AES-256-GCM authenticates the full
+  ciphertext at the trailing tag, so a partial-content reply
+  would either bypass the auth-tag check (delivering tampered
+  plaintext to the caller) or require decrypting the whole object
+  only to slice the result — neither matches the chain-of-custody
+  guarantee. The handler advertises Accept-Ranges: none AND
+  actively rejects inbound Range headers so client middleware
+  that ignores the response advertisement still gets a hard
+  signal.
+
+  Per RFC 7233 §4.4, a 416 response carries Content-Range:
+  bytes */<size or *>; we use `bytes */*` because the underlying
+  object size is unknown at the rejection point (the lookup hasn't
+  run yet) — clients re-issue without Range and get the full
+  plaintext (recording/get_audio.bru).
+
+  Chained env var {{recording_call_id}} — same as
+  get_audio.bru. Test passes regardless of whether the call
+  actually has a recording: the Range gate runs before the
+  service lookup so an absent recording still gets the 416 (the
+  attacker cannot use this endpoint to probe row existence; the
+  404 case is covered by _errors/cross_tenant_stream_404.bru).
+}

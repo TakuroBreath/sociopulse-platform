@@ -1,0 +1,57 @@
+meta {
+  name: Pause without reason (400 dialer.bad_request)
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{base_url}}/api/sessions/pause
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {}
+}
+
+tests {
+  test("400 Bad Request on missing reason", function() {
+    expect(res.status).to.equal(400);
+  });
+  test("response carries the canonical dialer error envelope", function() {
+    // The dialer module's ErrorEnvelope uses `code` (NOT `error`) —
+    // verified at internal/dialer/transport/http/dto.go:77. The auth
+    // module's envelope uses `error`; this is a known cross-module
+    // wire-format divergence.
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("dialer.bad_request");
+  });
+  test("error message references the missing reason field", function() {
+    expect(res.body).to.have.property("message");
+    expect(res.body.message).to.match(/reason/i);
+  });
+}
+
+docs {
+  Negative regression for the GoPauseDTO.Reason validator
+  (binding:"required,min=1,max=64"). A missing or empty reason
+  triggers c.ShouldBindJSON's gin validator and renderBindError
+  writes 400 dialer.bad_request with the gin error message.
+
+  Plan-21b lesson 12d pins this contract — the FSM cannot label the
+  pause without a reason because the value goes into metrics +
+  audit trail. The negative case ensures any future relaxation of
+  the binding tag would surface here loudly.
+
+  This test is independent of FSM state — gin's binding runs before
+  the handler dispatches to the FSM, so it fails the same way
+  whether the operator is in ready, status, or any other state.
+}

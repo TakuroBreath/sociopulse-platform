@@ -1,0 +1,56 @@
+meta {
+  name: Get current operator shift snapshot
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/sessions/me
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK with operator snapshot", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a bare SnapshotDTO (NOT wrapped under .snapshot)", function() {
+    // GET /me returns the SnapshotDTO directly (handlers.getMe does
+    // c.JSON(200, snapshotToDTO(snap))) — start/end-shift wrap it
+    // because they bundle optional working-hours hints; /me does not.
+    expect(res.body).to.have.property("state");
+    expect(res.body).to.have.property("state_entered_at");
+    expect(res.body).to.have.property("heartbeat_at");
+  });
+  test("state is one of the seven recognised FSM literals", function() {
+    // Plan-21b lesson 12b: state values are "offline" | "ready" |
+    // "dialing" | "call" | "status" | "verify" | "pause" — note
+    // "pause" (NOT "paused").
+    expect(["offline","ready","dialing","call","status","verify","pause"]).to.include(res.body.state);
+  });
+}
+
+docs {
+  GET /api/sessions/me — returns the current SnapshotDTO for the
+  operator identified by the JWT claims. Used by the operator UI to
+  re-hydrate state after a page reload (the WS channel publishes
+  every subsequent transition).
+
+  Wire shape: SnapshotDTO (bare, no envelope). Fields:
+    state              string  — one of the 7 FSM literals
+    state_entered_at   string  — RFC3339 timestamp
+    project_id?        uuid    — present while shift bound
+    current_call_id?   uuid    — present while state is dialing/call/status
+    respondent_id?     uuid    — present while a call is bound
+    pause_reason?      string  — present while state == "pause"
+    heartbeat_at       string  — last presence-touch timestamp
+
+  Run sessions/start.bru first to bind the shift; otherwise this
+  returns state == "offline" with no project_id / call_id (the FSM
+  hash returns the zero-snapshot when the operator has never
+  started a shift this hour — see internal/dialer/service/fsm.go).
+}

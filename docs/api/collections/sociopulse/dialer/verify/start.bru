@@ -1,0 +1,42 @@
+meta {
+  name: Supervisor enters verify mode (status -> verify)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/operator/verify/start
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on FSM status -> verify transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=verify", function() {
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("verify");
+  });
+}
+
+docs {
+  POST /api/operator/verify/start — supervisor / admin rehearsal
+  hook. The supervisor enters verify mode for the operator slot
+  pinned in their JWT claims (per plan-10: verify is the rehearsal
+  channel a supervisor uses before issuing a Force).
+
+  Empty body — handlers.goVerify takes no DTO.
+
+  Role gate: requireRole(authapi.RoleSupervisor, authapi.RoleAdmin)
+  — operator-only JWTs hit this with 403 auth.insufficient_role.
+  Use a supervisor or admin access_token; the default admin login
+  flow in auth/01_login.bru is sufficient.
+
+  FSM transition: only legal from state == "status" — calling
+  from other states yields 409 dialer.invalid_transition.
+}

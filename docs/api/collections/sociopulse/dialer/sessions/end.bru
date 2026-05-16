@@ -1,0 +1,38 @@
+meta {
+  name: End operator shift (* -> offline)
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/api/sessions/end
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on FSM transition to offline", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=offline", function() {
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("offline");
+  });
+}
+
+docs {
+  POST /api/sessions/end — operator FSM transition * -> offline.
+
+  Empty body — handlers.endShift takes no DTO; tenant + operator IDs
+  are sourced from JWT claims. EndShift is permitted from any
+  non-offline state (including pause / status / call) so the
+  operator can unblock from a stuck session by ending the shift.
+
+  After ending the shift, project_id / current_call_id / etc on
+  the returned SnapshotDTO are nil (the FSM clears the binding);
+  omitempty hides them from the wire response.
+}

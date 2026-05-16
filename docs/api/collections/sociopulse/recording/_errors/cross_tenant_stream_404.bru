@@ -1,0 +1,54 @@
+meta {
+  name: Cross-tenant recording stream probe (404 recording.not_found)
+  type: http
+  seq: 11
+}
+
+get {
+  url: {{base_url}}/api/calls/{{recording_call_id}}/recording
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{other_tenant_token}}
+}
+
+tests {
+  test("404 Not Found on cross-tenant probe", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response carries the recording.not_found envelope", function() {
+    // Unlike the dialer hangup guard (which uses RequireSameTenant
+    // and aborts with bare 404 + no body), the recording stream
+    // path enforces tenant scope at the service layer. The service
+    // adds claims.TenantID as the lookup predicate so a row owned
+    // by another tenant simply does not match — ErrNotFound bubbles
+    // up and renderServiceError emits 404 recording.not_found.
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("recording.not_found");
+  });
+}
+
+docs {
+  Negative regression for the service-level tenant scope on GET
+  /api/calls/:id/recording. Defence-in-depth: even an admin with
+  a valid JWT for tenant A cannot stream a recording owned by
+  tenant B because OpenAudioStream's first store call carries
+  claims.TenantID as a predicate.
+
+  Different envelope shape from the dialer's cross-tenant hangup
+  case — the dialer wires RequireSameTenant for an explicit
+  middleware-level 404 (no body, existence-probe defence). The
+  recording transport has no middleware; tenant scope is enforced
+  at the service layer and 404s carry the canonical envelope.
+
+  Seeding workflow for {{other_tenant_token}}: mirror
+  crm/_errors/cross_tenant_project_get.bru's docs block — seed a
+  second tenant + admin via SQL, log in as that admin, copy the
+  access_token into env var {{other_tenant_token}}.
+
+  Chained env var {{recording_call_id}} — same as
+  recording/get_audio.bru (a real call uuid owned by the FIRST
+  tenant; the test asserts the SECOND tenant cannot reach it).
+}

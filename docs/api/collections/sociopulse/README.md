@@ -201,23 +201,76 @@ tests {
 
 ## WebSocket endpoints — NOT covered by Bruno
 
-Bruno's request engine is HTTP-only. The platform's two WS endpoints
-(`/api/operator/ws` and `/api/realtime/ws`) are covered by the smoke
-harness instead:
+Bruno is HTTP-only — its request engine speaks HTTP and the upgrade
+handshake that promotes a request to a WebSocket frame stream is
+outside that surface. The platform ships two WS endpoints; both are
+covered by the Go smoke harness instead of Bruno.
 
-- [`tests/smoke/wsclient.go`](../../../../tests/smoke/wsclient.go)
-  exposes `smoke.DialOperator(ctx, t, addr, jwt)` (and the realtime
-  variant) returning a `coder/websocket` wrapper with `ReadJSON` /
-  `Close` helpers.
-- Production WS contract:
-  [`internal/dialer/transport/http/ws.go`](../../../../internal/dialer/transport/http/ws.go)
-  +
-  [`internal/realtime/transport/http`](../../../../internal/realtime/transport/http).
+| Endpoint | Module | Auth path | Frame contract |
+|---|---|---|---|
+| `GET /api/operator/ws` | dialer (operator-facing real-time) | `?token=<jwt>` query parameter | Server-pushed bare `SnapshotDTO` JSON frames (no `{type:...}` envelope; per Plan-21b lesson 12a) |
+| `GET /api/realtime/ws` | realtime (generic per-replica Hub) | FrameAuth handshake (token sent as the first frame, NOT as a query parameter) | `internal/realtime/api/events.go` event envelope |
 
-For manual WS exploration outside the smoke harness, point a generic WS
-client (e.g. [`websocat`](https://github.com/vi/websocat)) at
-`ws://127.0.0.1:8081/api/operator/ws?token=<jwt>` after running the
-Bruno login flow to obtain a fresh access token.
+Both endpoints are mounted OUTSIDE the gin `JWTMiddleware` chain
+(verified at
+[`internal/dialer/transport/http/routes.go:141-147`](../../../../internal/dialer/transport/http/routes.go)
+and
+[`internal/realtime/transport/http/routes.go:97-108`](../../../../internal/realtime/transport/http/routes.go))
+because browsers cannot easily set the `Authorization` header on a
+WebSocket handshake. The dialer's handler reads the token from
+`c.Query("token")` (with an `Authorization: Bearer <jwt>` header
+fallback for non-browser clients), self-validates against
+`Deps.Validator`, and enforces the operator-role gate in-line; the
+realtime handler validates the token from the first wire frame
+(FrameAuth handshake on
+[`internal/realtime/transport/http/ws_handler.go`](../../../../internal/realtime/transport/http/ws_handler.go)).
+
+### Canonical Go-side WS test surface
+
+The smoke harness exposes a deliberately tiny wrapper at
+[`tests/smoke/wsclient.go`](../../../../tests/smoke/wsclient.go) — the
+authoritative reference for any new WS scenario:
+
+```go
+//go:build smoke
+
+ws, err := smoke.DialOperator(t.Context(), t, addr, jwt)
+require.NoError(t, err)
+t.Cleanup(func() { _ = ws.Close() })
+
+// Each ReadEvent reads exactly one JSON frame with a per-call timeout.
+snap, err := ws.ReadEvent(t.Context(), 5*time.Second)
+require.NoError(t, err)
+require.Equal(t, "ready", snap["state"])
+```
+
+The wrapper owns the `*websocket.Conn` from
+[`github.com/coder/websocket`](https://github.com/coder/websocket),
+decodes each frame into `map[string]any` (typed shape would force a
+schema PR every time the dialer's wire format grows a field), and
+issues a normal-closure frame on `Close` so the server-side handler's
+deferred subscription release runs cleanly. `goleak.VerifyTestMain`
+in the smoke package keeps any leak honest.
+
+For ad-hoc WS exploration outside the smoke harness, point a generic
+WS client (e.g. [`websocat`](https://github.com/vi/websocat)) at
+`ws://127.0.0.1:8080/api/operator/ws?token=<jwt>` after running the
+Bruno login flow to obtain a fresh access token:
+
+```bash
+# 1. Capture a fresh JWT via Bruno (writes access_token to env on disk).
+bru run --env smoke --filename auth/01_login.bru
+
+# 2. Read it back + open a WS stream with websocat.
+ACCESS_TOKEN=$(grep '^  access_token:' environments/smoke.bru | awk '{print $2}')
+websocat "ws://127.0.0.1:8080/api/operator/ws?token=$ACCESS_TOKEN"
+```
+
+The realtime `?token=` query path is documented above for the dialer
+endpoint specifically — the realtime WS handler requires the token
+inside the first FrameAuth frame, so `websocat` against it needs a
+prepared scripted payload. The smoke harness is the path of least
+resistance for realtime scenarios.
 
 ## CI integration — deferred
 

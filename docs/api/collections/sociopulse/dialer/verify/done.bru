@@ -1,0 +1,37 @@
+meta {
+  name: Supervisor exits verify mode (verify -> ready)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/operator/verify/done
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on FSM verify -> ready transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=ready", function() {
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("ready");
+  });
+}
+
+docs {
+  POST /api/operator/verify/done — completes the rehearsal cycle;
+  FSM transition verify -> ready. The supervisor is dropped back
+  into the dispatch loop after this call.
+
+  Empty body — handlers.verifyDone takes no DTO.
+
+  Role gate: supervisor or admin (mirrors verify/start.bru).
+  Calling from a state other than "verify" yields
+  409 dialer.invalid_transition.
+}

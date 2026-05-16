@@ -1,0 +1,68 @@
+meta {
+  name: Force-transition target operator (admin escape)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/operator/{{target_operator_id}}/force
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "target": "offline",
+    "reason": "supervisor_kick"
+  }
+}
+
+tests {
+  test("200 OK on FSM force transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO at the forced target", function() {
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("offline");
+  });
+}
+
+docs {
+  POST /api/operator/:id/force — admin escape: force a target
+  operator into an arbitrary FSM state. The :id path parameter is
+  the target operator's user id (NOT the caller); the caller's
+  tenant comes from JWT claims and the FSM additionally validates
+  that the loaded hash carries a matching tenant_id (returns
+  ErrTenantMismatch -> 403 dialer.tenant_mismatch otherwise).
+
+  Body (ForceDTO):
+    target  enum  REQUIRED  one of: offline, ready, dialing, call,
+                                    status, verify, pause
+    reason  enum  REQUIRED  one of: heartbeat_lost, supervisor_kick,
+                                    shutdown, admin_override, other
+
+  The State + ForceReason enums are validated by api.State.Valid /
+  api.ForceReason.Valid (see internal/dialer/api/dto.go) before
+  dispatch — an invalid enum surfaces as 400 dialer.bad_request
+  (NOT 409 invalid_transition).
+
+  Role gate: requireRole(authapi.RoleAdmin) — supervisor + operator
+  hit this with 403 auth.insufficient_role.
+
+  Chained env var {{target_operator_id}} — the uuid of the operator
+  to force. Seed it manually from the auth/admin/list_users.bru
+  output, or via the SQL on the smoke admin alongside seeding.
+
+  Canonical use: a supervisor finds an operator stuck in state=call
+  (network blip + no telephony hangup); supervisor first runs
+  verify/start.bru to enter rehearsal then this force endpoint with
+  target=offline + reason=supervisor_kick to unblock the slot.
+}

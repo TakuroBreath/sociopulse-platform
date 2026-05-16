@@ -1,0 +1,60 @@
+meta {
+  name: Pause operator shift (ready -> pause)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/sessions/pause
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "reason": "lunch"
+  }
+}
+
+tests {
+  test("200 OK on FSM ready -> pause transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=pause", function() {
+    // Plan-21b lesson 12b: the literal is "pause" (NOT "paused").
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("pause");
+  });
+  test("pause_reason mirrors the request body", function() {
+    expect(res.body).to.have.property("pause_reason");
+    expect(res.body.pause_reason).to.equal("lunch");
+  });
+}
+
+docs {
+  POST /api/sessions/pause — operator FSM transition ready -> pause.
+
+  Body field "reason" is MANDATORY (Plan-21b lesson 12d):
+  GoPauseDTO carries `binding:"required,min=1,max=64"`. A missing
+  reason yields 400 dialer.bad_request from renderBindError
+  (sibling _errors/pause_without_reason_400.bru pins the contract).
+
+  The pause label lives in metrics + the audit trail — keep it
+  low-cardinality (e.g. "lunch", "training", "break", "meeting").
+  Free-form text is accepted up to 64 chars but the warehouse
+  consumes it as a label, so high-cardinality strings inflate the
+  cost.
+
+  State literal is "pause" — Plan-21b lesson 12b. Earlier (and
+  some agent-generated) drafts used "paused"; the FSM only knows
+  the singular form. The Bruno test asserts the exact literal so
+  any future rename would surface here loudly.
+}

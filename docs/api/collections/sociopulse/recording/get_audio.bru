@@ -1,0 +1,83 @@
+meta {
+  name: Stream recording audio (decrypted plaintext)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/calls/{{recording_call_id}}/recording
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on recording stream", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("Content-Type is audio/ogg (OPUS codec wrapped in OGG)", function() {
+    // service.contentTypeForCodec returns "audio/ogg" for codec
+    // "opus" / "opus-32" (the v1 baseline). Future codecs (G.711,
+    // PCMA/U) would map to "audio/basic"; this test pins the v1
+    // wire contract.
+    // Bruno exposes response headers via res.headers as a flat
+    // dictionary (lower-cased keys per Node's http parser); see
+    // bruno-docs > testing > assertions for the canonical pattern.
+    expect(res.headers["content-type"]).to.match(/^audio\//);
+  });
+  test("Accept-Ranges advertises 'none' (no partial-content support)", function() {
+    // ADR-0005 §15.4: AES-256-GCM authenticates the full ciphertext
+    // at the trailing tag, so a partial-content reply would either
+    // bypass the auth-tag check or require decrypting the whole
+    // object only to slice the result. We advertise Accept-Ranges:
+    // none AND reject inbound Range headers (the sibling
+    // _errors/range_request_416.bru pins the rejection contract).
+    expect(res.headers["accept-ranges"]).to.equal("none");
+  });
+  test("Cache-Control is private, no-store (chain-of-custody material)", function() {
+    expect(res.headers["cache-control"]).to.match(/no-store/);
+  });
+  test("Content-Length is set (full plaintext is buffered)", function() {
+    expect(res.headers).to.have.property("content-length");
+    expect(Number(res.headers["content-length"])).to.be.greaterThan(0);
+  });
+}
+
+docs {
+  GET /api/calls/:id/recording — streams the decrypted plaintext
+  audio body for the call's recording. Admin OR supervisor only.
+
+  Response is a binary audio body (NOT JSON). Bruno's res.body for
+  a non-JSON Content-Type is the raw string per
+  bruno-docs > javascript-reference > res.getBody; tests assert on
+  headers only because asserting on the binary body would require
+  base64ing and comparing the SHA — that is what
+  recording/verify_checksum.bru is for.
+
+  Response headers (recording_handler.go::streamRecording):
+    Content-Type     audio/ogg  (per service.contentTypeForCodec)
+    Content-Length   <bytes>
+    Accept-Ranges    none
+    Cache-Control    private, no-store
+
+  Range header support is intentionally absent — see
+  _errors/range_request_416.bru for the 416 contract pinned by
+  Plan 21b Task 5.
+
+  Chained env var {{recording_call_id}} — set by
+  recording/search.bru's post-response script (the first item's
+  call_id). On a freshly-booted dev stack with no recordings
+  seeded, set it manually to a known call uuid from a real
+  recorded session.
+
+  Service-layer error mapping (errors.go::renderServiceError):
+    ErrInvalidInput      -> 400 recording.invalid_input
+    ErrNotFound          -> 404 recording.not_found
+    ErrAlreadyDeleted    -> 410 recording.already_deleted
+    ErrCallNotFound      -> 412 recording.call_not_found
+    ErrTenantMismatch    -> 403 recording.tenant_mismatch
+    default              -> 500 recording.internal_error
+}

@@ -1,0 +1,60 @@
+meta {
+  name: Hang up active call (operator)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/calls/{{call_id}}/hangup
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "reason": "operator_hangup"
+  }
+}
+
+tests {
+  test("204 No Content on hangup publish", function() {
+    // handlers.hangup writes c.Status(http.StatusNoContent) after
+    // publishing the NATS HangupCommand; the FSM transition is
+    // driven asynchronously by the call_ended event from telephony,
+    // so the HTTP response itself carries no body.
+    expect(res.status).to.equal(204);
+  });
+}
+
+docs {
+  POST /api/calls/:id/hangup — operator-initiated hangup. Publishes
+  a NATS HangupCommand via Router.Hangup; the FSM transition lands
+  asynchronously when telephony fires the call_ended event.
+
+  Body (HangupDTO):
+    reason  string  optional  max 64 chars; empty/missing maps to
+                              "operator_hangup" downstream
+                              (handlers.go::hangupReasonDefault).
+
+  We send the explicit default reason to demonstrate the wire shape;
+  an empty {} body is also accepted (handlers.hangup gates on
+  ContentLength > 0 before binding).
+
+  Plan 21 Task 3 added RequireSameTenant on this route — the cross-
+  tenant case (_errors/cross_tenant_hangup_404.bru) pins the
+  404-no-body envelope. The middleware reads :id, looks up
+  calls.tenant_id via BypassRLS, and aborts before the handler if
+  the tenant claim does not match.
+
+  Chained env var {{call_id}} — same seeding pattern as
+  calls/submit_status.bru (the auto-dialer mints the call id; the
+  operator copies it off the WS Snapshot).
+}

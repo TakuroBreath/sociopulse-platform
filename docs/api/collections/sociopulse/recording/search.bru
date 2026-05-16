@@ -1,0 +1,113 @@
+meta {
+  name: Search recordings (cursor-paginated)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/recordings/search?limit=50
+  body: none
+  auth: bearer
+}
+
+params:query {
+  limit: 50
+  ~project_id: {{project_id}}
+  ~operator_id: {{user_id}}
+  ~status: stored,cold
+  ~from: 2026-01-01T00:00:00Z
+  ~to: 2026-12-31T23:59:59Z
+}
+
+
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+script:post-response {
+  // Persist the first page's first item's call_id so siblings
+  // (get_audio.bru, verify_checksum.bru) can target a known-good
+  // recording without manual editing. On an empty page we leave
+  // {{recording_call_id}} untouched — the seeding workflow
+  // documents how to populate it manually.
+  if (res.status === 200 && res.body && Array.isArray(res.body.items) && res.body.items.length > 0) {
+    bru.setEnvVar("recording_call_id", res.body.items[0].call_id, { persist: true });
+    bru.setEnvVar("recording_id", res.body.items[0].recording_id, { persist: true });
+  }
+}
+
+tests {
+  test("200 OK on recording search", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a SearchResponse page (items + has_more)", function() {
+    expect(res.body).to.have.property("items");
+    expect(res.body.items).to.be.an("array");
+    expect(res.body).to.have.property("has_more");
+    expect(res.body.has_more).to.be.a("boolean");
+  });
+  test("each item carries the sha256 field (NOT sha256_hex)", function() {
+    // Plan-21b lesson 14: the wire field is `sha256` (the
+    // RecordingMetadataDTO Go field is named SHA256Hex but it
+    // serialises with json:"sha256"). The Bruno test only runs
+    // the assertion when the page is non-empty — an empty smoke
+    // database is a legitimate steady state.
+    if (Array.isArray(res.body.items) && res.body.items.length > 0) {
+      var first = res.body.items[0];
+      expect(first).to.have.property("recording_id");
+      expect(first).to.have.property("call_id");
+      expect(first).to.have.property("tenant_id");
+      expect(first).to.have.property("sha256");
+      expect(first).to.have.property("bytes_size");
+      expect(first).to.have.property("duration_ms");
+      expect(first).to.have.property("status");
+    }
+  });
+}
+
+docs {
+  GET /api/recordings/search — admin/supervisor cursor-paginated
+  search over a tenant's recordings. Tenant scope comes from JWT
+  claims; the service layer adds the tenant predicate before
+  hitting the recordings store.
+
+  Optional query parameters (all leave the filter unset when
+  omitted; the Bruno UI shows them prefixed with `~` to mark them
+  as disabled by default — uncomment in the params:query block to
+  exercise):
+    project_id   uuid    filter by project
+    operator_id  uuid    filter by operator (who handled the call)
+    status       csv     subset of {stored, cold, deleted}
+    from         RFC3339 inclusive lower bound on committed_at
+    to           RFC3339 exclusive upper bound on committed_at
+    cursor       opaque  base64 cursor from a previous page
+    limit        int     1..200; default 50
+
+  Wire shape (SearchResponse, dto.go):
+    items[]       array of RecordingMetadataDTO
+    next_cursor   string  (omitempty)
+    has_more      bool
+
+  RecordingMetadataDTO fields (Plan-21b lesson 14 — sha256 is the
+  wire name; do NOT use sha256_hex):
+    recording_id  uuid
+    call_id       uuid
+    tenant_id     uuid
+    bytes_size    int64
+    duration_ms   int64
+    sha256        string  (ciphertext sha256 hex)
+    status        string  (stored | cold | deleted)
+    committed_at  RFC3339
+    delete_at     RFC3339 (omitzero — absent on legal-hold rows)
+    cold_at       RFC3339
+    verified_at   RFC3339 (omitempty — present iff verify run)
+
+  An empty items[] is a legitimate steady state when no recordings
+  have been seeded; the test asserts shape only on non-empty pages
+  to keep the smoke environment workable out of the box.
+
+  Persists {{recording_call_id}} + {{recording_id}} on success so
+  the siblings recording/get_audio.bru + recording/verify_checksum.bru
+  can target the same row without manual editing.
+}

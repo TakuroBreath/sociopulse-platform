@@ -1,0 +1,81 @@
+meta {
+  name: Submit call status (operator -> status -> ready)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/calls/{{call_id}}/status
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "call_id": "{{call_id}}",
+    "respondent_id": "{{respondent_id}}",
+    "status": "success",
+    "comment": "Respondent completed the questionnaire."
+  }
+}
+
+tests {
+  test("200 OK on FSM status -> ready transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=ready", function() {
+    // Submitting a status closes the call wrap-up window and bounces
+    // the operator back to the dispatch loop (state=ready). The next
+    // dispatched call moves them to dialing.
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("ready");
+  });
+  test("the closed call is no longer bound to the snapshot", function() {
+    expect(res.body.current_call_id === undefined || res.body.current_call_id === null).to.equal(true);
+  });
+}
+
+docs {
+  POST /api/calls/:id/status — operator submits the disposition for
+  the call currently in the wrap-up window (state == "status").
+
+  The :id path parameter MUST match body.call_id — handlers.submitStatus
+  treats the path as authoritative and rejects mismatch with
+  400 dialer.bad_request ("call_id in body does not match path :id").
+  We send the same UUID in both slots to mirror the canonical client.
+
+  Body fields (SubmitStatusDTO, dialer/transport/http/dto.go):
+    call_id        uuid    REQUIRED  must equal :id
+    respondent_id  uuid    REQUIRED
+    status         enum    REQUIRED  oneof: success, refused, wrong_person,
+                                      dropped, no_answer, busy, callback,
+                                      tech_failure
+    comment        string  optional  max 2000 chars
+
+  The enum values come from binding:"oneof=..." on SubmitStatusDTO.Status
+  — server-side status_rules then decides retry / DNC bucketing.
+
+  Chained env vars: {{call_id}} + {{respondent_id}} must be seeded
+  from a real auto-dialer cycle. The dialer-side flow has no direct
+  "create a call" endpoint — calls are minted by the dispatch loop
+  in internal/dialer/service/router.go::Dial when an operator's
+  ready slot picks a respondent off the queue. To exercise this
+  request manually:
+    1. Run crm/projects/create.bru + crm/respondents/create.bru
+       to seed a project + at least one respondent.
+    2. Run sessions/start.bru to bind the operator to that project.
+    3. Wait for the dispatch loop to pick the respondent (a few
+       seconds in the dev stack) — the operator WS pushes a
+       Snapshot with state=dialing then state=call.
+    4. Read current_call_id + respondent_id off that snapshot and
+       paste them into env vars {{call_id}} + {{respondent_id}}.
+    5. Once the call completes (state=status), run this request.
+}

@@ -1,0 +1,65 @@
+meta {
+  name: Verify recording checksum (admin, synchronous)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/calls/{{recording_call_id}}/recording/verify
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on verify completion (ok=true OR ok=false)", function() {
+    // Mismatched sha (OK=false) is 200 — the verify itself
+    // succeeded; the storage layer just returned different bytes
+    // than what was committed. Storage-level errors yield 5xx via
+    // renderServiceError instead.
+    expect(res.status).to.equal(200);
+  });
+  test("response is a VerifyResponse with the checksum comparison", function() {
+    expect(res.body).to.have.property("ok");
+    expect(res.body.ok).to.be.a("boolean");
+    expect(res.body).to.have.property("expected_sha");
+    expect(res.body).to.have.property("actual_sha");
+    expect(res.body).to.have.property("bytes_scanned");
+    expect(res.body).to.have.property("duration_ms");
+  });
+  test("on ok=true, expected_sha equals actual_sha", function() {
+    if (res.body.ok === true) {
+      expect(res.body.expected_sha).to.equal(res.body.actual_sha);
+    }
+  });
+}
+
+docs {
+  POST /api/calls/:id/recording/verify — admin-only synchronous
+  re-fetch + sha256 recompute of the ciphertext. Used to chain a
+  verify run into an audit workflow (the response body's ok flag
+  is the canonical signal for ops to investigate a mismatch).
+
+  Empty body — handlers.verifyChecksum takes no DTO. The :id is
+  the call uuid (same path shape as get_audio.bru). Tenant scope
+  comes from JWT claims; the service layer adds the tenant
+  predicate before hitting call_recordings.
+
+  Response (VerifyResponse, dto.go):
+    ok            bool    true iff expected_sha == actual_sha
+    expected_sha  string  hex sha256 from call_recordings.sha256
+    actual_sha    string  hex sha256 of the just-fetched ciphertext
+    bytes_scanned int64   payload size in bytes
+    duration_ms   int64   fetch + recompute wall time
+
+  Role gate: requireRole(authapi.RoleAdmin) — supervisor JWT hits
+  this with 403 auth.insufficient_role (admin-only because verify
+  writes an audit row and may incur ObjectStore.Get cost).
+
+  Chained env var {{recording_call_id}} — same as
+  get_audio.bru (set by recording/search.bru's first item or
+  populated manually).
+}

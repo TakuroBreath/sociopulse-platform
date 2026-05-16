@@ -1,0 +1,57 @@
+meta {
+  name: Cross-tenant hangup probe (404 from RequireSameTenant)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/api/calls/{{call_id}}/hangup
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{other_tenant_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {}
+}
+
+tests {
+  test("404 Not Found on cross-tenant hangup probe", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response body is empty (clean 404 from RequireSameTenant)", function() {
+    // pkg/middleware/tenant.RequireSameTenant aborts with bare 404 +
+    // no body when the resolver returns ErrNotFound. The dialer's
+    // callTenantResolveFn folds dialerapi.ErrCallNotFound into
+    // tenantmw.ErrNotFound so a probing attacker cannot distinguish
+    // between "call exists in another tenant" and "call does not
+    // exist at all" (existence-probe defence).
+    expect(res.body === "" || res.body === null || Object.keys(res.body || {}).length === 0).to.equal(true);
+  });
+}
+
+docs {
+  Negative regression for Plan 21 Task 3 — RequireSameTenant cross-
+  tenant guard on POST /api/calls/:id/hangup. Closes the Plan
+  13.2.5 finding: tenant A's operator JWT could previously hang up
+  tenant B's call because Router.Hangup publishes by call_id with
+  no tenant predicate.
+
+  Wired at internal/dialer/transport/http/routes.go:136-139 —
+  RequireSameTenant runs BEFORE handlers.hangup. The middleware
+  reads :id from the URL, looks up calls.tenant_id via BypassRLS,
+  and aborts the request with bare 404 (no envelope) when the
+  resolved tenant differs from the claims tenant.
+
+  Same envelope shape as crm/_errors/cross_tenant_project_get.bru
+  — see that file's docs block for the seeding workflow for
+  {{other_tenant_token}}. {{call_id}} is the same env var as
+  calls/hangup.bru (a real call uuid owned by the FIRST tenant).
+}

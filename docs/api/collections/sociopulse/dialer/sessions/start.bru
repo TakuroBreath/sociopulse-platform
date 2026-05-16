@@ -1,0 +1,71 @@
+meta {
+  name: Start operator shift (offline -> ready)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/sessions/start
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "project_id": "{{project_id}}"
+  }
+}
+
+tests {
+  test("200 OK on FSM offline -> ready transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a StartShiftResponse with the operator snapshot", function() {
+    expect(res.body).to.have.property("snapshot");
+    expect(res.body.snapshot).to.have.property("state");
+    expect(res.body.snapshot.state).to.equal("ready");
+    expect(res.body.snapshot).to.have.property("project_id");
+    expect(res.body.snapshot.project_id).to.equal(bru.getEnvVar("project_id"));
+    expect(res.body.snapshot).to.have.property("state_entered_at");
+    expect(res.body.snapshot).to.have.property("heartbeat_at");
+  });
+}
+
+docs {
+  POST /api/sessions/start — operator FSM transition offline -> ready.
+
+  The project_id body field is MANDATORY (Plan-21b lesson 12c):
+  operator_sessions.project_id is NOT NULL FK so the FSM cannot bind
+  the shift without it. Read internal/dialer/transport/http/dto.go
+  ::StartShiftDTO (binding:"required") for the wire contract.
+
+  Tenant + operator IDs come from JWT claims; the body only carries
+  the project the operator chose. Use crm/projects/create.bru first
+  to seed {{project_id}} into the environment file.
+
+  Response is StartShiftResponse (NOT a bare SnapshotDTO) — the
+  handler embeds the snapshot under .snapshot and optionally
+  surfaces .next_allowed_at / .outside_allowed for the UI when the
+  WorkingHoursChecker port returns a hint. The optional fields are
+  omitted on the happy path (no working-hours restriction seeded).
+
+  Use {{access_token}} of an operator (or supervisor/admin — the
+  sessions group accepts all three roles per routes.go:118). The
+  Plan 22 collection ships an admin login by default; to exercise
+  the operator-only sessions path, swap operator_login /
+  operator_password in environments/smoke.bru and re-run
+  auth/01_login.bru before this request.
+
+  Chained env vars: relies on {{project_id}} (set by
+  crm/projects/create.bru) and {{access_token}} (set by
+  auth/01_login.bru). No env var written by this request — the
+  per-operator session is identified by JWT claims.
+}

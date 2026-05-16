@@ -1,0 +1,41 @@
+meta {
+  name: Resume operator shift (pause -> ready)
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/api/sessions/resume
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on FSM pause -> ready transition", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the SnapshotDTO with state=ready", function() {
+    expect(res.body).to.have.property("state");
+    expect(res.body.state).to.equal("ready");
+  });
+  test("pause_reason is cleared on resume", function() {
+    // The FSM clears pause_reason when transitioning out of pause;
+    // SnapshotDTO marshals nil pointer fields with omitempty so the
+    // wire response omits the key entirely.
+    expect(res.body.pause_reason === undefined || res.body.pause_reason === null).to.equal(true);
+  });
+}
+
+docs {
+  POST /api/sessions/resume — operator FSM transition pause -> ready.
+
+  Empty body — handlers.resume takes no DTO; tenant + operator IDs
+  are sourced from JWT claims. Hitting this endpoint while NOT in
+  the pause state yields 409 dialer.invalid_transition (the FSM
+  rejects illegal transitions with this sentinel — see
+  internal/dialer/transport/http/errors.go::mapDialerError).
+}
