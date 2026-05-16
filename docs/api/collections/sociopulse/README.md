@@ -13,11 +13,16 @@ git-friendly). It exists for three audiences:
 
 The collection complements `tests/smoke/` (automated cross-module
 regression scenarios). Same target binary (`cmd/api`); different
-operator (human vs `go test`).
+operator (human vs `go test`). Smoke is the executable regression net;
+this collection is the manual exploration surface that closes Phase 2
+of `docs/architecture/10-end-to-end-testing-gaps.md`.
 
-Plan 22 ships the collection in four tasks; this README describes the
-scaffold + auth module landed in Task 1. CRM, surveys, dialer,
-recording, billing, and reports land in Tasks 2–4.
+Plan 22 shipped the collection in four tasks: Task 1 scaffold + auth,
+Task 2 CRM + surveys, Task 3 dialer + recording + WS doc, Task 4
+billing + reports + final polish. As of close-out the collection holds
+**81 request `.bru` files** across seven modules — every public HTTP
+endpoint of `cmd/api` is represented (only the two WebSocket endpoints
+are out of scope; see "WebSocket endpoints" below).
 
 ## Layout
 
@@ -35,28 +40,37 @@ docs/api/collections/sociopulse/
 │   ├── 03_logout.bru
 │   ├── me.bru
 │   ├── me_password.bru
-│   ├── totp_enroll.bru
-│   ├── totp_confirm.bru
-│   ├── totp_disable.bru
-│   ├── totp_status.bru
-│   ├── admin/
-│   │   ├── create_user.bru
-│   │   ├── list_users.bru
-│   │   ├── get_user.bru
-│   │   ├── update_roles.bru
-│   │   ├── archive_user.bru
-│   │   ├── restore_user.bru
-│   │   └── reset_password.bru
-│   └── _errors/
-│       ├── login_wrong_password.bru
-│       └── refresh_after_logout.bru
+│   ├── totp_{enroll,confirm,disable,status}.bru
+│   ├── admin/{create_user,list_users,get_user,update_roles,archive_user,restore_user,reset_password}.bru
+│   └── _errors/{login_wrong_password,refresh_after_logout}.bru
+├── crm/                       # 9 project + 6 respondent + 1 import + 2 negative
+│   ├── projects/{list,get,create,update,pause,resume,archive,assign,unassign,progress,members}.bru
+│   ├── respondents/{create,import,search,get,get_with_phone,delete}.bru
+│   ├── imports/get_status.bru
+│   └── _errors/{operator_creates_project_403,cross_tenant_project_get}.bru
+├── surveys/                   # 6 read + 5 admin + 2 negative
+│   ├── {list,get,versions_list,versions_active,preview_run,validate}.bru
+│   ├── admin/{create,update,archive,save_version,activate_version}.bru
+│   └── _errors/{activate_nonexistent_404,cross_tenant_survey_get}.bru
+├── dialer/                    # 5 session + 2 call + 2 verify + 1 force + 2 negative
+│   ├── sessions/{start,end,pause,resume,me}.bru
+│   ├── calls/{submit_status,hangup}.bru
+│   ├── verify/{start,done}.bru
+│   ├── operator/force.bru
+│   └── _errors/{cross_tenant_hangup_404,pause_without_reason_400}.bru
+├── recording/                 # 3 happy + 2 negative
+│   ├── {search,get_audio,verify_checksum}.bru
+│   └── _errors/{cross_tenant_stream_404,range_request_416}.bru
+├── billing/                   # 4 finance + 2 tariffs + 1 negative
+│   ├── finance/{dashboard,projects,breakdown,byMonth}.bru
+│   ├── tariffs/{get,patch}.bru
+│   └── _errors/operator_patches_tariff_403.bru
+├── reports/                   # 3 user + 2 jobs + 1 negative
+│   ├── {list_kinds,export,custom}.bru
+│   ├── jobs/{get,download}.bru
+│   └── _errors/cross_tenant_job_404.bru
 └── README.md                  # this file
 ```
-
-Tasks 2–4 add `crm/`, `surveys/`, `dialer/`, `recording/`, `billing/`,
-`reports/` siblings under `sociopulse/`. Each follows the same
-convention: HTTP-verb folder layout, `seq` ordering for happy-path,
-`_errors/` subfolder for negative cases.
 
 ## Install
 
@@ -114,14 +128,17 @@ that exactly, run a one-shot Go helper instead of pasting a literal.
 cd docs/api/collections/sociopulse
 
 # Run one request (canonical login → captures access_token + refresh_token
-# into environments/smoke.bru on success).
-bru run --env smoke --filename auth/01_login.bru
+# into environments/smoke.bru on success). Bruno CLI uses a POSITIONAL
+# path argument (NOT --filename) since v3.0+; the path can be a single
+# .bru OR a directory (use -r for recursive).
+bru run auth/01_login.bru --env smoke
 
 # Run the entire auth folder in seq order.
-bru run --env smoke --filename auth
+bru run auth --env smoke -r
 
-# Run the whole collection (Tasks 2–4 will populate the rest).
-bru run --env smoke
+# Run the whole collection (all 81 request files; the two env files
+# under environments/ are config, not requests).
+bru run --env smoke -r
 ```
 
 Each `bru run` invocation persists env-var changes back into the env
@@ -131,6 +148,125 @@ captured tokens for the subsequent requests to consume.
 
 Exit code: non-zero if any `tests` block fails. Suitable for a future
 CI job (deferred — see "CI integration" below).
+
+## Walk-throughs — end-to-end chained flows
+
+The collection's env-var capture chain lets you drive realistic
+journeys through the platform without manual paste. Each walk-through
+assumes a freshly-booted `make dev-up` stack with the SMOKE-DEFAULT
+tenant + alice admin seeded (see "First-time setup" above).
+
+### Walk-through A — admin onboards a project + respondents
+
+End-to-end coverage: admin auth + project lifecycle + respondent
+import. Demonstrates the canonical post-response env-var capture chain
+across modules.
+
+```bash
+cd docs/api/collections/sociopulse
+
+# 1. Admin login → access_token + tenant_id + user_id captured to env.
+bru run auth/01_login.bru --env smoke
+
+# 2. Create a project → project_id captured.
+bru run crm/projects/create.bru --env smoke
+
+# 3. Bulk-import respondents from the bundled CSV fixture.
+#    Multipart syntax: body:multipart-form { file: @fixtures/respondents.csv }
+#    (path is relative to the .bru file).
+bru run crm/respondents/import.bru --env smoke
+
+# 4. Poll the import job until it terminates (succeeded | failed).
+bru run crm/imports/get_status.bru --env smoke
+
+# 5. Search the imported respondents (filtered by the project).
+bru run crm/respondents/search.bru --env smoke
+
+# 6. Read one respondent + its decrypted phone (admin-only).
+bru run crm/respondents/get_with_phone.bru --env smoke
+```
+
+Env vars used: `access_token`, `tenant_id`, `user_id`, `project_id`,
+`respondent_id`. All set automatically by post-response scripts.
+
+### Walk-through B — operator runs a call + supervisor verifies recording
+
+End-to-end coverage: operator session lifecycle + call status
+submission + recording chain-of-custody.
+
+```bash
+# 1. Operator login → access_token captured.
+#    (Swap the env file's admin_login / admin_password for the operator
+#    credentials first, OR maintain a separate environments/smoke-op.bru
+#    for the operator persona.)
+bru run auth/01_login.bru --env smoke
+
+# 2. Bind the operator to a project (state offline → ready).
+bru run dialer/sessions/start.bru --env smoke
+
+# 3. Read the current FSM snapshot (state machine + bound project).
+bru run dialer/sessions/me.bru --env smoke
+
+# 4. Wait for the auto-dispatcher to pick a respondent + open a call.
+#    Read current_call_id off the operator's WS snapshot (see
+#    "WebSocket endpoints" below) — the dialer module has no direct
+#    "create a call" REST endpoint; calls are minted by the dispatch
+#    loop in internal/dialer/service/router.go::Dial.
+#    Set {{call_id}} + {{respondent_id}} env vars manually.
+
+# 5. Submit the call status disposition (success / refused / wrong_person
+#    / dropped / no_answer / busy / callback / tech_failure).
+bru run dialer/calls/submit_status.bru --env smoke
+
+# 6. Swap to admin / supervisor JWT (re-login as alice) for recording access.
+bru run auth/01_login.bru --env smoke
+
+# 7. Search the recording for that call → recording_call_id captured.
+bru run recording/search.bru --env smoke
+
+# 8. Stream the decrypted audio (200 + audio/ogg bytes).
+bru run recording/get_audio.bru --env smoke
+
+# 9. Verify the SHA-256 chain-of-custody integrity.
+bru run recording/verify_checksum.bru --env smoke
+```
+
+### Walk-through C — admin reviews finance + runs an async report
+
+End-to-end coverage: billing dashboard + tariff editor + reports
+sync / async routing.
+
+```bash
+# 1. Admin login.
+bru run auth/01_login.bru --env smoke
+
+# 2. Pull the dashboard composite payload (KPI + breakdown +
+#    byMonth + top-projects).
+bru run billing/finance/dashboard.bru --env smoke
+
+# 3. Read tariff snapshot → tariff_version captured.
+bru run billing/tariffs/get.bru --env smoke
+
+# 4. PATCH the tariff. Post-response asserts version strictly
+#    greater than the pre-PATCH value captured in step 3.
+bru run billing/tariffs/patch.bru --env smoke
+
+# 5. Re-fetch tariffs; the response carries the bumped version.
+bru run billing/tariffs/get.bru --env smoke
+
+# 6. Submit an export request. If window > 30 days, the handler
+#    auto-routes to async and returns 202 + report_job_id (captured).
+#    Otherwise it returns 200 + raw bytes.
+bru run reports/export.bru --env smoke
+
+# 7. Poll job status until State="succeeded".
+bru run reports/jobs/get.bru --env smoke
+
+# 8. Download the rendered artifact (302 → 24h presigned URL).
+bru run reports/jobs/download.bru --env smoke
+```
+
+Env vars used: `access_token`, `tariff_version`, `report_job_id`.
 
 ## Extend — write a new `.bru`
 
@@ -186,10 +322,12 @@ tests {
   Tenant). Avoid overloaded words like "User" outside the auth module.
 - **Negative cases** — every endpoint with a security boundary gets a
   paired `.bru` under `_errors/` covering one of: 401 (unauthenticated),
-  403 (wrong role), 404 (cross-tenant), 400 (malformed body). Keep them
-  in the same folder as their sibling so a UI walk-through reads them
-  next to the happy path; ordering is via `seq` (negative cases
-  conventionally `seq: 10+`).
+  403 (wrong role), 404 (cross-tenant), 400 (malformed body). Use
+  `seq: 10+` for negatives so they sit AFTER happy paths in the
+  Bruno UI ordering. The CLI walks subfolders alphabetically — that
+  means `_errors/` (underscore sorts before letters) runs FIRST in a
+  recursive sweep, so negative cases must stand alone (no dependency
+  on the happy-path having run first in the same `bru run` invocation).
 - **JWT capture** — only the canonical login flow persists tokens.
   Every other authenticated request reads `{{access_token}}` via
   `auth:bearer`. The logout flow clears the captured tokens on 204 so
@@ -198,6 +336,123 @@ tests {
   only; add `{ persist: true }` to write back to the env file on disk.
   CLI runs operate on the persisted file, so chained requests across
   separate invocations require persistence.
+
+## Common gotchas — distilled from Plan 22 implementation
+
+These are the production lessons that bit us during Plan 22's four
+tasks. Future agents extending the collection should read these first.
+
+1. **Top-level `#` comments fail the Bruno parser.** Bruno's grammar
+   only allows `#` inside specific blocks; a free-standing comment at
+   the top of a `.bru` file aborts parsing with a syntax error. Use
+   the `docs { ... }` block (parsed as multi-line free-text and shown
+   in the Bruno UI's "Docs" tab) instead of leading comments.
+
+2. **Bruno CLI walks subfolders alphabetically.** When you run
+   `bru run <module> -r --env smoke`, `_errors/` (underscore sorts
+   first) runs BEFORE the happy-path siblings. Negative cases must
+   therefore be self-contained — never depend on a happy-path
+   creating state the negative case will read. Use a separate
+   pre-existing env var (seeded out-of-band) for any state the
+   negative case needs.
+
+3. **CLI uses POSITIONAL path arg, not `--filename`.** The pre-3.0
+   docs example `bru run --filename foo.bru` is stale. Modern syntax
+   is `bru run foo.bru --env smoke` (path first, flags after). The
+   path can be a single file OR a directory; `-r` makes it recursive.
+
+4. **`script:post-response` runs on EVERY response, not just success.**
+   Wrap env-var captures in `if (res.status === 200 && res.body && ...)`
+   so a 401 / 4xx does not overwrite a previously-captured token /
+   id with `undefined`. The canonical login flow at
+   `auth/01_login.bru` demonstrates the guard pattern.
+
+5. **`bru.setEnvVar` is in-memory only by default.** Add
+   `{ persist: true }` for the value to write back to the env file on
+   disk. CLI runs share the env file across invocations only when the
+   capturing request persisted; otherwise the value is gone on the
+   next `bru run`. Convention: login → persist, logout → set to empty
+   + persist (so the env file does not carry a revoked token).
+
+6. **Wire-format reality is non-uniform across modules.** Several
+   common-looking endpoints diverge from their plan-text descriptions:
+
+   - **`DELETE /api/respondents/:id`** returns **200 + DeletionReceiptDTO**,
+     NOT 204 (the handler surfaces the scheduled purge timestamp to
+     the caller).
+   - **`POST /api/calls/:id/hangup`** returns **204 No Content** (the
+     FSM transition is asynchronous via NATS; the HTTP response
+     carries no body).
+   - **`POST /api/calls/:id/status`** body enum is exactly 8
+     underscore-separated values: `success`, `refused`, `wrong_person`,
+     `dropped`, `no_answer`, `busy`, `callback`, `tech_failure`.
+   - **`POST /api/surveys/:id/versions/:vid/activate`** returns **204
+     No Content** (NOT a SaveVersionResponse).
+   - **`POST /api/sessions/pause`** body field is `state: "pause"`
+     (NOT `"paused"`) and the `reason` field is REQUIRED with min=1
+     max=64 chars.
+   - **`PATCH /api/billing/tariffs`** body has NO `expected_version`
+     field — last-writer-wins, not optimistic concurrency. The version
+     is bumped server-side.
+   - **`POST /api/reports/:kind/export`** body has NO `period` field —
+     uses RFC 3339 `window_from` + `window_to` instead.
+   - **`POST /api/reports/custom`** is ALWAYS 202 (never 200). Predefined
+     export tries sync first; if window > 30 days OR estimated rows >
+     100k, the Runner returns `ErrAsyncRequired` and the handler
+     auto-routes to 202 + JobTicket.
+   - **`GET /api/reports/jobs/:jobID/download`** returns **302 redirect**
+     to the 24h presigned URL (NOT 200 + JSON envelope).
+
+   Read every `dto.go` / `handlers.go` / `*_test.go` field name + status
+   code verbatim. The `.bru` files in this collection are the
+   authoritative wire contract because they assert against the real
+   handlers; if a future doc disagrees, the `.bru` wins.
+
+7. **Error envelope shape differs across modules.** This is the
+   highest-leverage trap:
+
+   | Module | Envelope field | Code example |
+   |---|---|---|
+   | `auth/*` | `error` | `auth.insufficient_role`, `auth.token_invalid` |
+   | `crm/*` | `error` | `auth.insufficient_role` (RBAC reuses auth) |
+   | `surveys/*` | `error` | (auth envelope on RBAC, surveys-specific on validation) |
+   | `dialer/*` | `code` | `dialer.bad_request`, `dialer.invalid_state` |
+   | `recording/*` | `code` | `recording.range_not_satisfiable`, `recording.not_found` |
+   | `billing/*` | `code` | `billing.forbidden`, `billing.invalid_tariff`, `billing.no_tariffs` |
+   | `reports/*` | `code` | `reports.job_not_found`, `reports.unknown_kind`, `reports.too_large` |
+
+   When writing a negative `.bru`, verify which envelope field the
+   target module uses BEFORE writing the test assertion. The
+   `internal/<module>/transport/http/error_envelope.go` (or
+   `dto.go::ErrorEnvelope`) is the authoritative source. Five of seven
+   modules use `code`; only `auth` (and the CRM/surveys RBAC chain
+   that wraps auth's middleware) uses `error`.
+
+8. **Multipart syntax in Bruno.** For `POST /api/projects/:id/respondents/import`
+   the body block is:
+
+   ```bru
+   body:multipart-form {
+     file: @fixtures/respondents.csv
+   }
+   ```
+
+   The `@<path>` syntax loads the file from disk at request-time; the
+   path is relative to the `.bru` file's directory. The collection
+   ships a canonical CSV at `fixtures/respondents.csv` mirroring
+   `tests/smoke/respondent_helpers.go`'s seed format.
+
+9. **Query parameters require the `params:query` block** (in addition
+   to inlining them in the URL). Bruno parses both, but the
+   `params:query` block is the one rendered in the UI's Params tab;
+   omitting it makes the UI think the URL is hard-coded. Convention
+   for the collection: inline the param in the URL `url:` line AND
+   list it in `params:query`, so the UI and CLI agree.
+
+10. **`tests` block uses Chai-flavoured assertions.** `expect().to.equal()`
+    for primitives, `expect().to.have.property()` for object keys,
+    `expect().to.be.an("array")` for type checks, `expect([a,b]).to.include(x)`
+    for set membership. Bruno docs: https://docs.usebruno.com/testing.
 
 ## WebSocket endpoints — NOT covered by Bruno
 
@@ -259,7 +514,7 @@ Bruno login flow to obtain a fresh access token:
 
 ```bash
 # 1. Capture a fresh JWT via Bruno (writes access_token to env on disk).
-bru run --env smoke --filename auth/01_login.bru
+bru run auth/01_login.bru --env smoke
 
 # 2. Read it back + open a WS stream with websocat.
 ACCESS_TOKEN=$(grep '^  access_token:' environments/smoke.bru | awk '{print $2}')
@@ -272,24 +527,46 @@ inside the first FrameAuth frame, so `websocat` against it needs a
 prepared scripted payload. The smoke harness is the path of least
 resistance for realtime scenarios.
 
-## CI integration — deferred
-
-`bru run --env smoke` as a CI job is intentionally out of scope for
-Plan 22. The collection ships in this plan; a future plan decides
-whether to add a `rest` job to the GitHub Actions matrix and whether it
-gates tag-push. The smoke test layer (`go test -tags=smoke ./...`) is
-the executable regression net today.
-
 ## References
 
 - Plan 22 spec:
   [`docs/superpowers/plans/2026-05-16-22-rest-collection.md`](../../../superpowers/plans/2026-05-16-22-rest-collection.md)
-- Plan 22 references:
+- Plan 22 references (per-module endpoint inventory + gotchas):
   [`docs/references/plan-22-rest-collection.md`](../../../references/plan-22-rest-collection.md)
 - Wire-format reality (Plan 21b lessons 10–15):
   [`docs/references/plan-21b-phase-1b-smoke-scenarios.md`](../../../references/plan-21b-phase-1b-smoke-scenarios.md)
 - Per-module OpenAPI specs (where they exist):
-  [`docs/api/billing/`](../billing/),
-  [`docs/api/recording/`](../recording/),
-  [`docs/api/reports/`](../reports/).
+  [`docs/api/billing/`](../billing/) (canonical billing API),
+  [`docs/api/recording/`](../recording/) (recording API),
+  [`docs/api/reports/`](../reports/) (reports API).
+  Other modules (auth, crm, surveys, dialer, realtime) have no
+  standalone OpenAPI doc; the `internal/<module>/transport/http/dto.go`
+  files are the wire contract source.
+- Automated smoke regression net + WS coverage:
+  [`tests/smoke/`](../../../../tests/smoke/) — 10 smoke scenarios
+  exercising the same endpoints this collection enumerates, plus the
+  two WS surfaces that fall outside Bruno's scope.
 - Bruno docs: https://docs.usebruno.com/
+
+## Future work — CI integration (deferred)
+
+`bru run --env smoke` as a CI job is intentionally out of scope for
+Plan 22. The collection ships in this plan; a future plan decides
+whether to:
+
+1. Add a `rest` job to the GitHub Actions matrix.
+2. Stand up the dependencies the job needs (`make dev-up` in CI is
+   non-trivial — Postgres + Redis + NATS + cmd/api all need to be
+   spun up; the smoke harness's testcontainers seam is the natural
+   reuse target).
+3. Decide whether the job gates tag-push or is informational-only.
+
+The smoke test layer (`go test -tags=smoke ./...`) is the executable
+regression net today and remains the gating signal until the CI
+integration plan lands.
+
+Phase 2 of [`docs/architecture/10-end-to-end-testing-gaps.md`](../../../architecture/10-end-to-end-testing-gaps.md)
+is **closed** by this collection — every public HTTP endpoint of
+`cmd/api` is now exercisable from a developer-friendly UI tool, and
+the new-agent onboarding scenario the Phase 2 closure plan targeted
+is unblocked.

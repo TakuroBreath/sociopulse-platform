@@ -1,0 +1,100 @@
+meta {
+  name: Custom report (always 202 async)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/reports/custom
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "format": "xlsx",
+    "params": {
+      "project_id": "{{project_id}}",
+      "include_operator_breakdown": true,
+      "metric_keys": ["surveys_completed", "calls_handled", "avg_call_seconds"]
+    },
+    "window_from": "2026-05-01T00:00:00Z",
+    "window_to": "2026-05-07T00:00:00Z"
+  }
+}
+
+script:post-response {
+  // Custom reports ALWAYS return 202 + JobTicket — they skip the sync
+  // path entirely. Capture JobID for the polling chain. PascalCase
+  // field name (JobID, NOT job_id) — same Go-default-marshaller
+  // story as export.bru.
+  if (res.status === 202 && res.body && res.body.JobID) {
+    bru.setEnvVar("report_job_id", res.body.JobID, { persist: true });
+  }
+}
+
+tests {
+  test("202 Accepted on custom report submit (always async)", function() {
+    // POST /api/reports/custom is unconditionally async — the user
+    // explicitly asks for "async receipt" by hitting this endpoint
+    // rather than the predefined export. The handler does not even
+    // call Runner.Run. Verified at
+    // internal/reports/transport/http/handlers.go:126-146 and pinned
+    // by TestCustom_Always202 at handlers_test.go:393-398.
+    expect(res.status).to.equal(202);
+  });
+  test("response is a JobTicket with JobID + QueuedAt", function() {
+    expect(res.body).to.have.property("JobID");
+    expect(res.body.JobID).to.be.a("string");
+    expect(res.body).to.have.property("QueuedAt");
+  });
+}
+
+docs {
+  POST /api/reports/custom — render an ad-hoc custom report. ALWAYS
+  asynchronous (returns 202 + JobTicket; never 200). The handler does
+  not try the sync path — custom reports skip Runner.Run entirely
+  because their cost model is unbounded.
+
+  Role gate: admin OR supervisor (requireAdmin fast-path; operator
+  → 403 reports.forbidden).
+
+  Body shape: identical to /api/reports/:kind/export — same
+  exportRequestBody (format + params + window_from + window_to).
+  The handler injects kind=custom server-side; the request body does
+  NOT carry a "kind" field.
+
+  Params schema for custom (open enumeration — the renderer accepts
+  any keys it knows about):
+    project_id                  uuid    OPTIONAL  filter to one project
+    include_operator_breakdown  bool    OPTIONAL  per-operator section
+    metric_keys                 []str   OPTIONAL  metric ids to include
+    region_filter               []str   OPTIONAL  per-region scope
+    ... other kind-specific keys per internal/reports/templates/custom
+
+  Response (202 only):
+    JobTicket — { "JobID": "<asynq task id>", "QueuedAt": "<rfc3339>" }
+    PascalCase Go-default field names; see export.bru for the rationale.
+
+  The post-response script captures res.body.JobID into {{report_job_id}}
+  so jobs/get.bru can poll status without manual paste.
+
+  Error envelope (canonical {code, message}):
+    400 reports.invalid_params         binding error
+    400 reports.unsupported_format     format ∉ {xlsx, csv, pdf}
+    400 reports.window_invalid         window_to <= window_from
+    501 reports.async_unavailable      async path requires Redis
+
+  Chained env vars:
+    - INPUT  {{project_id}}    seeded by crm/projects/create.bru
+    - OUTPUT {{report_job_id}} consumed by jobs/get.bru +
+                              jobs/download.bru
+}

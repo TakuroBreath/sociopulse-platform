@@ -1,0 +1,132 @@
+meta {
+  name: Patch tenant tariffs (admin only)
+  type: http
+  seq: 6
+}
+
+patch {
+  url: {{base_url}}/api/billing/tariffs
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "wage_per_survey_minor": 5000,
+    "respondent_bases_minor": 200,
+    "storage_minor_per_gb_mo": 1500,
+    "fixed_fees_minor": 100000,
+    "trunk_costs_minor": {
+      "trunk-msk-1": 250,
+      "trunk-spb-1": 280
+    }
+  }
+}
+
+script:post-response {
+  // Persist the new version so a follow-up GET tariffs/get.bru can
+  // round-trip the assertion (the version should now equal the value
+  // captured here, not the value captured before the PATCH).
+  if (res.status === 200 && res.body && res.body.tariffs && typeof res.body.tariffs.version === "number") {
+    bru.setEnvVar("tariff_version", String(res.body.tariffs.version), { persist: true });
+  }
+}
+
+tests {
+  test("200 OK on tariff PATCH (admin only)", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the updated TariffsResponse with is_default=false", function() {
+    // PatchTariffs ALWAYS returns is_default=false (it just wrote a
+    // real row, so the response is no longer the defaults fallback).
+    // Verified at internal/billing/transport/http/handlers.go:284-288.
+    expect(res.body).to.have.property("tariffs");
+    expect(res.body).to.have.property("is_default");
+    expect(res.body.is_default).to.equal(false);
+  });
+  test("response reflects the patched fields", function() {
+    var t = res.body.tariffs;
+    expect(t.wage_per_survey_minor).to.equal(5000);
+    expect(t.respondent_bases_minor).to.equal(200);
+    expect(t.storage_minor_per_gb_mo).to.equal(1500);
+    expect(t.fixed_fees_minor).to.equal(100000);
+    expect(t).to.have.property("trunk_costs_minor");
+    expect(t.trunk_costs_minor["trunk-msk-1"]).to.equal(250);
+    expect(t.trunk_costs_minor["trunk-spb-1"]).to.equal(280);
+  });
+  test("version is monotonic — strictly greater than the pre-PATCH version", function() {
+    // The pre-PATCH version was captured by get.bru into
+    // {{tariff_version}}. If this file runs standalone (no prior
+    // get.bru in the same session), the env var is empty — in that
+    // case we just sanity-check that a version is present and is a
+    // positive integer.
+    expect(res.body.tariffs).to.have.property("version");
+    expect(res.body.tariffs.version).to.be.a("number");
+    var prev = bru.getEnvVar("tariff_version");
+    if (prev && Number(prev) > 0) {
+      expect(res.body.tariffs.version).to.be.above(Number(prev));
+    } else {
+      expect(res.body.tariffs.version).to.be.at.least(1);
+    }
+  });
+}
+
+docs {
+  PATCH /api/billing/tariffs — admin-only partial update of the tenant
+  tariff snapshot. Operator OR supervisor JWT → 403 billing.forbidden.
+
+  Body shape (billingapi.TariffsPatchRequest, verified at
+  internal/billing/api/dto.go:219-225):
+
+    trunk_costs_minor         map[str]int64  REPLACE-ALL when present
+                                             (admin UI always submits
+                                             the full map). Omit to
+                                             leave unchanged.
+    wage_per_survey_minor     *int64          optional scalar; nil = unchanged
+    storage_minor_per_gb_mo   *int64          optional scalar
+    respondent_bases_minor    *int64          optional scalar
+    fixed_fees_minor          *int64          optional scalar
+
+  NO expected_version field — billing's PATCH uses last-writer-wins
+  semantics, NOT optimistic concurrency. The Tariffs.version field is
+  a monotonic counter the server bumps on every successful update;
+  consumers can detect staleness by comparing but cannot CAS-write.
+  Concurrent admin edits race; the second writer's bump wins.
+
+  Pipeline (handlers.go::PatchTariffs):
+    1. Load current tariffs (ErrNoTariffs → start from defaults).
+    2. Apply the patch field-by-field; record changed keys.
+    3. Validate the merged snapshot (negative scalars → 400).
+    4. Persist via TariffStore.Update (bumps version).
+    5. Best-effort audit emit to the outbox (post-Update;
+       audit failure does NOT roll back the tariff write —
+       see service.AuditEmitter.EmitTariffUpdated docstring).
+
+  Validation: negative scalars and empty trunk_id keys trip 400
+  billing.invalid_tariff. Empty body OR no-op patch (all nil) is
+  accepted: the response is the unchanged snapshot but the version
+  still bumps (TariffStore.Update is unconditional).
+
+  Audit event: billing.tariff_updated to the outbox, carrying
+  before/after version + list of changed keys. Subscribers
+  (audit_log writer) consume best-effort, at-most-once.
+
+  Response (TariffsResponse — same shape as GET) with is_default=false.
+
+  Chained env var: {{tariff_version}} is read pre-PATCH (set by
+  get.bru) for the monotonic-bump assertion; the value is overwritten
+  with the new version after a successful PATCH so subsequent re-fetches
+  see the post-PATCH expectation.
+
+  Error envelope: canonical {code, message}. Sibling negative case:
+  _errors/operator_patches_tariff_403.bru pins the 403 from a non-
+  admin JWT (verifies the fast-path admin gate + matrix fallback).
+}

@@ -1,0 +1,75 @@
+meta {
+  name: Pie-chart breakdown (admin or supervisor)
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/api/finance/breakdown?period=month
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  period: month
+}
+
+tests {
+  test("200 OK on breakdown fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a 5-element pie-chart slice", function() {
+    // handlers.go::buildBreakdown returns exactly 5 BreakdownItem rows
+    // in the canonical order: Связь | Зарплата | Базы | Хранение |
+    // Постоянные. Verified at internal/billing/transport/http/helpers.go:50-58.
+    expect(res.body).to.be.an("array");
+    expect(res.body.length).to.equal(5);
+  });
+  test("each item is a BreakdownItem with label + value_minor", function() {
+    res.body.forEach(function(item) {
+      expect(item).to.have.property("label");
+      expect(item.label).to.be.a("string");
+      expect(item).to.have.property("value_minor");
+      expect(typeof item.value_minor).to.equal("number");
+    });
+  });
+  test("labels are the five canonical Russian glossary terms", function() {
+    // Display-only labels. The slice index is the canonical mapping —
+    // 0 → Связь, 1 → Зарплата, 2 → Базы, 3 → Хранение, 4 → Постоянные.
+    // Documented at docs/api/billing/v1/openapi.yaml § BreakdownItem.
+    var labels = res.body.map(function(i) { return i.label; });
+    expect(labels).to.deep.equal(["Связь", "Зарплата", "Базы", "Хранение", "Постоянные"]);
+  });
+}
+
+docs {
+  GET /api/finance/breakdown — the 5-slice pie-chart projection of the
+  current period's MonthBreakdown.
+
+  Role gate: admin OR supervisor. Tenant scope comes from claims.TenantID.
+
+  Query parameter:
+    period   week | month | quarter | year. Defaults to "month".
+             Identical parsing semantics to /api/finance/dashboard.
+
+  Response: []BreakdownItem (always length 5; the handler does not
+  collapse zero rows — a fresh tenant gets back five rows with
+  value_minor=0). The slice ORDER is the canonical identifier; the
+  Russian label is display-only and emitted verbatim by the server:
+
+    index 0 → Связь        (telecom_minor)
+    index 1 → Зарплата     (wages_minor)
+    index 2 → Базы         (respondent_bases_minor)
+    index 3 → Хранение     (storage_minor)
+    index 4 → Постоянные   (fixed_fee_minor)
+
+  Russian-only labels match the platform's v1 locale (the frontend does
+  not re-translate). The structured numeric values are int64 kopecks.
+
+  Error envelope: canonical {code, message}. Period out-of-enum trips
+  400 billing.invalid_period.
+}

@@ -1,0 +1,79 @@
+meta {
+  name: Trailing-N-months bar series (admin or supervisor)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/finance/byMonth?count=6
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  count: 6
+}
+
+tests {
+  test("200 OK on byMonth fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is an array of monthly bars", function() {
+    // SpendByMonth returns N rows oldest-first; the handler
+    // serialises them verbatim via toByMonthItems. Verified at
+    // internal/billing/transport/http/handlers.go:154-174 +
+    // helpers.go::toByMonthItems.
+    expect(res.body).to.be.an("array");
+    expect(res.body.length).to.be.at.most(6);
+  });
+  test("on non-empty response each item carries ByMonthItem fields", function() {
+    if (res.body.length > 0) {
+      var item = res.body[0];
+      expect(item).to.have.property("year");
+      expect(item.year).to.be.a("number");
+      expect(item).to.have.property("month");
+      expect(item.month).to.be.a("number");
+      expect(item.month).to.be.at.least(1);
+      expect(item.month).to.be.at.most(12);
+      expect(item).to.have.property("label");
+      expect(item.label).to.be.a("string");
+      expect(item).to.have.property("value_minor");
+    }
+  });
+}
+
+docs {
+  GET /api/finance/byMonth — trailing N-months spend bar series. Used
+  by the dashboard's secondary bar chart.
+
+  Role gate: admin OR supervisor.
+
+  Query parameter:
+    count    integer in [1, 24]. Defaults to 6 when omitted.
+             Out-of-range values trip 400 billing.invalid_period
+             (the handler reuses the period-invalid sentinel rather
+             than minting a separate count-invalid one).
+
+  NOTE: this endpoint does NOT accept ?period — it takes ?count instead,
+  because the response is always month-grain (count months back from
+  now). The period-grammar of the other finance endpoints does not
+  apply here.
+
+  Response: []ByMonthItem ordered oldest-first. Each row carries:
+    year         int     calendar year (e.g. 2026)
+    month        int     calendar month [1..12]
+    label        string  3-letter Russian month abbreviation
+                         (Янв / Фев / Мар / Апр / Май / Июн / Июл /
+                          Авг / Сен / Окт / Ноя / Дек) — display only,
+                         use (year, month) for date logic
+    value_minor  int64   month spend in kopecks (minor units)
+
+  Empty response (length 0) is a legitimate state when the tenant
+  recorded no call_costs rows in any of the N trailing months.
+
+  Error envelope: canonical {code, message}.
+}

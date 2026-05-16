@@ -1,0 +1,146 @@
+meta {
+  name: Export predefined report (sync or 202 async)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/reports/operator_efficiency/export
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "format": "xlsx",
+    "params": {},
+    "window_from": "2026-05-01T00:00:00Z",
+    "window_to": "2026-05-07T00:00:00Z"
+  }
+}
+
+script:post-response {
+  // The async path returns a JobTicket with the asynq task id; capture
+  // it so jobs/get.bru + jobs/download.bru can poll / fetch without
+  // manual paste. The Go JobTicket struct has NO json tags, so default
+  // marshaller emits PascalCase: JobID / QueuedAt — verified at
+  // internal/reports/api/dto.go:79-82 + handlers_test.go:269-271.
+  if (res.status === 202 && res.body && res.body.JobID) {
+    bru.setEnvVar("report_job_id", res.body.JobID, { persist: true });
+  }
+}
+
+tests {
+  test("200 OK (sync) OR 202 Accepted (auto-routed to async)", function() {
+    // Export tries Runner.Run first. If the request trips the async
+    // threshold (period > 30d OR estimated rows > 100k — Plan 13.3),
+    // the Runner returns ErrAsyncRequired and the handler auto-routes
+    // to the queue, returning 202 + JobTicket. Otherwise the response
+    // is the raw rendered bytes with Content-Type set to the
+    // renderer's MIME (xlsx / csv / pdf). Verified at
+    // internal/reports/transport/http/handlers.go:77-118.
+    expect([200, 202]).to.include(res.status);
+  });
+  test("on 200 sync, Content-Type is the renderer MIME", function() {
+    if (res.status === 200) {
+      // xlsx → application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+      // csv  → text/csv
+      // pdf  → application/pdf
+      // The HTTP layer does not re-encode; Render owns the wire shape.
+      expect(res.headers["content-type"]).to.match(/^(application\/|text\/)/);
+    }
+  });
+  test("on 202 async, the body is a JobTicket with JobID + QueuedAt", function() {
+    if (res.status === 202) {
+      // JobTicket: NO json tags on the Go struct — default Go
+      // marshaller emits PascalCase JobID / QueuedAt (NOT job_id /
+      // queued_at). Verified at internal/reports/api/dto.go:79-82.
+      expect(res.body).to.have.property("JobID");
+      expect(res.body.JobID).to.be.a("string");
+      expect(res.body).to.have.property("QueuedAt");
+    }
+  });
+}
+
+docs {
+  POST /api/reports/:kind/export — render a predefined report. The
+  path :kind is one of the 6 predefined kinds (list_kinds.bru
+  enumerates the canonical set; "custom" is rejected here — it must
+  hit POST /api/reports/custom).
+
+  Role gate: admin OR supervisor (requireAdmin fast-path; operator
+  → 403 reports.forbidden).
+
+  Body shape (exportRequestBody — verified at
+  internal/reports/transport/http/handlers.go:59-64):
+    format        enum     REQUIRED  one of "xlsx" | "csv" | "pdf".
+                                     Other values trip 400
+                                     reports.unsupported_format.
+    params        object   OPTIONAL  renderer-specific bag (e.g.
+                                     project_id, region_filter).
+                                     Schema is per-kind — see
+                                     internal/reports/templates/
+                                     <kind>/render.go for recognised
+                                     keys.
+    window_from   date-time REQUIRED  RFC 3339 — half-open window start.
+    window_to     date-time REQUIRED  RFC 3339 — half-open window end.
+
+  NO `period` field — reports take an explicit RFC 3339 window
+  (window_from, window_to), NOT the period grammar billing uses.
+  This is the canonical wire shape every reports renderer consumes.
+
+  Sync vs async routing (Plan 13.3 §FR-I):
+
+    Runner.Run is tried first. The runner returns ErrAsyncRequired
+    when the request trips EITHER of:
+      - window duration > AsyncThresholdPeriodDays (30 by default)
+      - estimated rows > AsyncThresholdRecords (100k by default)
+    On ErrAsyncRequired the handler auto-routes by enqueuing the
+    JobInput via Queue.Enqueue and returning 202 + JobTicket. Custom
+    reports (the catch-all "custom" kind) skip the sync path entirely
+    — they always 202 (see custom.bru).
+
+    The sync threshold is a guardrail against blocking the API
+    worker; large jobs are queued + run by the asynq consumer with
+    persigned-URL delivery (24h TTL).
+
+  Sync success (200):
+    Content-Type   xlsx | csv | pdf MIME
+    Body           raw rendered bytes (NOT JSON)
+
+  Async success (202):
+    Body           JobTicket — { "JobID": "<asynq task id>",
+                                 "QueuedAt": "<rfc3339>" }
+                   PascalCase field names because the Go struct has
+                   no json tags; default marshaller emits Go field
+                   names verbatim. The same naming convention applies
+                   to the Job DTO returned by jobs/get.bru.
+
+  Error envelope (canonical {code, message}):
+    400 reports.unknown_kind         path :kind not in the predefined enum
+    400 reports.unsupported_format   format ∉ {xlsx, csv, pdf}
+    400 reports.invalid_params       binding error (missing field, bad type)
+    400 reports.window_invalid       window_to <= window_from
+    422 reports.too_large            renderer exceeded the per-format cap
+        (PDF row cap, etc.)
+    501 reports.async_unavailable    async path requires Redis; the
+                                     reports queue is not configured
+
+  The post-response script captures res.body.JobID into
+  {{report_job_id}} ONLY on 202 — sync responses (200) do not have a
+  job id (the bytes are the response). The capture is guarded so a
+  failed request does not overwrite a real job id with undefined.
+
+  Chained env var (consumed downstream): {{report_job_id}} feeds
+  jobs/get.bru (status poll) + jobs/download.bru (302 to presigned
+  URL). To exercise the async path deterministically, expand the
+  window_to to span > 30 days so Runner.Run trips ErrAsyncRequired.
+}

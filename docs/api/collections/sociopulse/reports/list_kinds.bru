@@ -1,0 +1,74 @@
+meta {
+  name: List report kinds (admin or supervisor)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/reports
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on report kinds listing", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries a kinds array with exactly 7 entries", function() {
+    // ListKinds returns 6 predefined + custom — verified at
+    // internal/reports/transport/http/handlers.go:42-54 and pinned by
+    // TestListKinds at handlers_test.go:170.
+    expect(res.body).to.have.property("kinds");
+    expect(res.body.kinds).to.be.an("array");
+    expect(res.body.kinds.length).to.equal(7);
+  });
+  test("the 7 kinds are the canonical predefined set + custom", function() {
+    // ReportKind enum — internal/reports/api/dto.go:21-31. The handler
+    // emits a stable order for deterministic UI rendering.
+    var expected = [
+      "operator_efficiency",
+      "project_summary",
+      "calls_by_status",
+      "finance",
+      "quality_control",
+      "hourly_activity",
+      "custom"
+    ];
+    expected.forEach(function(kind) {
+      expect(res.body.kinds).to.include(kind);
+    });
+  });
+}
+
+docs {
+  GET /api/reports — enumerate the report kinds the admin UI's kind
+  picker can render. Returns the 6 predefined templates (operator
+  efficiency, project summary, calls by status, finance, quality
+  control, hourly activity) plus the "custom" sentinel for ad-hoc
+  parameterised reports.
+
+  Role gate: admin OR supervisor (requireAdmin middleware in
+  internal/reports/module.go::requireAdmin — fast-path on role list,
+  matrix fallback on ActionReportList for GET). Operator → 403
+  reports.forbidden.
+
+  Response:
+    kinds  []ReportKind  stable order, length always 7
+
+  Stable order is part of the contract — the frontend uses array
+  index for click handlers + analytics. The order is documented at
+  handlers.go::ListKinds verbatim.
+
+  This is a no-input request — no path or query parameters. Tenant
+  scope is implicit (the list is the same for every tenant; only
+  data the renderers fetch is tenant-scoped).
+
+  Error envelope: canonical {code, message} — same shape as billing /
+  dialer / recording. Reports envelope is verified at
+  internal/reports/transport/http/dto.go:22-24 — uses `code`, NOT
+  `error` (only auth module emits `error`).
+}

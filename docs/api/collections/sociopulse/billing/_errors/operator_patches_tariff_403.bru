@@ -1,0 +1,72 @@
+meta {
+  name: Operator patches tariff (403 billing.forbidden)
+  type: http
+  seq: 10
+}
+
+patch {
+  url: {{base_url}}/api/billing/tariffs
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{operator_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "wage_per_survey_minor": 9999
+  }
+}
+
+tests {
+  test("403 Forbidden on operator-role tariff PATCH", function() {
+    expect(res.status).to.equal(403);
+  });
+  test("response carries the billing RBAC error envelope", function() {
+    // billing's transport uses `code` (NOT `error`) — verified at
+    // internal/billing/transport/http/dto.go:24-27. Same shape as
+    // dialer + recording + reports envelopes; ONLY the auth module
+    // emits `error`.
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("billing.forbidden");
+    expect(res.body).to.have.property("message");
+  });
+}
+
+docs {
+  Negative regression for the requireRBAC admin gate on
+  PATCH /api/billing/tariffs — internal/billing/transport/http/routes.go:55.
+
+  Wire-up: GET /api/billing/tariffs accepts admin OR supervisor (fast-
+  path on ActionBillingView); PATCH /api/billing/tariffs accepts
+  ONLY admin (fast-path on ActionBillingTariffUpdate). The fast-path
+  is a role-membership check; an operator (or any non-admin) falls
+  through to the matrix RBACChecker fallback, which denies, surfacing
+  403 billing.forbidden via the canonical envelope.
+
+  Envelope shape:
+    code     "billing.forbidden"
+    message  human-readable detail from the RBACChecker error chain
+             (NEVER assert against this — the chain text is verbose)
+
+  Seeding {{operator_token}}: identical to the canonical CRM 403 case
+  at crm/_errors/operator_creates_project_403.bru — mint a fresh
+  operator via auth/admin/create_user.bru, log in as that operator
+  via auth/01_login.bru (after swapping env credentials), capture the
+  resulting access_token into {{operator_token}}, restore the admin
+  env values, run this request.
+
+  Why this is a billing-specific case (not redundant with the CRM 403):
+  the CRM 403 exercises the role-membership middleware in the CRM
+  routes layer (requireAdminRole on /api/projects). This case exercises
+  the billing-specific requireRBAC middleware in routes.go::Register
+  which has a slightly different shape (fast-path admin OR supervisor
+  for view, admin-only for write, matrix fallback). Both 403s carry
+  module-prefixed code strings so logs can pinpoint which gate fired.
+}

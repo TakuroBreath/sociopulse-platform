@@ -1,0 +1,100 @@
+meta {
+  name: Finance dashboard (admin or supervisor)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/finance/dashboard?period=month
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  period: month
+}
+
+tests {
+  test("200 OK on finance dashboard fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the DashboardResponse with the documented KPI tiles", function() {
+    // billingapi.DashboardResponse — verified at
+    // internal/billing/api/dto.go:189-204. All money fields are int64
+    // minor units (kopecks); float-typed *_pct fields are computed from
+    // the int math (delta_pct may be 0.0 when prev_spend is 0).
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("period");
+    expect(res.body).to.have.property("month_spend_minor");
+    expect(res.body).to.have.property("prev_spend_minor");
+    expect(res.body).to.have.property("delta_pct");
+    expect(res.body).to.have.property("cost_per_survey_minor");
+    expect(res.body).to.have.property("prev_cost_per_survey_minor");
+    expect(res.body).to.have.property("avg_cost_per_minute_minor");
+    expect(res.body).to.have.property("revenue_minor");
+    expect(res.body).to.have.property("margin_minor");
+    expect(res.body).to.have.property("margin_pct");
+  });
+  test("composite blocks are arrays (may be empty)", function() {
+    expect(res.body).to.have.property("breakdown");
+    expect(res.body.breakdown).to.be.an("array");
+    expect(res.body).to.have.property("by_month");
+    expect(res.body.by_month).to.be.an("array");
+    expect(res.body).to.have.property("top_projects");
+    expect(res.body.top_projects).to.be.an("array");
+  });
+  test("period carries the UTC half-open [from, to) window", function() {
+    expect(res.body.period).to.have.property("from");
+    expect(res.body.period).to.have.property("to");
+  });
+}
+
+docs {
+  GET /api/finance/dashboard — composite admin-dashboard payload (Plan 14
+  §FR-H). Returns the KPI tiles, the breakdown pie chart, the trailing
+  6-month bar series, and the top-5 projects in a single round-trip so
+  the prototype admin-pages-2.jsx::AdminFinance renders without a fan-
+  out fetch.
+
+  Role gate: admin OR supervisor (fast-path in routes.go::requireRBAC
+  for ActionBillingView; matrix fallback denies operator). Tenant scope
+  comes from claims.TenantID — there is no path-:id, so the project-
+  wide RequireSameTenant middleware does not apply.
+
+  Query parameter:
+    period   one of week | month | quarter | year. Defaults to "month"
+             when omitted. period.go::parsePeriod anchors every window
+             to UTC and half-open [from, to). Week is ISO 8601 (Monday-
+             anchored); quarter is the calendar quarter containing
+             now.Month(); year is the calendar year. Unknown values
+             trip 400 billing.invalid_period.
+
+  Response fields (DashboardResponse):
+    tenant_id                    uuid       claims.TenantID
+    period                       Period     half-open [from, to) UTC
+    month_spend_minor            int64      current-period total in kopecks
+    prev_spend_minor             int64      previous same-length-period total
+    delta_pct                    float64    (curr−prev)/prev × 100; 0 when prev=0
+    cost_per_survey_minor        int64      total / completed_surveys
+    prev_cost_per_survey_minor   int64      previous-period equivalent
+    avg_cost_per_minute_minor    int64      total × 60 / total_call_seconds
+    revenue_minor                int64      Σ contract revenue across projects
+    margin_minor                 int64      revenue − total
+    margin_pct                   float64    margin / revenue × 100; 0 when revenue=0
+    breakdown                    []         5-slice pie chart (telecom / wages /
+                                            bases / storage / fixed_fees)
+    by_month                     []         trailing 6 months bar series
+    top_projects                 []         top 5 by total_minor desc
+
+  All *_minor fields are int64 Russian rouble kopecks (100 kopecks = 1 RUB);
+  there is no float anywhere in the money path.
+
+  Error envelope: canonical {code, message} — verified at
+  internal/billing/transport/http/dto.go:24-27. Same shape as
+  recording + dialer; assert against `res.body.code` (NOT
+  `res.body.error` — auth module uses `error`, billing uses `code`).
+}

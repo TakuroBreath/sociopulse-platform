@@ -1,0 +1,103 @@
+meta {
+  name: Get report job status (admin or supervisor)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/reports/jobs/{{report_job_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on job status fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the Job DTO with State + Kind + Format", function() {
+    // reportsapi.Job — verified at internal/reports/api/dto.go:96-112.
+    // The Go struct has NO json tags, so the default marshaller emits
+    // PascalCase field names: ID, TenantID, Kind, State, BytesSize,
+    // DownloadURL, Filename, CreatedBy, CreatedAt, etc. Pinned by
+    // TestGetJob_Happy at handlers_test.go:445-449.
+    expect(res.body).to.have.property("ID");
+    expect(res.body).to.have.property("TenantID");
+    expect(res.body).to.have.property("Kind");
+    expect(res.body).to.have.property("Format");
+    expect(res.body).to.have.property("State");
+    expect(res.body).to.have.property("CreatedBy");
+    expect(res.body).to.have.property("CreatedAt");
+  });
+  test("State is one of the documented lifecycle values", function() {
+    // JobState enum: queued | running | succeeded | failed | canceled.
+    // Verified at internal/reports/api/dto.go:87-93.
+    var states = ["queued", "running", "succeeded", "failed", "canceled"];
+    expect(states).to.include(res.body.State);
+  });
+  test("download metadata is populated only when State=succeeded", function() {
+    // While state ∈ {queued, running}, BytesSize is 0 and
+    // DownloadURL / Filename / Error are empty strings. They get
+    // populated on succeed / fail.
+    if (res.body.State === "succeeded") {
+      expect(res.body.DownloadURL).to.be.a("string");
+      expect(res.body.DownloadURL.length).to.be.above(0);
+      expect(res.body.Filename).to.be.a("string");
+    }
+  });
+}
+
+docs {
+  GET /api/reports/jobs/:jobID — poll an async report job for its
+  current status. The :jobID path parameter is the asynq task id (text
+  PK on reports_jobs; NOT a UUID) — captured into {{report_job_id}}
+  by export.bru / custom.bru's post-response scripts.
+
+  Role gate: admin OR supervisor (requireAdmin fast-path; operator →
+  403 reports.forbidden). Plus per-tenant guard: jobIDTenantGuard
+  middleware (routes.go:84-114) resolves the job's owning tenant via
+  BypassRLS and returns 404 reports.job_not_found on cross-tenant
+  access — existence-probe defence (never let an attacker distinguish
+  "exists but not yours" from "does not exist").
+
+  Response (reportsapi.Job, PascalCase field names — Go struct has no
+  json tags, so default marshaller emits Go field names verbatim):
+
+    ID            string     asynq task id
+    TenantID      uuid       job's owning tenant
+    Kind          enum       one of the 7 ReportKind values
+    Format        enum       xlsx | csv | pdf
+    Params        object     renderer-specific bag (echoed back from submit)
+    Window        object     { From, To } RFC 3339 — the requested window
+    State         enum       queued | running | succeeded | failed | canceled
+    StartedAt     *date-time nullable until State=running
+    FinishedAt    *date-time nullable until State ∈ terminal {succeeded,failed,canceled}
+    BytesSize     int64      0 while non-terminal; populated on succeed
+    Filename      string     empty until State=succeeded
+    DownloadURL   string     empty until State=succeeded; 24h presigned
+                             URL minted at MarkSucceededTx (Plan 13.3 §FR-I3)
+    Error         string     empty until State=failed
+    CreatedBy     uuid       user that submitted the job (notify target)
+    CreatedAt     date-time  enqueue timestamp
+
+  Polling pattern: re-issue this request until State="succeeded" then
+  hit jobs/download.bru. Typical job latency: seconds for small
+  windows, minutes for cross-month aggregates. No long-poll / SSE
+  surface in v1.
+
+  Error envelope (canonical {code, message}):
+    401 reports.unauthenticated   missing JWT (chain wiring bug)
+    403 reports.forbidden         non-admin / non-supervisor caller
+    404 reports.job_not_found     unknown :jobID OR cross-tenant probe
+                                  (BOTH map to 404; existence-probe defence)
+    501 reports.async_unavailable async path requires Redis; queue
+                                  is not configured on this deployment
+
+  Chained env var: {{report_job_id}} — set by export.bru (on 202
+  auto-route) OR custom.bru (always 202). The variable is empty
+  when this request runs standalone; in that case the request 404s
+  (no :jobID matches).
+}

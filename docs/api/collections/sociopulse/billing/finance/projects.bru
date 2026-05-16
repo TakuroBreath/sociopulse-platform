@@ -1,0 +1,84 @@
+meta {
+  name: Per-project margin table (admin or supervisor)
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/finance/projects?period=month
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  period: month
+}
+
+tests {
+  test("200 OK on per-project margin fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is the per-project margin slice (may be empty)", function() {
+    // MarginReport.Margin returns []billingapi.ProjectMargin sorted by
+    // total_minor desc — verified at internal/billing/api/dto.go:152-166.
+    // The handler emits the array verbatim; the frontend slices top-N.
+    expect(res.body).to.be.an("array");
+  });
+  test("on non-empty result, each row carries the documented ProjectMargin shape", function() {
+    if (res.body.length > 0) {
+      var row = res.body[0];
+      expect(row).to.have.property("project_id");
+      expect(row).to.have.property("project_code");
+      expect(row).to.have.property("project_name");
+      expect(row).to.have.property("surveys");
+      expect(row).to.have.property("telecom_minor");
+      expect(row).to.have.property("wages_minor");
+      expect(row).to.have.property("respondent_bases_minor");
+      expect(row).to.have.property("storage_minor");
+      expect(row).to.have.property("total_minor");
+      expect(row).to.have.property("revenue_minor");
+      expect(row).to.have.property("margin_minor");
+      expect(row).to.have.property("cost_per_survey_minor");
+    }
+  });
+}
+
+docs {
+  GET /api/finance/projects — per-project margin table for the requested
+  period. Returns the full slice sorted by total_minor desc (the frontend
+  is responsible for top-N slicing).
+
+  Role gate: admin OR supervisor (same as the dashboard). Tenant scope
+  comes from claims.TenantID.
+
+  Query parameter:
+    period   week | month | quarter | year. Defaults to "month".
+             Identical parsing semantics to /api/finance/dashboard
+             (see dashboard.bru docs for the period grammar).
+
+  Response: []ProjectMargin — one row per project that recorded any
+  call_costs row in the period. Empty array is a legitimate state for
+  a fresh tenant with no completed calls yet.
+
+  Per-row fields (ProjectMargin):
+    project_id              uuid
+    project_code            string
+    project_name            string
+    surveys                 int64    completed surveys in period
+    telecom_minor           int64    per-minute trunk spend
+    wages_minor             int64    operator wages spend
+    respondent_bases_minor  int64    bases purchase spend
+    storage_minor           int64    recording storage spend
+    total_minor             int64    Σ of all spend components
+    revenue_minor           int64    contract revenue
+    margin_minor            int64    revenue − total
+    cost_per_survey_minor   int64    total / surveys; 0 when surveys=0
+
+  All *_minor fields are int64 Russian rouble kopecks.
+
+  Error envelope: same {code, message} shape as the dashboard endpoint.
+}

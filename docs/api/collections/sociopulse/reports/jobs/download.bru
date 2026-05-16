@@ -1,0 +1,87 @@
+meta {
+  name: Download report artifact (302 → 24h presigned URL)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/api/reports/jobs/{{report_job_id}}/download
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+settings {
+  followRedirects: false
+}
+
+tests {
+  test("302 Found — redirect to the presigned S3 URL", function() {
+    // Download is a 302 redirect (NOT a 200 + JSON body) — verified at
+    // internal/reports/transport/http/handlers.go:191 (c.Redirect(302))
+    // and pinned by TestDownload_RedirectsToPresignedURL at
+    // handlers_test.go:510. settings { followRedirects: false } in
+    // the request block keeps Bruno from auto-following so the test
+    // can assert on the 302 itself.
+    expect(res.status).to.equal(302);
+  });
+  test("Location header carries the 24h presigned URL", function() {
+    // The presigned URL is minted eagerly at MarkSucceededTx and
+    // persisted on the reports_jobs row; this handler is a thin proxy.
+    // 24h TTL by contract (Plan 13.3 §FR-I3); after expiry the
+    // underlying S3 endpoint returns 403, NOT this handler.
+    expect(res.headers).to.have.property("location");
+    expect(res.headers["location"]).to.be.a("string");
+    expect(res.headers["location"].length).to.be.above(0);
+  });
+}
+
+docs {
+  GET /api/reports/jobs/:jobID/download — download the rendered
+  artifact for a succeeded job. Returns 302 with a Location header
+  pointing at the 24h presigned S3 URL (NOT a 200 + JSON envelope).
+  The client follows the redirect to fetch the actual bytes from
+  object store directly.
+
+  Bruno's default behaviour is to follow redirects transparently;
+  this .bru disables that via settings { followRedirects: false }
+  so the 302 surfaces in res.status for assertion. Sibling
+  recording/get_audio.bru does NOT need this setting because the
+  recording stream is a direct 200 + bytes.
+
+  Role gate: admin OR supervisor (requireAdmin fast-path; operator
+  → 403 reports.forbidden). Plus per-tenant guard: jobIDTenantGuard
+  resolves the job's owning tenant via BypassRLS and returns 404
+  reports.job_not_found on mismatch — same existence-probe defence
+  as jobs/get.bru.
+
+  Response:
+    302 Found
+      Location: <24h presigned URL>      e.g. https://storage.yandexcloud.net/
+                                              sociopulse-reports-<bucket>/
+                                              report_<jobid>.xlsx?X-Amz-...
+
+  The presigned URL is single-use from the client's perspective and
+  expires 24h after minting (timestamp captured at MarkSucceededTx
+  on the worker side). Expired URLs return 403 from S3, NOT from this
+  handler. The API contract documents the 24h window so clients can
+  decide whether to re-mint (re-submit the export) or surface the
+  expiry to the user.
+
+  Error envelope (canonical {code, message}):
+    401 reports.unauthenticated      missing JWT (wiring bug)
+    403 reports.forbidden            non-admin / non-supervisor caller
+    404 reports.job_not_found        unknown :jobID OR cross-tenant probe
+    409 reports.job_not_ready        job state ∉ {succeeded} OR DownloadURL
+                                     is empty (queued / running / failed /
+                                     canceled). Verified at handlers.go:186-191.
+    501 reports.async_unavailable    async path requires Redis
+
+  Chained env var: {{report_job_id}} — same value as jobs/get.bru;
+  set by export.bru / custom.bru. To exercise the 409 case, hit this
+  endpoint with a job id whose state is still "queued" or "running"
+  (poll jobs/get.bru to see when it transitions).
+}

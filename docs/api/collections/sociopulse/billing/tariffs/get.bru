@@ -1,0 +1,101 @@
+meta {
+  name: Get tenant tariff snapshot (admin or supervisor)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/api/billing/tariffs
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+script:post-response {
+  // Capture the current monotonic tariff version so the sibling
+  // patch.bru can document the "version N → N+1" expectation in its
+  // tests block. Persist so the value survives across CLI invocations
+  // (Bruno: bru.setEnvVar without { persist: true } is in-memory only).
+  if (res.status === 200 && res.body && res.body.tariffs && typeof res.body.tariffs.version === "number") {
+    bru.setEnvVar("tariff_version", String(res.body.tariffs.version), { persist: true });
+  }
+}
+
+tests {
+  test("200 OK on tariff snapshot fetch", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a TariffsResponse with tariffs + is_default flag", function() {
+    // billingapi.TariffsResponse — verified at internal/billing/api/dto.go:209-213.
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("tariffs");
+    expect(res.body).to.have.property("is_default");
+    expect(res.body.is_default).to.be.a("boolean");
+  });
+  test("tariffs carries the canonical Tariffs shape", function() {
+    // billingapi.Tariffs — verified at internal/billing/api/dto.go:30-39.
+    // All money fields are int64 kopecks (minor units).
+    var t = res.body.tariffs;
+    expect(t).to.have.property("tenant_id");
+    expect(t).to.have.property("version");
+    expect(t.version).to.be.a("number");
+    expect(t).to.have.property("updated_at");
+    expect(t).to.have.property("wage_per_survey_minor");
+    expect(t).to.have.property("storage_minor_per_gb_mo");
+    expect(t).to.have.property("respondent_bases_minor");
+    expect(t).to.have.property("fixed_fees_minor");
+  });
+}
+
+docs {
+  GET /api/billing/tariffs — fetch the tenant's tariff snapshot.
+
+  NOTE: route prefix is /api/billing/* (NOT /api/finance/* as the older
+  Plan 22 reference table suggested). Verified at
+  internal/billing/transport/http/routes.go:52 — billing has TWO route
+  groups: /api/finance/{dashboard,projects,breakdown,byMonth} for the
+  aggregate reports + /api/billing/tariffs for the per-tenant config
+  surface. The siblings under finance/ talk to the report side; this
+  file + patch.bru talk to the tariff side.
+
+  Role gate: admin OR supervisor (fast-path on ActionBillingView).
+  Operator JWT → 403 billing.forbidden.
+
+  Response (TariffsResponse):
+    tenant_id   uuid
+    tariffs     Tariffs   (snapshot)
+    is_default  bool      true when the response is the platform
+                          BillingConfig.Defaults fallback (tenant has
+                          not yet PATCHed its own tariffs). The admin
+                          UI flags "still on defaults" using this.
+
+  Tariffs fields:
+    tenant_id                 uuid
+    version                   int        monotonic counter; bumped on
+                                         every PATCH that mutates a field
+    updated_at                date-time
+    trunk_costs_minor         map[str]   per-trunk per-minute kopecks
+                                         (open enumeration — no server-
+                                         side trunk allow-list)
+    wage_per_survey_minor     int64      operator wage per completed survey
+    storage_minor_per_gb_mo   int64      S3 storage kopecks per GB-month
+    respondent_bases_minor    int64      per-imported-record bases purchase
+    fixed_fees_minor          int64      constant monthly overhead
+
+  The post-response script persists tariffs.version into the
+  {{tariff_version}} env slot so the sibling patch.bru can document
+  the expected version bump (the version is set, not asserted, here —
+  the assertion happens in patch.bru by re-fetching after the update).
+
+  Chained env vars: this is a no-input request — fetches the tariff
+  for the JWT claim's tenant. The post-response capture chain runs
+  ONLY when status=200.
+
+  Error envelope: canonical {code, message}. ErrNoTariffs is non-fatal —
+  the handler falls back to defaults with is_default=true rather than
+  surfacing 409 for the typical "fresh tenant" path. 409 billing.no_tariffs
+  is reserved for the operationally-rare "no defaults configured" case.
+}

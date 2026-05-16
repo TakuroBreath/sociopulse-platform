@@ -1,0 +1,72 @@
+meta {
+  name: Cross-tenant report job probe (404 reports.job_not_found)
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{base_url}}/api/reports/jobs/{{report_job_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{other_tenant_token}}
+}
+
+tests {
+  test("404 Not Found on cross-tenant job probe", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response carries the reports envelope (NOT an empty body)", function() {
+    // jobIDTenantGuard emits its own {code, message} envelope on
+    // mismatch (unlike pkg/middleware/tenant.RequireSameTenant which
+    // aborts with bare 404). Verified at
+    // internal/reports/transport/http/routes.go:99-110.
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("reports.job_not_found");
+    expect(res.body).to.have.property("message");
+  });
+}
+
+docs {
+  Negative regression for the per-tenant guard on
+  GET /api/reports/jobs/:jobID — internal/reports/transport/http/routes.go:84-114.
+
+  The jobIDTenantGuard middleware:
+    1. Pulls claims.TenantID from the gin context.
+    2. Resolves the job's owning tenant via TenantResolver.SelectTenantByJobID
+       (BypassRLS lookup; reports_jobs.id is asynq task id — text PK,
+       NOT a UUID, hence the resolver works on string).
+    3. On resolver error OR tenant mismatch → aborts with 404
+       reports.job_not_found.
+
+  Critically, mismatch and missing both return the SAME 404 + same code:
+  this is the existence-probe defence — never let an attacker
+  distinguish "exists but belongs to another tenant" from "does not
+  exist at all". Documented in routes.go's middleware comment and
+  pinned by TestGetJob_NotFound at handlers_test.go:470-473.
+
+  Envelope shape (different from pkg/middleware/tenant.RequireSameTenant
+  which emits bare 404 + no body — that's the CRM / dialer convention;
+  reports uses an explicit envelope for symmetry with the rest of the
+  module's error responses):
+    code     "reports.job_not_found"
+    message  "job not found" (verbatim) — assert on `code`, NOT
+             message (the message string is stable but the code is the
+             contract).
+
+  Seeding {{other_tenant_token}}: identical to the canonical cross-
+  tenant case at crm/_errors/cross_tenant_project_get.bru — mint a
+  second tenant + admin via SQL with a different org_code, log in as
+  that admin via auth/01_login.bru (after swapping org_code +
+  admin_login env), capture access_token into {{other_tenant_token}},
+  restore the original env values, run this request.
+
+  Pre-condition: {{report_job_id}} must point at a real job owned by
+  the FIRST tenant — set by export.bru OR custom.bru's post-response
+  capture. Running this request when {{report_job_id}} is empty
+  results in a vacuous 404 (no job matches the empty path); the
+  intended assertion is the tenant-mismatch path, which requires a
+  real job id from the OTHER tenant's perspective.
+}
