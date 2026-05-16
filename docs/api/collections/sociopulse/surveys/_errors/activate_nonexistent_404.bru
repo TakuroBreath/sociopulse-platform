@@ -1,0 +1,33 @@
+meta {
+  name: Activate non-existent version (404)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/versions/00000000-0000-0000-0000-000000000000/activate
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("404 Not Found on missing version id", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response carries the canonical surveys.version_not_found envelope", function() {
+    expect(res.body).to.have.property("error");
+    expect(res.body.error).to.equal("surveys.version_not_found");
+  });
+}
+
+docs {
+  Negative regression for the version-not-found path in
+  service.Activate (surfaces as surveysapi.ErrVersionNotFound, mapped
+  to 404 surveys.version_not_found at
+  internal/surveys/transport/http/errors.go:49). The zero-UUID is
+  guaranteed not to match any real version row.
+}

@@ -1,0 +1,74 @@
+meta {
+  name: Preview run (stateless DSL evaluation)
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/preview/run
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "schema": {
+      "version": "1.0",
+      "primary_mode": "flow",
+      "metadata": {
+        "name": "preview-minimal",
+        "purpose": "bruno preview fixture"
+      },
+      "nodes": [
+        { "id": "start", "kind": "start", "next": [{ "to": "q1" }] },
+        {
+          "id": "q1",
+          "kind": "question",
+          "title": "Do you support the new policy?",
+          "question_type": "single",
+          "required": true,
+          "options": [
+            { "id": "yes", "label": "Yes", "value": "yes" },
+            { "id": "no", "label": "No", "value": "no" }
+          ],
+          "next": [{ "to": "end_ok" }]
+        },
+        { "id": "end_ok", "kind": "success-end", "title": "Thank you!" }
+      ]
+    },
+    "current_node_id": "start",
+    "answers": {}
+  }
+}
+
+tests {
+  test("200 OK on preview run", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the runtime decision shape", function() {
+    expect(res.body).to.have.property("terminated");
+    expect(res.body).to.have.property("progress");
+  });
+  test("from start with empty answers the runtime advances to q1", function() {
+    // The canonical fixture has an unconditional edge start → q1, so
+    // the runtime resolves it without needing any answers (see
+    // internal/surveys/runtime/runtime.go::NextNode start-edge path).
+    expect(res.body.next_node_id).to.equal("q1");
+    expect(res.body.terminated).to.equal(false);
+  });
+}
+
+docs {
+  Stateless — schema is parsed in-place and the runtime computes the
+  next node. No row is persisted. Mirror of cmd/api smoke scenario 4's
+  preview step (smoke.MinimalValidSurveySchema is the canonical
+  fixture this body inlines).
+}

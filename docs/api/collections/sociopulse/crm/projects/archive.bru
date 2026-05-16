@@ -1,0 +1,27 @@
+meta {
+  name: Archive project (admin)
+  type: http
+  seq: 9
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/archive
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on archive", function() {
+    expect(res.status).to.equal(204);
+  });
+}
+
+docs {
+  Soft transition — archived projects remain queryable via
+  ?include_archived=true on the list endpoint. The smoke harness asserts
+  the row is still returned by the cross-tenant guard after archival.
+}

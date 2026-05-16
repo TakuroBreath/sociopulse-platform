@@ -1,0 +1,43 @@
+meta {
+  name: Update project (admin)
+  type: http
+  seq: 6
+}
+
+patch {
+  url: {{base_url}}/api/projects/{{project_id}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "name": "Smoke survey project (updated)",
+    "target_count": 750
+  }
+}
+
+tests {
+  test("200 OK on update", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response reflects the patched fields", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.name).to.equal("Smoke survey project (updated)");
+    expect(res.body.target_count).to.equal(750);
+  });
+}
+
+docs {
+  PATCH is partial-update semantics: every field is a pointer in the
+  request DTO so any subset may be sent. Fields omitted from the body
+  are left unchanged.
+}

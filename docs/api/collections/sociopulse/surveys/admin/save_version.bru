@@ -1,0 +1,89 @@
+meta {
+  name: Admin — save survey version
+  type: http
+  seq: 4
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/versions
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "schema": {
+      "version": "1.0",
+      "primary_mode": "flow",
+      "metadata": {
+        "name": "save-version-minimal",
+        "purpose": "bruno save_version fixture"
+      },
+      "nodes": [
+        { "id": "start", "kind": "start", "next": [{ "to": "q1" }] },
+        {
+          "id": "q1",
+          "kind": "question",
+          "title": "Do you support the new policy?",
+          "question_type": "single",
+          "required": true,
+          "options": [
+            { "id": "yes", "label": "Yes", "value": "yes" },
+            { "id": "no", "label": "No", "value": "no" }
+          ],
+          "next": [{ "to": "end_ok" }]
+        },
+        { "id": "end_ok", "kind": "success-end", "title": "Thank you!" }
+      ]
+    },
+    "minor": false
+  }
+}
+
+script:post-response {
+  // Persist the freshly-minted version id so activate_version.bru can
+  // target it. SaveVersion returns 201 + the full VersionDTO (NOT a
+  // bare id wrapper — Plan-21b lesson 10).
+  if (res.status === 201 && res.body && res.body.id) {
+    bru.setEnvVar("version_id", res.body.id, { persist: true });
+  }
+}
+
+tests {
+  test("201 Created on successful save", function() {
+    expect(res.status).to.equal(201);
+  });
+  test("response is a full VersionDTO with major/minor ints", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body).to.have.property("survey_id");
+    expect(res.body.survey_id).to.equal(bru.getEnvVar("survey_id"));
+    expect(res.body).to.have.property("major");
+    expect(res.body.major).to.be.a("number");
+    expect(res.body).to.have.property("minor");
+    expect(res.body.minor).to.be.a("number");
+    expect(res.body).to.have.property("is_active");
+    expect(res.body.is_active).to.equal(false);
+  });
+}
+
+docs {
+  Versioning rules (per Plan-21b lesson 11):
+    - First version saved under a survey: major=1, minor=0.
+    - minor=false on a survey with existing versions: latestMajor+1,
+      minor=0.
+    - minor=true: same major, minor=latest+1 (backwards-compatible
+      bump).
+
+  On validator failure the response is 422 with the structured
+  ValidationReportDTO + issues array (NOT this happy-path shape).
+  The schema fixture inlined here mirrors smoke
+  MinimalValidSurveySchema (tests/smoke/survey_seed.go).
+}

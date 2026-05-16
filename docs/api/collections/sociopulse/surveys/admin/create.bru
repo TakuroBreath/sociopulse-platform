@@ -1,0 +1,55 @@
+meta {
+  name: Admin — create survey
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/surveys
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "name": "Smoke bruno survey",
+    "description": "Created by docs/api/collections/sociopulse/surveys/admin/create.bru",
+    "primary_mode": "flow"
+  }
+}
+
+script:post-response {
+  // Persist the freshly-minted survey id so sibling .bru files (get,
+  // versions_list, versions_active, preview_run, validate, update,
+  // archive, save_version, activate_version) can target the same row
+  // without manual editing.
+  if (res.status === 201 && res.body && res.body.id) {
+    bru.setEnvVar("survey_id", res.body.id, { persist: true });
+  }
+}
+
+tests {
+  test("201 Created on successful survey creation", function() {
+    expect(res.status).to.equal(201);
+  });
+  test("response is the CreateSurveyResponse with the new id", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.id).to.be.a("string");
+  });
+}
+
+docs {
+  CreateSurveyRequest has NO `code` field (Plan-21b lesson 10) — body
+  is {name, description?, primary_mode?} only. primary_mode is one of
+  {"form", "flow"} and defaults to "form" when omitted. The response
+  is the bare {id: "..."} shape (NOT the full SurveyDTO); fetch the
+  full DTO via surveys/get.bru after creation.
+}

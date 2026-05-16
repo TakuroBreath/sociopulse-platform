@@ -1,0 +1,37 @@
+meta {
+  name: Get active survey version
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/surveys/{{survey_id}}/versions/active
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on active version", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a VersionDTO marked is_active=true", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body).to.have.property("survey_id");
+    expect(res.body.survey_id).to.equal(bru.getEnvVar("survey_id"));
+    expect(res.body).to.have.property("major");
+    expect(res.body).to.have.property("minor");
+    expect(res.body).to.have.property("is_active");
+    expect(res.body.is_active).to.equal(true);
+  });
+}
+
+docs {
+  Returns 404 surveys.no_active_version when no version has been
+  activated yet (a freshly-created survey with no Activate call
+  hits this). The smoke harness covers the activate flow end-to-end
+  in cmd/api/smoke_surveys_test.go.
+}

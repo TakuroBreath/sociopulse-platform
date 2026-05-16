@@ -1,0 +1,39 @@
+meta {
+  name: Admin — update survey
+  type: http
+  seq: 2
+}
+
+patch {
+  url: {{base_url}}/api/surveys/{{survey_id}}
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "name": "Smoke bruno survey (updated)",
+    "description": "Patched via surveys/admin/update.bru"
+  }
+}
+
+tests {
+  test("204 No Content on update", function() {
+    expect(res.status).to.equal(204);
+  });
+}
+
+docs {
+  PATCH semantics — pointer fields in UpdateSurveyRequest (name,
+  description, primary_mode) signal "leave unchanged when nil". Any
+  subset may be sent. The handler returns 204 No Content; fetch the
+  patched DTO via surveys/get.bru.
+}

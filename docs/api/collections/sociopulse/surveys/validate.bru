@@ -1,0 +1,65 @@
+meta {
+  name: Validate survey schema (admin)
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/validate
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "version": "1.0",
+    "primary_mode": "flow",
+    "metadata": {
+      "name": "validate-minimal",
+      "purpose": "bruno validate fixture"
+    },
+    "nodes": [
+      { "id": "start", "kind": "start", "next": [{ "to": "q1" }] },
+      {
+        "id": "q1",
+        "kind": "question",
+        "title": "Do you support the new policy?",
+        "question_type": "single",
+        "required": true,
+        "options": [
+          { "id": "yes", "label": "Yes", "value": "yes" },
+          { "id": "no", "label": "No", "value": "no" }
+        ],
+        "next": [{ "to": "end_ok" }]
+      },
+      { "id": "end_ok", "kind": "success-end", "title": "Thank you!" }
+    ]
+  }
+}
+
+tests {
+  test("200 OK on a passing schema", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a ValidationReportDTO with valid=true", function() {
+    expect(res.body).to.have.property("valid");
+    expect(res.body.valid).to.equal(true);
+  });
+}
+
+docs {
+  The handler reads the request body as raw JSON (NOT wrapped in a
+  schema field — see handlers.go::validateSchema). On failure the
+  response is 422 with the structured ValidationReportDTO + issues
+  array. The :id path param must be a valid UUID but the survey row
+  is NOT looked up (the endpoint is stateless — anyone with the
+  admin role on any survey id can use it as a schema linter).
+}

@@ -1,0 +1,63 @@
+meta {
+  name: Import respondents from CSV (admin, multipart)
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/respondents/import
+  body: multipart-form
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+body:multipart-form {
+  file: @file(fixtures/respondents.csv) @contentType(text/csv)
+  format: csv
+}
+
+script:post-response {
+  // Persist the async job_id so crm/imports/get_status.bru can poll it.
+  // The handler returns 202 Accepted with an ImportTicketDTO carrying
+  // the opaque job id; sentinel status here is "queued" (see
+  // internal/crm/service/import.go:236 — every fresh ticket starts as
+  // queued before the worker picks it up).
+  if (res.status === 202 && res.body && res.body.job_id) {
+    bru.setEnvVar("import_job_id", res.body.job_id, { persist: true });
+  }
+}
+
+tests {
+  test("202 Accepted on enqueue", function() {
+    expect(res.status).to.equal(202);
+  });
+  test("response is an ImportTicketDTO with the opaque job ticket", function() {
+    expect(res.body).to.have.property("job_id");
+    expect(res.body).to.have.property("project_id");
+    expect(res.body.project_id).to.equal(bru.getEnvVar("project_id"));
+    expect(res.body).to.have.property("status");
+    expect(res.body.status).to.equal("queued");
+    expect(res.body).to.have.property("started_at");
+  });
+}
+
+docs {
+  Multipart-form upload — Bruno's @file(<path>) syntax resolves
+  relative paths against the collection root (the directory carrying
+  bruno.json), per packages/bruno-cli/src/utils/form-data.js. The
+  fixture lives at fixtures/respondents.csv with the canonical header
+  phone,full_name,external_ref (mirrors
+  tests/smoke/respondent_helpers.go::BuildCSVImport).
+
+  The format field is technically optional — the handler also infers
+  csv from the .csv filename extension (respondent_handler.go
+  ::inferImportFormat) — but we include it explicitly so the wire
+  shape doesn't depend on filename heuristics.
+
+  After this request lands a job_id, run crm/imports/get_status.bru
+  to poll until state="succeeded" (terminal states: "succeeded" /
+  "failed").
+}

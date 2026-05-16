@@ -1,0 +1,51 @@
+meta {
+  name: Create project (admin)
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/api/projects
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "code": "SMOKE-PROJ-001",
+    "name": "Smoke survey project",
+    "customer": "Smoke ACME",
+    "target_count": 500
+  }
+}
+
+script:post-response {
+  // Persist the freshly-minted project id so sibling .bru files (get,
+  // progress, members, update, pause/resume/archive, assign, respondent
+  // CRUD, dialer sessions/start) can target the same row without manual
+  // editing.
+  if (res.status === 201 && res.body && res.body.id) {
+    bru.setEnvVar("project_id", res.body.id, { persist: true });
+  }
+}
+
+tests {
+  test("201 Created on successful project creation", function() {
+    expect(res.status).to.equal(201);
+  });
+  test("response is a ProjectDTO with the expected fields", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("code");
+    expect(res.body.code).to.equal("SMOKE-PROJ-001");
+    expect(res.body).to.have.property("status");
+  });
+}

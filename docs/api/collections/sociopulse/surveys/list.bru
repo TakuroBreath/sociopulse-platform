@@ -1,0 +1,33 @@
+meta {
+  name: List surveys
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/surveys?limit=50&offset=0
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  limit: 50
+  offset: 0
+  ~status: active
+  ~search: smoke
+}
+
+tests {
+  test("200 OK on list", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the surveys array + total", function() {
+    expect(res.body).to.have.property("surveys");
+    expect(res.body).to.have.property("total");
+    expect(res.body.surveys).to.be.an("array");
+  });
+}

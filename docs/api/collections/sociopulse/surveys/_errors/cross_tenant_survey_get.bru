@@ -1,0 +1,37 @@
+meta {
+  name: Cross-tenant survey GET (404)
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{base_url}}/api/surveys/{{survey_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{other_tenant_token}}
+}
+
+tests {
+  test("404 Not Found on cross-tenant probe", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response body is empty (clean 404 from RequireSameTenant)", function() {
+    // pkg/middleware/tenant.RequireSameTenant aborts with bare 404 +
+    // no body when the resolver returns ErrNotFound. Same envelope
+    // shape as crm — deliberate; hides whether the row exists in
+    // another tenant.
+    expect(res.body === "" || res.body === null || Object.keys(res.body || {}).length === 0).to.equal(true);
+  });
+}
+
+docs {
+  Negative regression for the cross-tenant guard
+  (pkg/middleware/tenant.RequireSameTenant + surveys
+  surveyTenantResolver in routes.go:67). See
+  crm/_errors/cross_tenant_project_get.bru for the
+  {{other_tenant_token}} seeding procedure — the env var is shared
+  across modules.
+}

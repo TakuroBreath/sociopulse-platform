@@ -1,0 +1,53 @@
+meta {
+  name: Create respondent (admin)
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/respondents
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "phone": "+79001234567",
+    "region_code": "MSK",
+    "attributes": {
+      "full_name": "Alice Smoke",
+      "external_ref": "ext-bru-001"
+    },
+    "source": "imported"
+  }
+}
+
+script:post-response {
+  // Persist the freshly-minted respondent id so sibling .bru files
+  // (get / get_with_phone / delete) can target the same row without
+  // manual editing.
+  if (res.status === 201 && res.body && res.body.id) {
+    bru.setEnvVar("respondent_id", res.body.id, { persist: true });
+  }
+}
+
+tests {
+  test("201 Created on successful respondent creation", function() {
+    expect(res.status).to.equal(201);
+  });
+  test("response is a RespondentDTO with the masked phone projection", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("project_id");
+    expect(res.body).to.have.property("phone_masked");
+    expect(res.body).to.have.property("status");
+  });
+}

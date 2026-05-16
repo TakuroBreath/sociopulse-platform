@@ -1,0 +1,55 @@
+meta {
+  name: Operator creates project (403)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/api/projects
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{operator_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "code": "OPERATOR-FORBIDDEN-001",
+    "name": "Should be rejected"
+  }
+}
+
+tests {
+  test("403 Forbidden on operator-role attempt to create project", function() {
+    expect(res.status).to.equal(403);
+  });
+  test("response carries the canonical RBAC error envelope", function() {
+    expect(res.body).to.have.property("error");
+    expect(res.body.error).to.equal("auth.insufficient_role");
+  });
+}
+
+docs {
+  Negative regression for the requireAdminRole RBAC gate
+  (internal/crm/transport/http/routes.go:71). Operator-only tokens hit
+  the adminProjects subgroup and are rejected before the handler runs.
+
+  Seeding {{operator_token}}:
+    1. Run auth/admin/create_user.bru to mint a fresh operator (the
+       request body already sets roles=["operator"]); persist the
+       returned temp_password to a scratch note.
+    2. Temporarily swap env vars admin_login/admin_password →
+       new-operator / <temp_password> and run auth/01_login.bru.
+    3. Copy the access_token into the {{operator_token}} env slot.
+    4. Restore the original env values + run this request.
+
+  Alternative: ship a separate auth/_login_as_operator.bru chain that
+  encapsulates the swap — deferred from Plan 22 scope (would touch
+  Task 1 auth folder).
+}

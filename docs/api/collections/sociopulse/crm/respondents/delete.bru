@@ -1,0 +1,35 @@
+meta {
+  name: Delete respondent (admin, soft-delete)
+  type: http
+  seq: 6
+}
+
+delete {
+  url: {{base_url}}/api/respondents/{{respondent_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on delete (returns DeletionReceiptDTO)", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the soft-delete receipt with scheduled purge", function() {
+    expect(res.body).to.have.property("respondent_id");
+    expect(res.body.respondent_id).to.equal(bru.getEnvVar("respondent_id"));
+    expect(res.body).to.have.property("scheduled_purge_at");
+  });
+}
+
+docs {
+  Soft-delete — stamps deleted_at + schedules the 30-day PurgeWorker
+  hard-delete. The handler returns 200 with DeletionReceiptDTO (NOT
+  204) so the caller can surface the scheduled purge timestamp to the
+  user. Hard-purge is handled out-of-band by
+  internal/crm/service/purge.go::PurgeWorker after the retention
+  window elapses.
+}

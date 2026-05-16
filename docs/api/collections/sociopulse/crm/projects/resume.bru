@@ -1,0 +1,21 @@
+meta {
+  name: Resume project (admin)
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/resume
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on resume", function() {
+    expect(res.status).to.equal(204);
+  });
+}

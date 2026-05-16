@@ -1,0 +1,35 @@
+meta {
+  name: Get respondent with plaintext phone (admin)
+  type: http
+  seq: 5
+}
+
+get {
+  url: {{base_url}}/api/respondents/{{respondent_id}}/with-phone
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on get-with-phone", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a RespondentDTO with the decrypted phone exposed", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.id).to.equal(bru.getEnvVar("respondent_id"));
+    expect(res.body).to.have.property("phone");
+    expect(res.body.phone).to.be.a("string");
+    expect(res.body).to.have.property("phone_masked");
+  });
+}
+
+docs {
+  Admin-only path — operator+ tokens are rejected with 403
+  auth.insufficient_role at the requireAdminRole gate. Every successful
+  access writes an audit_log entry through the service-layer audit
+  decorator (see internal/crm/service/respondent.go::GetWithPhone).
+}

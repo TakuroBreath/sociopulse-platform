@@ -1,0 +1,49 @@
+meta {
+  name: Cross-tenant project GET (404)
+  type: http
+  seq: 10
+}
+
+get {
+  url: {{base_url}}/api/projects/{{project_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{other_tenant_token}}
+}
+
+tests {
+  test("404 Not Found on cross-tenant probe", function() {
+    expect(res.status).to.equal(404);
+  });
+  test("response body is empty (clean 404 from RequireSameTenant)", function() {
+    // pkg/middleware/tenant.RequireSameTenant aborts with bare 404 +
+    // no body when the resolver returns ErrNotFound. This deliberately
+    // hides whether the row exists in another tenant from a probing
+    // caller.
+    expect(res.body === "" || res.body === null || Object.keys(res.body || {}).length === 0).to.equal(true);
+  });
+}
+
+docs {
+  Negative regression for the cross-tenant guard
+  (pkg/middleware/tenant.RequireSameTenant + crm projectTenantResolver
+  in routes.go:103). Seeded by manually logging in as an admin from a
+  second tenant (different org_code) and storing the access token in
+  env var {{other_tenant_token}}; then this request uses that token
+  to probe a {{project_id}} owned by the first tenant. The guard
+  resolves the project's tenant_id, compares to claims.TenantID, and
+  aborts with bare 404 on mismatch.
+
+  Seeding {{other_tenant_token}}:
+    1. SeedTenantAndAdmin a second tenant via SQL (mirror first-time
+       setup in collection README but with a different org_code, e.g.
+       "SMOKE-OTHER").
+    2. Run auth/01_login.bru against that tenant (temporarily swap
+       org_code + admin_login in the env file).
+    3. Copy the access_token value into the {{other_tenant_token}}
+       env slot.
+    4. Restore the original env values + run this request.
+}

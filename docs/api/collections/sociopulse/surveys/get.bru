@@ -1,0 +1,29 @@
+meta {
+  name: Get survey
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/surveys/{{survey_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on get", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a SurveyDTO for the requested id", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.id).to.equal(bru.getEnvVar("survey_id"));
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("name");
+    expect(res.body).to.have.property("primary_mode");
+    expect(res.body).to.have.property("status");
+  });
+}

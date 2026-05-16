@@ -1,0 +1,25 @@
+meta {
+  name: List survey versions
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/api/surveys/{{survey_id}}/versions
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on versions list", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries a versions array", function() {
+    expect(res.body).to.have.property("versions");
+    expect(res.body.versions).to.be.an("array");
+  });
+}

@@ -1,0 +1,29 @@
+meta {
+  name: Get project progress
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/api/projects/{{project_id}}/progress
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on progress", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a ProjectProgressDTO with the canonical counters", function() {
+    expect(res.body).to.have.property("project_id");
+    expect(res.body).to.have.property("target_count");
+    expect(res.body).to.have.property("completed_count");
+    expect(res.body).to.have.property("in_progress_count");
+    expect(res.body).to.have.property("pending_count");
+    expect(res.body).to.have.property("percent_done");
+  });
+}

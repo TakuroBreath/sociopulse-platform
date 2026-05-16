@@ -1,0 +1,46 @@
+meta {
+  name: Get import job status (admin)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/imports/{{import_job_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on import status", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is an ImportStatusDTO with the canonical counter fields", function() {
+    expect(res.body).to.have.property("job_id");
+    expect(res.body.job_id).to.equal(bru.getEnvVar("import_job_id"));
+    expect(res.body).to.have.property("state");
+    expect(res.body).to.have.property("total");
+    expect(res.body).to.have.property("processed");
+    expect(res.body).to.have.property("inserted");
+    expect(res.body).to.have.property("skipped");
+    expect(res.body).to.have.property("started_at");
+  });
+  test("state is one of the canonical lifecycle values", function() {
+    // internal/crm/service/import_progress.go:86 — the value set is
+    // {"queued", "running", "succeeded", "failed"}. Terminal states are
+    // "succeeded" and "failed"; the operator polls this endpoint until
+    // it sees one of the two.
+    expect(res.body.state).to.be.oneOf(["queued", "running", "succeeded", "failed"]);
+  });
+}
+
+docs {
+  Polled by the operator after crm/respondents/import.bru returns 202
+  with a job_id. State machine: queued → running → succeeded | failed.
+  The handler is tenant-scoped via the service layer — the job_id
+  itself does not encode tenant; cross-tenant attempts return 404
+  crm.import.not_found.
+}

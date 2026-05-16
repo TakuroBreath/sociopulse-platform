@@ -1,0 +1,27 @@
+meta {
+  name: Admin — archive survey
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/archive
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on archive", function() {
+    expect(res.status).to.equal(204);
+  });
+}
+
+docs {
+  Soft transition — archived surveys remain queryable. Subsequent
+  write paths on the archived row return 403 surveys.archived
+  (internal/surveys/transport/http/errors.go:60).
+}

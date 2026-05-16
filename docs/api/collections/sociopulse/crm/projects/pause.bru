@@ -1,0 +1,21 @@
+meta {
+  name: Pause project (admin)
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/pause
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on pause", function() {
+    expect(res.status).to.equal(204);
+  });
+}

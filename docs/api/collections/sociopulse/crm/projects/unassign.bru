@@ -1,0 +1,21 @@
+meta {
+  name: Unassign operator from project (admin)
+  type: http
+  seq: 11
+}
+
+delete {
+  url: {{base_url}}/api/projects/{{project_id}}/operators/{{user_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on unassign", function() {
+    expect(res.status).to.equal(204);
+  });
+}

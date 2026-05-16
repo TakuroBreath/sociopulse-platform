@@ -1,0 +1,35 @@
+meta {
+  name: Get respondent (masked phone)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/respondents/{{respondent_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on get", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a RespondentDTO with the masked-phone projection only", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.id).to.equal(bru.getEnvVar("respondent_id"));
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("project_id");
+    expect(res.body).to.have.property("phone_masked");
+    expect(res.body).to.have.property("status");
+  });
+  test("plaintext phone is NOT exposed on the masked path", function() {
+    // The handler omits the plaintext phone field on this endpoint;
+    // admin callers use /with-phone to fetch the decrypted value with
+    // an audit log entry attached.
+    expect(res.body.phone === "" || res.body.phone === undefined).to.equal(true);
+  });
+}

@@ -1,0 +1,43 @@
+meta {
+  name: Search respondents (within project)
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/projects/{{project_id}}/respondents?page=1&page_size=50
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  page: 1
+  page_size: 50
+  ~status: pending
+  ~phone: +7900
+  ~region: MSK
+  ~query: alice
+}
+
+tests {
+  test("200 OK on search", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the paginated envelope", function() {
+    expect(res.body).to.have.property("respondents");
+    expect(res.body).to.have.property("total_count");
+    expect(res.body).to.have.property("page");
+    expect(res.body).to.have.property("page_size");
+    expect(res.body.respondents).to.be.an("array");
+  });
+}
+
+docs {
+  Phone field on each respondent is the MASKED projection
+  (phone_masked) — plaintext phone is only exposed via the explicit
+  /api/respondents/:id/with-phone admin path.
+}

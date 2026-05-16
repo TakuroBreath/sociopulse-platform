@@ -1,0 +1,36 @@
+meta {
+  name: Admin — activate survey version
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/api/surveys/{{survey_id}}/versions/{{version_id}}/activate
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on activate (Plan-21b lesson 11)", function() {
+    expect(res.status).to.equal(204);
+  });
+  test("response body is empty", function() {
+    expect(res.body === "" || res.body === null || Object.keys(res.body || {}).length === 0).to.equal(true);
+  });
+}
+
+docs {
+  Atomic transition — service.Activate DeactivateAlls the previous
+  active version (if any) and flips the target to is_active=true in
+  a single tx. The partial-unique index survey_versions_active_one
+  enforces at-most-one-active at the DB level
+  (migrations/000001_init.up.sql:183-184).
+
+  Returns 404 surveys.version_not_found when the version_id doesn't
+  exist under the survey, OR surveys.archived (403) when the parent
+  survey is in the archived state.
+}

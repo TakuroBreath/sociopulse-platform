@@ -1,0 +1,39 @@
+meta {
+  name: Assign operators to project (admin)
+  type: http
+  seq: 10
+}
+
+post {
+  url: {{base_url}}/api/projects/{{project_id}}/assign
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "operator_ids": ["{{user_id}}"]
+  }
+}
+
+tests {
+  test("204 No Content on assign", function() {
+    expect(res.status).to.equal(204);
+  });
+}
+
+docs {
+  operator_ids is a non-empty array of operator UUIDs in the same
+  tenant. The body validator rejects an empty list with crm.bad_request.
+  {{user_id}} is conventionally the just-created admin from
+  auth/01_login.bru; operators created via auth/admin/create_user.bru
+  also work — swap the value as needed.
+}

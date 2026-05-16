@@ -1,0 +1,34 @@
+meta {
+  name: List projects
+  type: http
+  seq: 1
+}
+
+get {
+  url: {{base_url}}/api/projects?limit=50&offset=0
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  limit: 50
+  offset: 0
+  ~status: active
+  ~include_archived: true
+  ~search: smoke
+}
+
+tests {
+  test("200 OK on list", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the paginated envelope", function() {
+    expect(res.body).to.have.property("projects");
+    expect(res.body).to.have.property("total_count");
+    expect(res.body.projects).to.be.an("array");
+  });
+}
