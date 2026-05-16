@@ -1,0 +1,44 @@
+meta {
+  name: Refresh tokens
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{base_url}}/api/auth/refresh
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "refresh_token": "{{refresh_token}}"
+  }
+}
+
+script:post-response {
+  // Rotate BOTH tokens — the gateway issues a fresh pair on every
+  // refresh and invalidates the prior refresh in Redis (replay
+  // protection). Persisting only the new access_token would leave the
+  // collection with a stale refresh that the next call would reject.
+  if (res.status === 200 && res.body && res.body.access_token) {
+    bru.setEnvVar("access_token", res.body.access_token, { persist: true });
+    bru.setEnvVar("refresh_token", res.body.refresh_token, { persist: true });
+  }
+}
+
+tests {
+  test("200 OK on valid refresh token", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries a new access_token", function() {
+    expect(res.body).to.have.property("access_token");
+  });
+  test("response rotates the refresh_token", function() {
+    expect(res.body).to.have.property("refresh_token");
+  });
+}

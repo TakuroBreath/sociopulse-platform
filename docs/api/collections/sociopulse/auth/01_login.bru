@@ -1,0 +1,59 @@
+meta {
+  name: Login (admin)
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/auth/login
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "org_id": "{{org_code}}",
+    "login": "{{admin_login}}",
+    "password": "{{admin_password}}"
+  }
+}
+
+script:post-response {
+  // Guard against non-200 responses — a 401 would otherwise overwrite
+  // the cached tokens with undefined and break every authenticated
+  // request that follows. The canonical login flow only persists when
+  // the gateway returns the success envelope.
+  if (res.status === 200 && res.body && res.body.access_token) {
+    bru.setEnvVar("access_token", res.body.access_token, { persist: true });
+    bru.setEnvVar("refresh_token", res.body.refresh_token, { persist: true });
+    if (res.body.user && res.body.user.tenant_id) {
+      bru.setEnvVar("tenant_id", res.body.user.tenant_id, { persist: true });
+    }
+    if (res.body.user && res.body.user.id) {
+      bru.setEnvVar("user_id", res.body.user.id, { persist: true });
+    }
+  }
+}
+
+tests {
+  test("200 OK on valid credentials", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries access_token", function() {
+    expect(res.body).to.have.property("access_token");
+    expect(res.body.access_token).to.be.a("string");
+  });
+  test("response carries refresh_token", function() {
+    expect(res.body).to.have.property("refresh_token");
+    expect(res.body.refresh_token).to.be.a("string");
+  });
+  test("response carries embedded user", function() {
+    expect(res.body).to.have.property("user");
+    expect(res.body.user).to.have.property("tenant_id");
+    expect(res.body.user.roles).to.include("admin");
+  });
+}

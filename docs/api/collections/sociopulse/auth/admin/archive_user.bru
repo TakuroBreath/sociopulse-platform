@@ -1,0 +1,21 @@
+meta {
+  name: Admin — archive user
+  type: http
+  seq: 5
+}
+
+post {
+  url: {{base_url}}/api/auth/users/{{user_id}}/archive
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on archive", function() {
+    expect(res.status).to.equal(204);
+  });
+}

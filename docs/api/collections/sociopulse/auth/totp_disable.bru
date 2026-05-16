@@ -1,0 +1,21 @@
+meta {
+  name: TOTP disable
+  type: http
+  seq: 8
+}
+
+post {
+  url: {{base_url}}/api/auth/me/totp/disable
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on successful disable", function() {
+    expect(res.status).to.equal(204);
+  });
+}

@@ -1,0 +1,31 @@
+meta {
+  name: TOTP confirm
+  type: http
+  seq: 7
+}
+
+post {
+  url: {{base_url}}/api/auth/me/totp/confirm
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "code": "123456"
+  }
+}
+
+tests {
+  test("204 No Content on successful confirm", function() {
+    expect(res.status).to.equal(204);
+  });
+}

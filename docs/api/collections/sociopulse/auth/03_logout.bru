@@ -1,0 +1,38 @@
+meta {
+  name: Logout
+  type: http
+  seq: 3
+}
+
+post {
+  url: {{base_url}}/api/auth/logout
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "refresh_token": "{{refresh_token}}"
+  }
+}
+
+script:post-response {
+  // Logout is idempotent — the service swallows malformed/unknown
+  // tokens and always returns 204. We clear the local cache only when
+  // we see the canonical success status so a transport hiccup does not
+  // wipe a still-valid token.
+  if (res.status === 204) {
+    bru.setEnvVar("access_token", "", { persist: true });
+    bru.setEnvVar("refresh_token", "", { persist: true });
+  }
+}
+
+tests {
+  test("204 No Content on successful logout", function() {
+    expect(res.status).to.equal(204);
+  });
+}

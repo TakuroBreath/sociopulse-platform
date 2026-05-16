@@ -1,0 +1,21 @@
+meta {
+  name: Admin — restore user
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/api/auth/users/{{user_id}}/restore
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("204 No Content on restore", function() {
+    expect(res.status).to.equal(204);
+  });
+}

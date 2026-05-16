@@ -1,0 +1,27 @@
+meta {
+  name: Admin — get user
+  type: http
+  seq: 3
+}
+
+get {
+  url: {{base_url}}/api/auth/users/{{user_id}}
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on get", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a UserDTO for the requested id", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body.id).to.equal(bru.getEnvVar("user_id"));
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("roles");
+  });
+}

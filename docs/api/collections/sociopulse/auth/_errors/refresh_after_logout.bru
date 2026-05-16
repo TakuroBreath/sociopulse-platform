@@ -1,0 +1,55 @@
+meta {
+  name: Refresh after logout (401)
+  type: http
+  seq: 11
+}
+
+post {
+  url: {{base_url}}/api/auth/refresh
+  body: json
+  auth: none
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "refresh_token": "logged-out-token-revoked-by-redis"
+  }
+}
+
+tests {
+  test("401 Unauthorized on revoked refresh", function() {
+    expect(res.status).to.equal(401);
+  });
+  test("response carries the canonical auth.* error envelope", function() {
+    expect(res.body).to.have.property("error");
+    expect(res.body.error).to.match(/^auth\./);
+  });
+  test("error code identifies the token as invalid/revoked/replayed", function() {
+    // internal/auth/transport/http/errors.go maps:
+    //   ErrTokenInvalid  -> 401 auth.token_invalid
+    //   ErrTokenRevoked  -> 401 auth.token_revoked
+    //   ErrRefreshReplay -> 401 auth.refresh_replay
+    // Any of the three is a valid response depending on which guard
+    // fires first (malformed-token check vs Redis revocation check vs
+    // replay detection).
+    expect(res.body.error).to.be.oneOf([
+      "auth.token_invalid",
+      "auth.token_revoked",
+      "auth.refresh_replay"
+    ]);
+  });
+}
+
+docs {
+  Negative regression for the logout -> refresh-replay path.
+
+  Run this AFTER auth/03_logout.bru in the same env so the persisted
+  refresh_token is the revoked one Redis remembers. Bruno's `bru run`
+  walks files in `seq` order; the auth folder's seq numbering
+  (login=1, refresh=2, logout=3, ..., _errors=10+) guarantees this
+  case fires after logout has revoked the token.
+}

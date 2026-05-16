@@ -1,0 +1,55 @@
+meta {
+  name: Admin — create user
+  type: http
+  seq: 1
+}
+
+post {
+  url: {{base_url}}/api/auth/users
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "login": "new-operator",
+    "full_name": "New Operator",
+    "email": "new-operator@smoke.local",
+    "roles": ["operator"]
+  }
+}
+
+script:post-response {
+  // Persist the freshly-minted user id so the sibling .bru files
+  // (get_user / update_roles / archive / restore / reset_password) can
+  // target the same record without manual editing. The temp_password
+  // is deliberately NOT persisted — it is shown ONCE and the operator
+  // must surface it out-of-band per security policy (errors.go).
+  if (res.status === 201 && res.body && res.body.user && res.body.user.id) {
+    bru.setEnvVar("user_id", res.body.user.id, { persist: true });
+  }
+}
+
+tests {
+  test("201 Created on successful user creation", function() {
+    expect(res.status).to.equal(201);
+  });
+  test("response carries the created UserDTO", function() {
+    expect(res.body).to.have.property("user");
+    expect(res.body.user).to.have.property("id");
+    expect(res.body.user).to.have.property("tenant_id");
+    expect(res.body.user.roles).to.include("operator");
+  });
+  test("response carries the one-time temp_password", function() {
+    expect(res.body).to.have.property("temp_password");
+    expect(res.body.temp_password).to.be.a("string");
+  });
+}

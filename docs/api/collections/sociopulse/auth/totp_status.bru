@@ -1,0 +1,25 @@
+meta {
+  name: TOTP status
+  type: http
+  seq: 9
+}
+
+get {
+  url: {{base_url}}/api/auth/me/totp/status
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on status", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the enabled flag", function() {
+    expect(res.body).to.have.property("enabled");
+    expect(res.body.enabled).to.be.a("boolean");
+  });
+}

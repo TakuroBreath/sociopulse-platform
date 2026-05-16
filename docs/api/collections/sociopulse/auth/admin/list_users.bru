@@ -1,0 +1,32 @@
+meta {
+  name: Admin — list users
+  type: http
+  seq: 2
+}
+
+get {
+  url: {{base_url}}/api/auth/users?limit=50&offset=0
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+params:query {
+  limit: 50
+  offset: 0
+  ~include_archived: true
+}
+
+tests {
+  test("200 OK on list", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the paginated envelope", function() {
+    expect(res.body).to.have.property("users");
+    expect(res.body).to.have.property("total");
+    expect(res.body.users).to.be.an("array");
+  });
+}

@@ -1,0 +1,35 @@
+meta {
+  name: Admin — update user roles
+  type: http
+  seq: 4
+}
+
+patch {
+  url: {{base_url}}/api/auth/users/{{user_id}}/roles
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+headers {
+  content-type: application/json
+}
+
+body:json {
+  {
+    "roles": ["supervisor"]
+  }
+}
+
+tests {
+  test("200 OK on role update", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response reflects the updated roles", function() {
+    expect(res.body).to.have.property("roles");
+    expect(res.body.roles).to.include("supervisor");
+  });
+}

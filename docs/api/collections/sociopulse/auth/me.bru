@@ -1,0 +1,28 @@
+meta {
+  name: Get me (current user)
+  type: http
+  seq: 4
+}
+
+get {
+  url: {{base_url}}/api/auth/me
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK with a valid access token", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response is a UserDTO with tenant_id + roles", function() {
+    expect(res.body).to.have.property("id");
+    expect(res.body).to.have.property("tenant_id");
+    expect(res.body).to.have.property("login");
+    expect(res.body).to.have.property("roles");
+    expect(res.body.roles).to.be.an("array");
+  });
+}

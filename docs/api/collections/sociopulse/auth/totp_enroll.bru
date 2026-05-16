@@ -1,0 +1,30 @@
+meta {
+  name: TOTP enroll
+  type: http
+  seq: 6
+}
+
+post {
+  url: {{base_url}}/api/auth/me/totp/enroll
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{access_token}}
+}
+
+tests {
+  test("200 OK on enroll", function() {
+    expect(res.status).to.equal(200);
+  });
+  test("response carries the otp_auth_url for the authenticator app", function() {
+    expect(res.body).to.have.property("otp_auth_url");
+    expect(res.body.otp_auth_url).to.match(/^otpauth:\/\//);
+  });
+  test("response carries the shared secret + backup_codes", function() {
+    expect(res.body).to.have.property("secret");
+    expect(res.body).to.have.property("backup_codes");
+    expect(res.body.backup_codes).to.be.an("array");
+  });
+}
