@@ -6,7 +6,22 @@
 > Related: Plan 21 (`v0.0.26-e2e-smoke-foundation`) + Plan 21b (`v0.0.27-phase-1b-smoke-scenarios`) — closed Phase 1 of the same closure plan. Smoke = automated cross-module regression net; REST collection = human-driven exploration of the same surface.
 > Affected ADRs: none (deliverable is a documentation artefact, not a code/architectural change). The collection MIRRORS existing API contracts; it does not introduce new ones.
 
-## Amendments: none
+## Amendments (post-execution 2026-05-16)
+
+- **Task 1 (3c08ca1)** — Admin user-mgmt routes are under `/api/auth/users/*`, NOT `/api/users/*` as originally written in plan + references. Verified by Task 1 implementer via `internal/auth/transport/http/routes.go::auth.Group("/users")`. References file corrected in commit `2d05e0b`.
+- **Task 1 (3c08ca1)** — Bruno parser gotchas discovered + applied across all subsequent tasks: (a) top-level `#` comments fail the parser → use `docs { ... }` block; (b) `bru run <path> -r` walks subfolders alphabetically (`_errors/` runs first); (c) CLI uses positional path arg, not `--filename`. README documents.
+- **Task 1 (3c08ca1)** — Scope cut: `auth/01b_login_totp.bru` (POST `/api/auth/login/totp` step-2 of TOTP-enabled login) was enumerated in references but not shipped. Captured as Phase-2-follow-up in Production lessons § 20.
+- **Task 2 (ab3b74c)** — `DELETE /api/respondents/:id` returns **200 + DeletionReceiptDTO**, NOT 204 as plan brief + Plan 21b lesson #15 said. Verified at `internal/crm/transport/http/respondent_handler.go:183`. The .bru file asserts correct shape; Plan 21b lesson #15 corrected in same close-out commit.
+- **Task 3 (2bea874)** — Three wire-format clarifications verified by reading source: (a) `POST /api/calls/:id/hangup` returns 204 No Content; (b) `POST /api/calls/:id/status` body enum is 8 underscore-separated values (`success refused wrong_person dropped no_answer busy callback tech_failure`) — pre-flight had hyphenated + incomplete; (c) error envelope field divergence — `auth` uses `error`, `dialer`+`recording` use `code`. Documented in `.bru` `docs` blocks; full module mapping in references § 3 "Error envelope field divergence" table at close-out.
+- **Task 4 (16d6405)** — SEVEN wire-format/route corrections vs plan + references:
+  - Billing tariff routes are `/api/billing/tariffs`, NOT `/api/finance/tariffs` (verified at `internal/billing/transport/http/routes.go:52`). References § 3-billing table corrected.
+  - PATCH tariffs has NO `expected_version` field — last-writer-wins (verified at `billingapi.TariffsPatchRequest`).
+  - Reports body uses `window_from`/`window_to` RFC 3339, NOT `period` string (verified at `exportRequestBody`).
+  - Reports `Job` + `JobTicket` DTOs emit PascalCase field names (no json tags on Go structs at `internal/reports/api/dto.go:79-82,96-112`). OpenAPI at `docs/api/reports/v1/openapi.yaml` documents snake_case → divergence flagged for follow-up plan.
+  - Reports download is **302 redirect** (Bruno needs `settings { followRedirects: false }`), NOT 200 + JSON.
+  - Error envelope: billing + reports both use `code` field (matches dialer + recording; only auth uses `error`).
+  - Total .bru count: 81 (plan estimated ~86; gap accounted for by TOTP step-2 not shipped + a few admin endpoints that the parent route handles in one .bru).
+- **Phase-2 follow-ups captured** (NOT in Plan 22 scope) — see references § 6 Production lessons #20-24: add `auth/01b_login_totp.bru`, reconcile reports OpenAPI vs Go DTOs (PascalCase ↔ snake_case), align error envelope field across modules, schedule Bruno-CLI CI integration.
 
 ## Goal
 

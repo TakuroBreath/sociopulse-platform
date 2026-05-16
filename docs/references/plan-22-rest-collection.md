@@ -253,7 +253,7 @@ Plan-21b lesson 12 is authoritative.
 |---|---|---|---|
 | GET | `/api/realtime/ws` | any (subprotocol "sociopulse-v1") | **WebSocket — NOT in Bruno collection** |
 
-### billing (`/api/finance/*`, `/api/finance/tariffs`)
+### billing (`/api/finance/*` aggregates + `/api/billing/tariffs` config)
 
 | Method | Path | Role | Notes |
 |---|---|---|---|
@@ -261,8 +261,8 @@ Plan-21b lesson 12 is authoritative.
 | GET | `/api/finance/projects` | admin ∪ supervisor | |
 | GET | `/api/finance/breakdown` | admin ∪ supervisor | |
 | GET | `/api/finance/byMonth` | admin ∪ supervisor | |
-| GET | `/api/finance/tariffs` | admin ∪ supervisor | |
-| PATCH | `/api/finance/tariffs` | admin only | body: tariffs map |
+| GET | `/api/billing/tariffs` | admin ∪ supervisor | (Plan-22 Task 4 verification: under `/api/billing/`, NOT `/api/finance/` — `internal/billing/transport/http/routes.go:52`. Billing has two route groups: aggregates under `/api/finance/`, config under `/api/billing/`.) |
+| PATCH | `/api/billing/tariffs` | admin only | body: tariffs map (NO `expected_version` field — last-writer-wins, server bumps version) |
 
 OpenAPI source: `docs/api/billing/v1/openapi.yaml` — use for exact request/response shapes.
 
@@ -271,12 +271,28 @@ OpenAPI source: `docs/api/billing/v1/openapi.yaml` — use for exact request/res
 | Method | Path | Role | Notes |
 |---|---|---|---|
 | GET | `/api/reports` | admin ∪ supervisor | list available kinds |
-| POST | `/api/reports/:kind/export` | admin ∪ supervisor | sync OR async (202 + jobID if period>30d OR rows>100k) |
-| POST | `/api/reports/custom` | admin ∪ supervisor | custom report builder |
+| POST | `/api/reports/:kind/export` | admin ∪ supervisor | body uses `window_from`/`window_to` RFC 3339 timestamps (NOT `period` string); sync OR async 202 + jobID if window>30d OR rows>100k |
+| POST | `/api/reports/custom` | admin ∪ supervisor | custom report builder; same window model |
 | GET | `/api/reports/jobs/:jobID` | admin ∪ supervisor | async job status |
-| GET | `/api/reports/jobs/:jobID/download` | admin ∪ supervisor | 24h presigned-URL S3 redirect |
+| GET | `/api/reports/jobs/:jobID/download` | admin ∪ supervisor | **302 redirect** to 24h presigned-URL S3 (NOT 200 + JSON — Bruno needs `settings { followRedirects: false }` to assert the redirect) |
 
-OpenAPI source: `docs/api/reports/` — use for exact request/response shapes.
+OpenAPI source: `docs/api/reports/` — use for exact request/response shapes. **WARNING (Plan-22 Task 4 finding):** the reports DTOs at `internal/reports/api/dto.go:79-82,96-112` lack json tags → Go default marshaller emits PascalCase field names (`JobID`, `QueuedAt`, `State`, `DownloadURL`, etc.). The OpenAPI at `docs/api/reports/v1/openapi.yaml` documents snake_case — **diverges from wire reality**. Until reconciled (add json tags OR fix OpenAPI), the Bruno collection asserts on actual wire (PascalCase). Future plan should add json tags to match the rest of the project's snake_case convention.
+
+### Error envelope field divergence (Plan-22 Task 3+4 finding)
+
+The platform's error envelope shape is NOT uniform across modules:
+
+| Module | Field | Source |
+|---|---|---|
+| `auth` | `res.body.error` | `internal/auth/transport/http/error_envelope.go` |
+| `crm` (RBAC-only paths) | `res.body.error` | inherits auth middleware shape |
+| `surveys` | `res.body.error` | inherits auth middleware shape |
+| `dialer` | `res.body.code` | `internal/dialer/transport/http/dto.go:77` |
+| `recording` | `res.body.code` | `internal/recording/transport/http/dto.go:10` |
+| `billing` | `res.body.code` | `internal/billing/transport/http/dto.go:24-27` |
+| `reports` | `res.body.code` | `internal/reports/transport/http/dto.go:22-24` |
+
+The `.bru` files assert on the correct field per module. A future hardening plan should align all modules on a single field name (recommended: `code`, since 4 of 7 modules already use it).
 
 ## 4. Gotchas (known traps)
 
@@ -328,6 +344,62 @@ When pointing Bruno at the smoke stack, the cmd/api binds an ephemeral port per 
 4. **Bruno CLI in CI: in-scope for Plan 22 or follow-up?** Recommendation: follow-up. Plan 22 ships the collection + README; a future plan adds `bru run --env smoke` as a CI job (and decides whether it gates tag-push). Scope creep otherwise.
 5. **WS endpoint documentation: in the same README or a separate doc?** Recommendation: a section in the collection README pointing at `tests/smoke/wsclient.go` + `internal/dialer/transport/http/ws.go`. No separate doc.
 
-## 6. Production lessons (post-execution YYYY-MM-DD)
+## 6. Production lessons (post-execution 2026-05-16)
 
-> Filled in at close-out per CLAUDE.md workflow rule #8. Until then, this section is empty by design.
+### Bruno collection patterns
+
+1. **Top-level `#` comments fail the parser.** Bruno's grammar only recognises a fixed set of block names; a bare `# This file does X` line between blocks rejects the WHOLE file with `Expected ... "meta"`. Use the `docs { ... }` block (Bruno's canonical request-level docs container) for any inline notes. Caught in Task 1; Tasks 2-4 followed the pattern.
+
+2. **`bru run <path> -r` walks subfolders alphabetically before files in the parent.** `_errors/*` runs BEFORE the main flow when invoked recursively. Negative cases MUST stand alone (the wrong-password 401 doesn't need a prior login) OR document the workaround. The collection's README has a "Common gotchas" section spelling this out. Alternative: prefix the folder name (e.g. `zz_errors/`) to push it last — Plan 22 chose the documentation route over the rename.
+
+3. **CLI uses positional path arg, NOT `--filename`.** `bru run auth/01_login.bru --env smoke` (correct) vs `bru run --env smoke --filename auth/01_login.bru` (wrong — the latter errors). README documents.
+
+4. **`script:post-response` MUST guard on `res.status`** before reading body fields. `bru.setEnvVar("access_token", res.body.access_token, { persist: true })` on a 401 response writes `undefined` and breaks downstream auth. Canonical pattern: `if (res.status === 200) { bru.setEnvVar(...) }`. Pinned in `auth/01_login.bru`.
+
+5. **`{persist: true}` is mandatory for cross-CLI-invocation env vars.** Without it, the var is in-memory only — gone the next `bru run` invocation. Convention: login → persist; logout → empty string (persist).
+
+6. **Bruno's `body:multipart-form` references files via `@<path>` relative to the .bru file's location** (verified via context7). `crm/respondents/import.bru` uses `file: @../../fixtures/respondents.csv` — the path is resolved relative to the .bru, not the CWD.
+
+7. **Binary response handling** (recording stream): Bruno's `tests` block doesn't auto-parse non-JSON bodies. Assert on `res.headers["content-type"]` instead of trying to consume the audio bytes. The 302 redirect case (reports download) needs `settings { followRedirects: false }` to surface the status code.
+
+### Wire-format reality vs initial plan text
+
+The 4 implementer tasks surfaced 7+ documentation drifts between plan text / OpenAPI specs / references file and the actual Go handler code. The references file `§ 3` tables have been corrected inline; the drifts are:
+
+8. **`/api/billing/tariffs`, NOT `/api/finance/tariffs`** — billing has two route groups (`/api/finance/*` for aggregates, `/api/billing/*` for config). Task 4 catch.
+
+9. **`/api/auth/users/*`, NOT `/api/users/*`** — admin user-mgmt is under `/api/auth/users` (auth.Group("/users") inside the `/api/auth` parent). Task 1 catch.
+
+10. **`DELETE /api/respondents/:id` returns 200 + DeletionReceiptDTO, NOT 204.** Plan-21b lesson #15 was wrong; Task 2 catch. Both Plan 21b refs and Plan 22 refs have been corrected.
+
+11. **`POST /api/calls/:id/hangup` returns 204 No Content.** Task 3 verified at handler.
+
+12. **`POST /api/calls/:id/status` body enum is 8 specific underscore-separated values:** `success`, `refused`, `wrong_person`, `dropped`, `no_answer`, `busy`, `callback`, `tech_failure`. Task 3 catch — pre-flight had wrong values (hyphenated + missing entries).
+
+13. **Reports body uses `window_from`/`window_to` RFC 3339, NOT `period` string.** Task 4 catch.
+
+14. **Reports `Job` + `JobTicket` DTOs emit PascalCase** (`JobID`, `QueuedAt`, `State`, `DownloadURL`) — Go structs at `internal/reports/api/dto.go:79-82,96-112` lack json tags. The `docs/api/reports/v1/openapi.yaml` documents snake_case — **diverges from wire reality**. Task 4 catch. **Recommended follow-up**: add json tags to match project convention; update OpenAPI to match Go OR vice-versa.
+
+15. **Reports download is 302 redirect, NOT 200 + JSON.** Task 4 catch.
+
+16. **Error envelope field divergence**: `auth` (and the CRM/surveys RBAC chain that wraps auth's middleware) uses `res.body.error`; `dialer`/`recording`/`billing`/`reports` use `res.body.code`. Task 3+4 cross-module discovery. Full mapping in references file § 3 "Error envelope field divergence" table.
+
+### Operational
+
+17. **Bruno collection targets `make dev-up` (stable port 8080), NOT the smoke testcontainer harness** (ephemeral ports per scenario). The Bruno `smoke` environment is for human exploration against a stable cmd/api; `tests/smoke/` is for automated cross-module regression. Both target the same binary; the operator (human vs go test) differs.
+
+18. **First-time setup requires a seeded tenant.** Bruno cannot bootstrap a tenant via the public API (tenant creation requires service-owner identity not in scope). Operator runs a `psql` snippet to insert `tenants` + `users` rows with `pkg/passwords.Default().Hash(password)` for the password — README ships the snippet.
+
+19. **Bruno parse cost ≪ Bruno run cost.** `bru run <path> -r` parses ALL files first (cheap; ~1s for 81 files) then attempts requests (slow; network-bounded). For CI verification without a live stack, parse-only via `bru run` against unreachable `base_url` IS a valid syntactic gate — every file's `meta`/`url`/`body`/`tests` blocks are validated even when the HTTP request fails.
+
+### Phase 2 follow-ups (deferred from Plan 22)
+
+20. **`/api/auth/login/totp` (step-2 TOTP login) is missing from the collection.** Plan-22 Task 1 inventory enumerated it but Task 1 implementer skipped it (likely scope oversight). Add as `auth/01b_login_totp.bru` in a follow-up — needed for any operator account with `totp_enabled=true`.
+
+21. **`_errors/` alphabetical ordering** — README documents the workaround (run negative cases standalone). If a future scenario needs negative-after-happy ordering, refactor to `zz_errors/` OR use seq numbers ≥ 100 within the main folder (Bruno's `seq` orders within a folder).
+
+22. **CI integration is deferred.** Plan 22 ships the collection; a future plan adds `bru run --env smoke` as a CI job + decides whether tag-push gates on it. Bruno CLI exit code is well-defined (`bru run` → non-zero on any test failure), so integration is mechanical when scheduled.
+
+23. **Reports OpenAPI ↔ Go DTO reconciliation** (production-doc inconsistency #14 above). The fix is small (~5-10 LoC of json tags) but is a behavior change for any client built from the OpenAPI. Defer to a focused mini-plan with explicit deprecation policy.
+
+24. **Aligning error envelope field across modules** (#16). 4 of 7 modules use `code`; auth (and middleware-borrowing modules) uses `error`. Picking ONE convention + migrating eliminates a class of client confusion. Deprecation-friendly: emit BOTH fields for one release, drop the old in the next.

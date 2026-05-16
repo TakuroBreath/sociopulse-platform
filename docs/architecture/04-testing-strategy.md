@@ -493,12 +493,13 @@ CI: dedicated `smoke` job runs `go test -tags=smoke -race -count=1`
 on every push to `main` and on every `v*` tag push. Tag-push deploys
 gate on smoke green.
 
-**Phase 1 of the closure plan is COMPLETE.** Remaining phases:
+**Phase 1 of the closure plan is COMPLETE** (Plans 21 + 21b). **Phase 2 of the closure plan is COMPLETE** (Plan 22 — Bruno REST collection at `docs/api/collections/sociopulse/`, 81 `.bru` across 7 modules + scaffold + multipart fixture + README; CLI 3.3.0 parses 81/81 clean; live execution requires `make dev-up` cmd/api at :8080). Remaining phases:
 
-- **Phase 2** — REST collection (Bruno / Postman / Hurl) for manual exploration / QA pre-release sweep. ~4 hours of work; not yet scheduled.
 - **Phase 3** — Frontend E2E (Playwright) — owned by `sociopulse-web` repo, Plans 15-19.
 - **Phase 4** — Real FreeSWITCH integration (Plan 08) + real Yandex SDK (Plan 01).
 - **Phase 5** — Chaos / load (k6, SIPp, Chaos Mesh) — pre-launch milestone.
+
+The Bruno collection is the human-driven exploration surface paired with the smoke layer's automated regression net. Same backing stack, same wire contracts, different operator (developer vs `go test`). See `docs/api/collections/sociopulse/README.md` for usage; `docs/references/plan-22-rest-collection.md` § 6 captures 24+ production lessons including 7+ wire-format drifts caught by reading source vs trusting prior docs.
 
 The full gap analysis, the rationale ("not coverage — confidence"),
 the failure-class examples, and the phased closure plan live in

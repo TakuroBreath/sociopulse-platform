@@ -235,7 +235,10 @@ parallel to existing `Test`:
 
 Phase 1 closes scenarios A and C from § "What we do not test today".
 
-### Phase 2 — REST collection (target: ~4 hours)
+### Phase 2 — REST collection ✅ **COMPLETE** (2026-05-16 Plan 22)
+
+> **Status: shipped.** Plan 22 (`v0.0.28-rest-collection`) shipped `docs/api/collections/sociopulse/` — Bruno collection with 81 `.bru` files across 7 modules (auth/crm/surveys/dialer/recording/billing/reports) + scaffold (`bruno.json`, `environments/{smoke,dev}.bru`, `README.md`, `fixtures/respondents.csv`). Covers happy-path + canonical negative cases (cross-tenant 404, RBAC 403, missing field 400, Range 416) for every endpoint reachable via HTTP. WebSocket endpoints (`/api/operator/ws`, `/api/realtime/ws`) deliberately out of scope — Bruno is HTTP-only; pointer at `tests/smoke/wsclient.go::DialOperator` for the Go-side equivalent. CI integration (Bruno CLI as a gate) deferred to follow-up. **Section retained below as the original design / decision record; present tense should be read as "shipped".**
+
 
 `docs/api/collections/sociopulse.bru` (Bruno format; alternatively a
 `.postman_collection.json` / Hurl / HTTPie file). Contents:

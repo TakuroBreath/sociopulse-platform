@@ -376,7 +376,7 @@ Plan 21 added a `test-smoke` target in `Makefile`. Plan 21b extends it ONLY if a
 
 14. **`call_recordings.sha256` field name on the wire is `"sha256"` (NOT `"sha256_hex"` even though the DB column is `sha256_hex`).** Verified at `internal/recording/api/dto.go:31`. The wire-side JSON tag wins when a smoke test asserts on the response shape.
 
-15. **DELETE `/api/respondents/:id` returns 204.** Plan-21b Task 6 verified.
+15. **DELETE `/api/respondents/:id` returns 200 + DeletionReceiptDTO.** ~~Plan-21b Task 6 verified as 204~~ — Plan 22 Task 2 re-verified at `internal/crm/transport/http/respondent_handler.go:183` (`c.JSON(http.StatusOK, DeletionReceiptDTO{...})`). The handler ships the soft-delete receipt so the caller can surface `scheduled_purge_at`. **Plan 21b lesson here was wrong**; the smoke test still passed because it asserts `204 OR 200` (broad check) AND because the verify-row-gone assertion is the meaningful contract — the status code was a flexibly-asserted side detail.
 
 ### Operational
 
