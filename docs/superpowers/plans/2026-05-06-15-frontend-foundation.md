@@ -2199,5 +2199,88 @@ Plan 15 verified.
 
 ---
 
+## Amendments (post-execution 2026-05-17)
+
+Adaptations made during execution in `sociopulse-web`. Plan text is preserved for historical reference; this section captures the deltas. Full details + production lessons live in [`docs/references/plan-15-frontend-foundation.md`](../../references/plan-15-frontend-foundation.md).
+
+### Separate-repo path adaptations (Tasks 1-13)
+
+- The plan was authored when the FE lived inside platform/`web/`. All file paths drop the `web/` prefix in execution (`web/package.json` → `package.json` at sociopulse-web repo root, etc.). The `dist/` build output lands at the web repo root.
+
+### Task 1 (Vite scaffold)
+
+- `npm create vite@5.2 . -- --template react-ts -y` refuses on a non-empty repo (CLAUDE.md, README.md, docs/ already present). Scaffolded manually — same end state.
+- Added `@types/node` to devDependencies (plan oversight — vite.config.ts needs `node:path` + `__dirname`).
+- Decision documented: `social-pulse-maket/` is gitignored in the web repo; canonical source is sibling `../social-pulse/social-pulse-maket/` (per web README).
+- `package.json` deps bumped vs plan's pins:
+  - `@typescript-eslint/eslint-plugin@^7.10` + `@typescript-eslint/parser@^7.10` → **`typescript-eslint@^8.0.0`** (umbrella). The v7 split packages cap at eslint v8; we use eslint v9.
+  - `eslint-plugin-react-hooks@^4.6.2` → **`^5.0.0`** (v4 caps at eslint v8).
+  - Added `@eslint/js@^9.39.4` (needed by the flat-config recommended set).
+- `tsc -b` (composite project mode) emits `*.tsbuildinfo` + `vite.config.{js,d.ts}` as build artefacts. Added to `.gitignore`.
+
+### Task 2 (styles port)
+
+- Inline `<script>` in `index.html` restores theme + font-size from `localStorage.getItem("sociopulse.theme")` BEFORE React mounts — FOUC-prevention. Coordinated with the zustand store key (Task 5).
+- Added `--z-tooltip/toast/modal/popover` CSS variables to `tokens.css` to give Radix portals an explicit stacking order (Radix portals don't inherit stacking context; plan-15 ref §5.1).
+- Reset.css carries the full `html/body { font-family, font-size, color, background, line-height, font-smoothing }` block (plan's reset.css was minimal; for pixel fidelity the base styles need to land in reset rather than splitting across reset/globals).
+
+### Task 3 (API client + auth store)
+
+- **Wire format**: store carries `user: User | null` (lowercase `user`, snake_case interior fields matching `internal/auth/transport/http/dto.go::UserDTO`). NOT the plan's `claims: AuthClaims` camelCase. The plan's prose was wrong vs the backend canon.
+- `rotateTokens(...)` action takes ONLY `accessToken`, `refreshToken`, `accessExpiresAt`, `refreshExpiresAt` — the refresh response (`02_refresh.bru`) carries no user payload, so we preserve the existing user object across refreshes.
+- `idempotency.ts` uses built-in `crypto.randomUUID()` (the `uuid` package stays in package.json for future uses but is unimported from production code — consider dropping in Plan 16).
+- jsdom `localStorage` polyfill in `src/test/setup.ts` (jsdom installs a read-only stub when `--localstorage-file` is passed without a path).
+
+### Task 4 (WS hub)
+
+- Discriminated-union `Frame` type with full type narrowing; payload is `unknown` on the wire, narrowed by `subscribe<T>` at the call site (plan's draft used `any`).
+- `subscribe` frame omits `filter` field entirely when empty (cleaner wire under `exactOptionalPropertyTypes`).
+- `connect()` rejects with `ws_closed_before_auth` if socket closes pre-handshake (so callers don't hang forever).
+- `auth.error` clears `connectingToken` to break the reconnect loop.
+- Hub replies `pong` to server-initiated `ping` (plan ignored inbound pings).
+
+### Task 7 (Layout)
+
+- `aria-label="Выйти"` added to logout button (plan's `title="Выйти"` alone doesn't produce an accessible name for `getByRole("button", { name })`).
+- Topbar subscribes via `useThemeStore((s) => s.theme)` selector rather than `useTheme()` — zustand's `UseBoundStore` overload collapses `ReturnType<typeof useStore>` to `unknown` under TS.
+- AppShell uses conditional spread for `style` and `right` props (`exactOptionalPropertyTypes` forbids `style={undefined}`).
+
+### Task 8 (Routing)
+
+- Created `src/pages/Login.tsx` as a stub at end of Task 8 (the lazy import in `routes.tsx` blocks the typecheck without it); Task 9 replaces with the full port. Plan didn't account for the chicken-and-egg.
+- Added `/` → `/login` redirect explicitly (plan had no rule for "/").
+
+### Task 9 (Login)
+
+- Real wire format applied: `setSession({ accessToken: res.access_token, refreshToken: res.refresh_token, accessExpiresAt: res.access_expires_at, refreshExpiresAt: res.refresh_expires_at, user: res.user })`. TOTP path detects `res.totp_required === true` and intentionally does NOT call `setSession` — the partial token rides on `res.access_token` and is consumed by Plan 05/16's 2FA screen.
+- `getByLabelText(/Пароль/i)` regex anchored (`/^Пароль$/i`) to avoid colliding with the show/hide button's `aria-label="Показать пароль"`.
+- `location.state` narrowed via type guard (`react-router-dom` v6 types it as `unknown`).
+
+### Task 10 (WASM loader)
+
+- Typed Go-host surface (`window.Go`, `importObject`, `run`) instead of leaking `any` through the API. Throws a clear error if `wasm_exec.js` isn't loaded yet.
+- `lib/wasm.ts` calls `fetch("/surveys-runtime.wasm")` inside `WebAssembly.instantiateStreaming` — this is a static-asset load, not an API call, and is the **one documented exception** to the "no raw fetch outside src/api/" standing rule.
+
+### Task 11 (ESLint + Prettier)
+
+- Modern flat-config using `typescript-eslint` v8 umbrella + `@eslint/js` v9 + `eslint-plugin-react-hooks` v5 + `eslint-plugin-react-refresh`. The plan's `@typescript-eslint/eslint-plugin` + `@typescript-eslint/parser` v7 wiring is replaced.
+- Test files override: `no-explicit-any`, `no-unused-vars`, `react-refresh/only-export-components` all relaxed (vitest mock objects + fixture exports).
+- `prettier.config.cjs` (CJS so `module.exports` works) is excluded from lint (`**/*.cjs` in `ignores`).
+- Final lint state: 0 errors, 2 warnings (both `react-refresh/only-export-components` advisories on `Icon.tsx` ICONS map + `routes.tsx` PendingPage — acceptable since both files exist as glue rather than HMR-hot leaves).
+
+### Task 12 (embed.FS bridge)
+
+- **Deferred to platform** via [issue TakuroBreath/sociopulse-platform#2](https://github.com/TakuroBreath/sociopulse-platform/issues/2). The cross-repo wiring (`cmd/api/embed.go`, Makefile `web-build`, multi-stage Dockerfile) lives in platform — the FE side ships only the artefact (`dist/` produced by `npm run build`).
+
+### Task 13 (Playwright)
+
+- `process.env["E2E_BASE_URL"]` (bracket notation) — TS `noUncheckedIndexedAccess: true` requires it.
+
+### Final implementation review (2026-05-17)
+
+Independent code-reviewer subagent over `9da104f...HEAD`: **APPROVE-WITH-NITS**. 0 blockers, 0 majors, 3 minors (refresh-bypass-retry, WS race-on-rotation, WS listener cleanup) — all deferred to Plan 16 where they'll be exercised under real conditions. Quality gates green: typecheck silent, lint 0 errors / 2 warnings, 68/68 tests pass, build succeeds.
+
+---
+
 **Plan complete and saved to `docs/superpowers/plans/2026-05-06-15-frontend-foundation.md`.**
 
