@@ -117,7 +117,7 @@ Makefile                                     # add `make dashboards`, `make aler
 **Files:**
 - Create: `docs/runbooks/README.md`
 
-- [ ] **Step 1: Написать `docs/runbooks/README.md`**
+- [x] **Step 1: Написать `docs/runbooks/README.md`** — done 2026-05-17 in `v0.0.29-runbook-readme`
 
 Содержание (markdown, ~200 строк):
 
@@ -160,7 +160,7 @@ Makefile                                     # add `make dashboards`, `make aler
 - [redis-sentinel-failover.md](redis-sentinel-failover.md) — Sentinel переключил мастер (P2)
 ```
 
-- [ ] **Step 2: Commit**
+- [x] **Step 2: Commit** — done 2026-05-17 (also bundled reference file + PROJECT_STATUS update + plan amendment).
 
 ```bash
 git add docs/runbooks/README.md
@@ -1194,3 +1194,11 @@ Plan 20 verified.
 ---
 
 **Plan complete and saved to `docs/superpowers/plans/2026-05-06-20-observability-foundation.md`.**
+
+---
+
+## Amendments (post-execution)
+
+- **2026-05-17 — Task 1 shipped in `sociopulse-platform` as `v0.0.29-runbook-readme`.** Single docs deliverable: `docs/runbooks/README.md` with severity matrix + 6 incident-response principles + IC declaration checklist + post-mortem pointer + 10-row runbook navigation table (links 404 until Phase-2 leaves land — intentional shape-fixing). Reference file: `docs/references/plan-20-observability-foundation.md` (Phase-2 deferral matrix + production lessons).
+- **Tasks 2-7 deferred to `sociopulse-infra`.** They need kube-prometheus-stack on MKS + Alertmanager routing + ArgoCD applications + real production endpoints to canary. The plan's own opening note carved Task 1 out as the Phase-1 platform-repo deliverable; this amendment confirms the carve-out happened cleanly. `cmd/synthetic` and `cmd/status-page` (Tasks 5-6) are Go binaries that *could* technically land in this repo, but they would be dead code without Phase-2 infra to consume — keep them in `sociopulse-infra` for now.
+- **No plan-level "Plan 20 done" tag.** This repo's contribution to Plan 20 is closed under `v0.0.29-runbook-readme`. Phase-2 work in `sociopulse-infra` may produce its own tags there. Future agents reading this file: don't expect `v0.0.N-observability-foundation` — it won't appear in `sociopulse-platform` git history.
